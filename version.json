@@ -1,0 +1,15 @@
+{
+  "latest_version": "2.2.0",
+  "download_url": "https://raw.githubusercontent.com/Hugh112/douyinshangchuan/main/packages/douyin_single_publish_v2.2.0_online_update.zip",
+  "sha256": "ab9036e09f2b005c6fd33b9399f45bd97c42250ecbc21d70d01d4efec2b34055",
+  "force_update": false,
+  "preserve_paths": [
+    "app/douyin_gui_config.json"
+  ],
+  "release_notes": [
+    "新增在线更新：启动后自动检查 GitHub version.json。",
+    "前端增加“检查更新”按钮，检测到新版本后由用户自行选择是否更新。",
+    "更新时保留本机配置 app/douyin_gui_config.json，避免每次覆盖后重新配置。",
+    "新增独立更新器 online_updater.py：下载更新包、校验 sha256、覆盖程序文件并重启。"
+  ]
+}

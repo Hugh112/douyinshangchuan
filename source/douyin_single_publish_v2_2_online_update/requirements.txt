@@ -1,0 +1,6 @@
+pandas
+openpyxl
+pyperclip
+playwright
+xlrd
+greenlet

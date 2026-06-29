@@ -49,7 +49,7 @@ from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeo
 
 APP_DIR = Path(__file__).resolve().parent
 CONFIG_PATH = APP_DIR / "douyin_gui_config.json"
-APP_VERSION = "2.2.0"
+APP_VERSION = "2.2.1"
 APP_NAME = f"抖音单图文发布v{APP_VERSION}"
 LOGO_ICO = APP_DIR / "assets" / "app_logo.ico"
 LOGO_PNG = APP_DIR / "assets" / "app_logo.png"
@@ -532,10 +532,33 @@ def list_images(cfg):
 
 
 def read_copies(cfg):
-    p = Path(cfg["excel_path"])
+    excel_value = str(cfg.get("excel_path", "") or "").strip().strip('"')
+    if not excel_value:
+        raise RuntimeError("文案Excel未设置：请在前端“文案Excel”选择真正的 .xlsx 或 .xls 文案表。")
+    p = Path(excel_value)
     if not p.exists():
         raise FileNotFoundError(f"Excel 不存在：{p}")
-    xls = pd.ExcelFile(p)
+
+    suffix = p.suffix.lower()
+    allowed = {".xlsx", ".xls", ".xlsm"}
+    if suffix not in allowed:
+        raise RuntimeError(
+            "文案Excel文件格式不正确。\n"
+            f"当前选择：{p}\n"
+            f"当前后缀：{suffix or '无后缀'}\n"
+            "请不要选择软件压缩包、程序目录或其他文件；请在前端“文案Excel”重新选择 .xlsx / .xls / .xlsm 文案表。"
+        )
+
+    try:
+        xls = pd.ExcelFile(p)
+    except Exception as e:
+        raise RuntimeError(
+            "无法读取文案Excel。\n"
+            f"当前选择：{p}\n"
+            "请确认该文件是真正的 Excel 表格，且没有损坏；建议另存为 .xlsx 后重新选择。\n"
+            f"原始错误：{repr(e)}"
+        ) from e
+
     sheet = next((s for s in xls.sheet_names if s.lower() == str(cfg["sheet_name"]).lower()), None)
     if not sheet:
         raise RuntimeError(f"找不到工作表：{cfg['sheet_name']}；当前工作表：{xls.sheet_names}")
@@ -2609,7 +2632,7 @@ class App:
 
         self.logbox = ScrolledText(self.root, height=22, font=("Consolas", 10))
         self.logbox.pack(fill="both", expand=True, padx=10, pady=6)
-        self.write_ui("抖音单图文发布v2.2 已启动。已增加在线更新：启动自动检查，也可点击“检查更新”。\n")
+        self.write_ui("抖音单图文发布v2.2.1 已启动。已增加在线更新：启动自动检查，也可点击“检查更新”。\n")
 
 
     def auto_check_update(self):
@@ -2677,7 +2700,13 @@ class App:
             messagebox.showerror("启动更新失败", repr(e))
 
     def choose_file(self, key):
-        p = filedialog.askopenfilename()
+        if key == "excel_path":
+            p = filedialog.askopenfilename(
+                title="选择文案Excel",
+                filetypes=[("Excel 文案表", "*.xlsx *.xls *.xlsm"), ("所有文件", "*.*")],
+            )
+        else:
+            p = filedialog.askopenfilename()
         if p:
             self.vars[key].set(p)
 

@@ -1,11 +1,9 @@
-上传 v2.2.1 更新步骤：
+上传步骤：
 
-1. 打开 GitHub 仓库：https://github.com/Hugh112/douyinshangchuan
-2. 点击 Add file / Upload files。
-3. 上传本文件夹里的 version.json。
-4. 进入或创建 packages 文件夹，上传 douyin_single_publish_v2.2.1_online_update_fixed.zip。
-5. Commit message 填：fix excel zip reader v2.2.1
-6. 点击 Commit changes。
+1. 解压 douyin_github_repo_v2.2.3_upload_ready.zip。
+2. 打开 douyin_github_repo_v2.2.3 文件夹。
+3. 把里面的 version.json、README.md、packages、.gitignore、上传到GitHub步骤.txt 上传到 GitHub 仓库根目录。
+4. 提交信息填写：fix zip filename encoding v2.2.3
+5. 点击提交更改。
 
-上传完成后，已经安装 v2.2.0 在线更新版的用户，点击软件里的“检查更新”即可升级。
-新用户可以直接下载 packages 里的 v2.2.1 压缩包。
+注意：不要把 douyin_github_repo_v2.2.3 这个外层文件夹上传进去，要上传它里面的内容。

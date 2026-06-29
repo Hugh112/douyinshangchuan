@@ -1,15 +1,14 @@
 {
-  "latest_version": "2.2.1",
-  "download_url": "https://raw.githubusercontent.com/Hugh112/douyinshangchuan/main/packages/douyin_single_publish_v2.2.1_online_update_fixed.zip",
-  "sha256": "fc14ca734f40cbe22cf0462db867c1b0661aee5e7222409bf7bd6edd06ebe5ce",
+  "latest_version": "2.2.3",
+  "download_url": "https://raw.githubusercontent.com/Hugh112/douyinshangchuan/main/packages/douyin_single_publish_v2.2.3_encoding_fixed.zip",
+  "sha256": "b6fa2eb94b0709fe5d9f95f868ad1bd46e9795ae743b35b159d591b9ab9a48c2",
   "force_update": false,
   "preserve_paths": [
     "app/douyin_gui_config.json"
   ],
   "release_notes": [
-    "修复文案Excel误选为 .zip 压缩包时出现 io.excel.zip.reader 报错的问题。",
-    "文案Excel选择窗口增加 Excel 文件筛选，降低选错文件概率。",
-    "读取文案前增加中文格式校验，选错文件会提示重新选择 .xlsx / .xls / .xlsm。",
+    "修复更新包/压缩包在部分 Windows 解压工具中中文文件名显示乱码的问题。",
+    "保留 v2.2.2 的 Excel/WPS 表格读取修复，继续避免 io.excel.zip.reader 报错。",
     "在线更新功能继续保留，更新时仍保留本机配置。"
   ]
 }

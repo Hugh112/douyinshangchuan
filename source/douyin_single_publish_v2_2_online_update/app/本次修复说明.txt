@@ -1,9 +1,0 @@
-抖音单图文发布 v2.2.1 修复说明
-
-1. 修复文案Excel误选为 .zip 压缩包时，pandas 报 io.excel.zip.reader 的问题。
-2. 文案Excel选择窗口增加 Excel 文件筛选，默认只显示 .xlsx / .xls / .xlsm。
-3. 读取文案前增加格式校验，选错文件会给出中文提示，不再直接输出底层报错。
-4. 在线更新功能继续保留，更新时仍会保留 app/douyin_gui_config.json。
-
-使用提醒：
-文案Excel必须选择真正的 Excel 表格，不要选择软件压缩包、程序目录或 GitHub 下载包。

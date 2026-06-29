@@ -1,0 +1,25 @@
+打开你要用的那个 Chrome 账号，在地址栏输入：
+chrome://version
+找到这一行：
+个人资料路径 / Profile Path
+如果显示：
+C:\Users\111\AppData\Local\Google\Chrome\User Data\Profile 20
+就拆成：
+浏览器用户目录：
+C:\Users\111\AppData\Local\Google\Chrome\User Data
+浏览器Profile目录：
+Profile 20
+如果显示：
+C:\Users\111\AppData\Local\Google\Chrome\User Data\Default
+就填：
+浏览器用户目录：
+C:\Users\111\AppData\Local\Google\Chrome\User Data
+浏览器Profile目录：
+Default
+如果你用的是脚本专用目录，例如：
+D:\douyin_chrome_zhejiang\Default
+那就填：
+浏览器用户目录：
+D:\douyin_chrome_zhejiang
+浏览器Profile目录：
+Default

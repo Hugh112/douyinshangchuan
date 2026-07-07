@@ -1,14 +1,16 @@
 {
-  "latest_version": "2.2.3",
-  "download_url": "https://raw.githubusercontent.com/Hugh112/douyinshangchuan/main/packages/douyin_single_publish_v2.2.3_encoding_fixed.zip",
-  "sha256": "b6fa2eb94b0709fe5d9f95f868ad1bd46e9795ae743b35b159d591b9ab9a48c2",
+  "latest_version": "2.2.4",
+  "download_url": "https://raw.githubusercontent.com/Hugh112/douyinshangchuan/main/packages/douyin_single_publish_v2.2.4_wps_py_fix.zip",
+  "sha256": "33a352591cc01ab503b55f4974d2e355e2768a536742234f1670e1d0ae945f31",
   "force_update": false,
   "preserve_paths": [
     "app/douyin_gui_config.json"
   ],
   "release_notes": [
-    "修复更新包/压缩包在部分 Windows 解压工具中中文文件名显示乱码的问题。",
-    "保留 v2.2.2 的 Excel/WPS 表格读取修复，继续避免 io.excel.zip.reader 报错。",
-    "在线更新功能继续保留，更新时仍保留本机配置。"
+    "修复文案文件误选 .py 脚本后，被 WPS/Excel 当成表格打开的问题。",
+    "文案文件选择框限制为 .xlsx、.xls、.xlsm、.csv、.txt，避免误选脚本文件。",
+    "保存配置和读取文案时增加文件格式校验，误选 .py 会直接提示，不再继续运行。",
+    "read_copies 增加 txt/csv 读取支持，Excel 读取失败时给出更明确提示。",
+    "本次更新不包含强制绑定 Python 3.12 的改动，仍使用当前系统默认 py。"
   ]
 }

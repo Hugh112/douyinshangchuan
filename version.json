@@ -1,17 +1,18 @@
 {
   "latest_version": "2.2.7",
-  "download_url": "https://cdn.jsdelivr.net/gh/Hugh112/douyinshangchuan@main/packages/douyin_single_publish_v2.2.7_clean_random_type_fix.zip",
-  "sha256": "e14e03adb59d8e031e1b8c84beec60587067541fefd4773dbacd6f55a7740576",
+  "download_url": "https://raw.githubusercontent.com/Hugh112/douyinshangchuan/main/packages/douyin_single_publish_v2.2.7_confirmed_update_ok.zip",
+  "sha256": "fea7af2dd97e6eba74ad6dfad7114ef24f59448b00993f271c7e773c5a5c2cdb",
   "force_update": false,
   "preserve_paths": [
     "app/douyin_gui_config.json"
   ],
   "release_notes": [
-    "基于 v2.2 新增随机图片基础版重新整理更新包。",
-    "保留运行选项中的随机使用图片功能，勾选后每次发布随机选择图片。",
-    "保留逐字输入文案和话题功能，不再覆盖为剪贴板粘贴版。",
+    "基于 v2.2.3 带检查更新版本重新制作。",
+    "保留检查更新按钮和 online_updater.py。",
+    "保留随机使用图片功能。",
+    "保留逐字输入正文和话题功能。",
+    "修复 v2.2.3 读取 jsDelivr 缓存导致可能更新到旧版本的问题。",
     "修复文案文件误选 .py 后被 WPS 当表格打开的问题。",
-    "清理无用文件和重复启动器，减少更新包冗余。",
     "本次更新不包含强制绑定 Python 3.12 的改动，仍使用当前系统默认 py。"
   ]
 }

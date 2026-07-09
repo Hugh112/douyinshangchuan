@@ -8,6 +8,6 @@
   ],
   "release_notes": [
     "修复线上更新包缺少根目录启动器的问题。",
-    "新增 Start_Douyin_Publisher_v2.2.5.vbs、Start_Douyin_Publisher_v2.2.5.bat 和 debug_start_v2.2.5.bat。"。"
+    "新增 Start_Douyin_Publisher_v2.2.5.vbs、Start_Douyin_Publisher_v2.2.5.bat 和 debug_start_v2.2.5.bat。"
   ]
 }

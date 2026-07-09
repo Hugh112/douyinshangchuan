@@ -1,6 +1,6 @@
 {
   "latest_version": "2.2.6",
-  "download_url": "https://raw.githubusercontent.com/Hugh112/douyinshangchuan/main/packages/douyin_single_publish_v2.2.6_keep_original_launcher_fix.zip",
+  "download_url": "https://cdn.jsdelivr.net/gh/Hugh112/douyinshangchuan@main/packages/douyin_single_publish_v2.2.6_keep_original_launcher_fix.zip",
   "sha256": "293fe6b628e71a72b30be14b417a79e55b38de9533d26cd62d65645e130fd2f5",
   "force_update": false,
   "preserve_paths": [

@@ -1,16 +1,13 @@
 {
-  "latest_version": "2.2.4",
-  "download_url": "https://raw.githubusercontent.com/Hugh112/douyinshangchuan/main/packages/douyin_single_publish_v2.2.4_wps_py_fix.zip",
-  "sha256": "33a352591cc01ab503b55f4974d2e355e2768a536742234f1670e1d0ae945f31",
+  "latest_version": "2.2.5",
+  "download_url": "https://raw.githubusercontent.com/Hugh112/douyinshangchuan/main/packages/douyin_single_publish_v2.2.5_launcher_encoding_fix.zip",
+  "sha256": "bc1efd3e0fa39359f8d9cbbc21bed81b6676a86369f051015201e1f3195b9ee1",
   "force_update": false,
   "preserve_paths": [
     "app/douyin_gui_config.json"
   ],
   "release_notes": [
-    "修复文案文件误选 .py 脚本后，被 WPS/Excel 当成表格打开的问题。",
-    "文案文件选择框限制为 .xlsx、.xls、.xlsm、.csv、.txt，避免误选脚本文件。",
-    "保存配置和读取文案时增加文件格式校验，误选 .py 会直接提示，不再继续运行。",
-    "read_copies 增加 txt/csv 读取支持，Excel 读取失败时给出更明确提示。",
-    "本次更新不包含强制绑定 Python 3.12 的改动，仍使用当前系统默认 py。"
+    "修复线上更新包缺少根目录启动器的问题。",
+    "新增 Start_Douyin_Publisher_v2.2.5.vbs、Start_Douyin_Publisher_v2.2.5.bat 和 debug_start_v2.2.5.bat。"。"
   ]
 }

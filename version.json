@@ -1,13 +1,17 @@
 {
-  "latest_version": "2.2.5",
-  "download_url": "https://raw.githubusercontent.com/Hugh112/douyinshangchuan/main/packages/douyin_single_publish_v2.2.5_launcher_encoding_fix.zip",
-  "sha256": "bc1efd3e0fa39359f8d9cbbc21bed81b6676a86369f051015201e1f3195b9ee1",
+  "latest_version": "2.2.6",
+  "download_url": "https://raw.githubusercontent.com/Hugh112/douyinshangchuan/main/packages/douyin_single_publish_v2.2.6_keep_original_launcher_fix.zip",
+  "sha256": "293fe6b628e71a72b30be14b417a79e55b38de9533d26cd62d65645e130fd2f5",
   "force_update": false,
   "preserve_paths": [
     "app/douyin_gui_config.json"
   ],
   "release_notes": [
-    "修复线上更新包缺少根目录启动器的问题。",
-    "新增 Start_Douyin_Publisher_v2.2.5.vbs、Start_Douyin_Publisher_v2.2.5.bat 和 debug_start_v2.2.5.bat。"
+    "修复线上更新后旧启动器没有被替换的问题，用户继续点击原启动器也能打开新版。",
+    "补齐 Start_Douyin_Publisher_v2.1、Start_Douyin_Publisher、start_app 等旧启动器文件名。",
+    "软件窗口标题更新为 v2.2.6，避免更新后仍显示 v2.1。",
+    "继续修复更新包中文文件名在部分 Windows 解压工具中显示乱码的问题。",
+    "保留 v2.2.4 的 WPS 误选 .py 文案文件修复。",
+    "本次更新不包含强制绑定 Python 3.12 的改动，仍使用当前系统默认 py。"
   ]
 }

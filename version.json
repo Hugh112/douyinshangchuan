@@ -1,18 +1,19 @@
 {
-  "latest_version": "2.2.7",
-  "download_url": "https://raw.githubusercontent.com/Hugh112/douyinshangchuan/main/packages/douyin_single_publish_v2.2.7_confirmed_update_ok.zip",
-  "sha256": "fea7af2dd97e6eba74ad6dfad7114ef24f59448b00993f271c7e773c5a5c2cdb",
+  "latest_version": "2.2.8",
+  "download_url": "https://raw.githubusercontent.com/Hugh112/douyinshangchuan/main/packages/douyin_single_publish_v2.2.8_validate_copy_fix.zip",
+  "sha256": "da45f40d741a2f9543299dbd993a0eb0d038f7367e6bd828e44051c23ece5c42",
   "force_update": false,
   "preserve_paths": [
     "app/douyin_gui_config.json"
   ],
   "release_notes": [
-    "基于 v2.2.3 带检查更新版本重新制作。",
+    "修复文案已经写入编辑框，却被错误判断为文案未填写的问题。",
+    "文案校验改为优先读取正文输入区域，不再只依赖整页文字。",
+    "校验时自动忽略换行、空格、标点以及零宽字符差异。",
+    "等待抖音快速检测和话题识别稳定后重复校验，减少动态页面造成的假失败。",
     "保留检查更新按钮和 online_updater.py。",
-    "保留随机使用图片功能。",
-    "保留逐字输入正文和话题功能。",
-    "修复 v2.2.3 读取 jsDelivr 缓存导致可能更新到旧版本的问题。",
-    "修复文案文件误选 .py 后被 WPS 当表格打开的问题。",
-    "本次更新不包含强制绑定 Python 3.12 的改动，仍使用当前系统默认 py。"
+    "保留随机使用图片和逐字输入正文、话题功能。",
+    "清理重复版本启动器，更新包只保留固定名称启动器。",
+    "本次更新不包含强制绑定 Python 3.12 的改动。"
   ]
 }

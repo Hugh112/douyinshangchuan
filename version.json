@@ -1,19 +1,14 @@
 {
-  "latest_version": "2.2.8",
-  "download_url": "https://raw.githubusercontent.com/Hugh112/douyinshangchuan/main/packages/douyin_single_publish_v2.2.8_validate_copy_fix.zip",
-  "sha256": "da45f40d741a2f9543299dbd993a0eb0d038f7367e6bd828e44051c23ece5c42",
-  "force_update": false,
+  "latest_version": "2.2.9",
+  "download_url": "https://github.com/Hugh112/douyinshangchuan/releases/download/v2.2.9/douyin_single_publish_v2.2.9_no_black_window_update.zip",
+  "sha256": "ce40eb3bbeb29da88f4061002ccc10fc46151f56f0bdace0f6137997b9ed2836",
+  "release_notes": [
+    "修复普通启动时出现或停留黑色命令行窗口的问题",
+    "新增无黑框 VBS 启动器，并隐藏 PowerShell、浏览器及更新器子进程窗口",
+    "更新完成后自动以无窗口方式重新启动",
+    "保留调试启动入口，便于查看异常日志"
+  ],
   "preserve_paths": [
     "app/douyin_gui_config.json"
-  ],
-  "release_notes": [
-    "修复文案已经写入编辑框，却被错误判断为文案未填写的问题。",
-    "文案校验改为优先读取正文输入区域，不再只依赖整页文字。",
-    "校验时自动忽略换行、空格、标点以及零宽字符差异。",
-    "等待抖音快速检测和话题识别稳定后重复校验，减少动态页面造成的假失败。",
-    "保留检查更新按钮和 online_updater.py。",
-    "保留随机使用图片和逐字输入正文、话题功能。",
-    "清理重复版本启动器，更新包只保留固定名称启动器。",
-    "本次更新不包含强制绑定 Python 3.12 的改动。"
   ]
 }

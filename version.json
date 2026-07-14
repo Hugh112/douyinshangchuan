@@ -1,14 +1,17 @@
 {
-  "latest_version": "2.2.9",
-  "download_url": "https://github.com/Hugh112/douyinshangchuan/releases/download/v2.2.9/douyin_single_publish_v2.2.9_no_black_window_update.zip",
-  "sha256": "ce40eb3bbeb29da88f4061002ccc10fc46151f56f0bdace0f6137997b9ed2836",
-  "release_notes": [
-    "修复普通启动时出现或停留黑色命令行窗口的问题",
-    "新增无黑框 VBS 启动器，并隐藏 PowerShell、浏览器及更新器子进程窗口",
-    "更新完成后自动以无窗口方式重新启动",
-    "保留调试启动入口，便于查看异常日志"
-  ],
+  "latest_version": "2.3.0",
+  "download_url": "https://raw.githubusercontent.com/Hugh112/douyinshangchuan/main/packages/douyin_single_publish_v2.3.0_no_black_window_update.zip",
+  "sha256": "b09060a1cfee662f06ac3ddc2d4c43bf0ca6ba4318aa9311a855d546fb65244a",
+  "force_update": false,
   "preserve_paths": [
     "app/douyin_gui_config.json"
+  ],
+  "release_notes": [
+    "修复普通启动时出现或停留黑色命令行窗口的问题。",
+    "新增无黑框 VBS 启动方式，普通启动时不再显示命令行窗口。",
+    "隐藏 PowerShell、浏览器启动及在线更新器产生的子进程窗口。",
+    "更新完成后使用无窗口方式自动重新启动软件。",
+    "保留检查更新、随机使用图片、逐字输入正文和话题功能。",
+    "保留调试启动入口，出现问题时仍可查看完整运行日志。"
   ]
 }

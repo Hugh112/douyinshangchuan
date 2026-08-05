@@ -57,7 +57,6 @@ OBSOLETE_PATHS = [
     "app/鏈淇璇存槑.txt",
     # v2.5.0 起以原生 EXE 启动；以下仅清理确定属于旧 Python/VBS 启动链的文件。
     "Start_Douyin_Publisher.bat",
-    "Start_Douyin_Publisher.vbs",
     "start_app.bat",
     "start_app.vbs",
     "debug_start.bat",
@@ -99,7 +98,7 @@ def download_with_retry(url, dst, retry=3, timeout=60):
     parsed = urllib.parse.urlparse(str(url or ""))
     if parsed.scheme.lower() != "https":
         raise RuntimeError("更新包下载地址必须使用 HTTPS。")
-    headers = {"User-Agent": "DouyinPublisherUpdater/2.5.0", "Cache-Control": "no-cache", "Pragma": "no-cache", "Connection": "close"}
+    headers = {"User-Agent": "DouyinPublisherUpdater/2.5.1", "Cache-Control": "no-cache", "Pragma": "no-cache", "Connection": "close"}
     last_err = None
     sep = "&" if "?" in url else "?"
     url2 = f"{url}{sep}_t={int(time.time())}"

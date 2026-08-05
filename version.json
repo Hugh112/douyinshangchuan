@@ -2,8 +2,8 @@
   "latest_version": "2.5.1",
   "minimum_supported_version": "2.4.0",
   "download_url": "https://github.com/Hugh112/douyinshangchuan/releases/download/v2.5.1/DouyinPublisher_Update_v2.5.1.zip",
-  "sha256": "04c8ae512d014b3c510500d5b57f7c579618f4284710e587dc419dab1527cb75",
-  "package_size_bytes": 89794780,
+  "sha256": "739be94a80c702e5d17c551442022ae5f4fe44dd024699a89344ad72e64640ec",
+  "package_size_bytes": 89805278,
   "force_update": false,
   "is_forced": false,
   "rollout_percentage": 100,
@@ -11,10 +11,10 @@
     "app/douyin_gui_config.json"
   ],
   "release_notes": [
-    "启动时先完成授权恢复或软件账号登录，授权成功后才展示发布配置主界面。",
-    "四个功能标签分别使用独立滚动容器，滚动互不影响；浏览器账号列表支持横向和纵向滚动。",
-    "任务控制固定在运行日志区域，在任意标签页都可直接操作；界面移除非必要的小字说明。",
-    "安装向导始终显示安装位置选择，支持用户自定义安装目录。",
-    "继续保留多浏览器顺序发布、账号专属内容、定时启动、授权心跳、遥测和安全在线更新。"
+    "同一浏览器可重复加入账号队列；每行拥有独立内容、发布时间和进度。",
+    "发布条数只取队列行配置，定时时间点不足时明确提示，不再受旧全局上限静默截断。",
+    "修复无表头 Excel 第一条文案被跳过，并及时释放 Excel 文件句柄。",
+    "发布中心集中等待、检测、失败重试和运行选项；账号与排期页面扩大队列表并支持全表导入导出。",
+    "保留授权心跳、遥测、多浏览器切换、暂停弹窗、安全在线更新和旧固定快捷方式兼容。"
   ]
 }

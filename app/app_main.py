@@ -55,7 +55,7 @@ except Exception:
     pass
 
 import pandas as pd
-from openpyxl import load_workbook
+from openpyxl import Workbook, load_workbook
 
 try:
     import tkinter as tk
@@ -332,7 +332,15 @@ def normalize_browser_account(raw, index, legacy_cfg=None):
     if not account_id:
         digest = hashlib.sha1(f"{index}|{browser_path}|{name}".encode("utf-8", errors="ignore")).hexdigest()[:10]
         account_id = f"browser_{digest}"
-    independent_content = parse_bool(raw.get("independent_content"), False)
+    def inherited(key, fallback=""):
+        return raw.get(key) if key in raw and raw.get(key) not in {None, ""} else legacy_cfg.get(key, fallback)
+
+    try:
+        start_hour = int(inherited("start_hour", 8))
+        end_hour = int(inherited("end_hour", 18))
+        per_hour_count = max(1, int(inherited("per_hour_count", 3)))
+    except Exception:
+        start_hour, end_hour, per_hour_count = 8, 18, 3
     return {
         "id": account_id,
         "name": name or f"浏览器{index + 1}",
@@ -347,19 +355,72 @@ def normalize_browser_account(raw, index, legacy_cfg=None):
         "cdp_port": port,
         "posts_per_run": posts,
         "close_after_finish": parse_bool(raw.get("close_after_finish"), True),
-        "independent_content": independent_content,
-        "image_dir": str(raw.get("image_dir") or "").strip(),
-        "excel_path": str(raw.get("excel_path") or "").strip(),
-        "sheet_name": str(raw.get("sheet_name") or "").strip(),
+        "independent_content": True,
+        "image_dir": str(inherited("image_dir", "") or "").strip(),
+        "excel_path": str(inherited("excel_path", "") or "").strip(),
+        "sheet_name": str(inherited("sheet_name", "sheet1") or "sheet1").strip(),
+        "use_schedule": parse_bool(inherited("use_schedule", True), True),
+        "publish_start_date": str(
+            inherited("publish_start_date", inherited("publish_date", "")) or ""
+        ).strip(),
+        "publish_end_date": str(
+            inherited("publish_end_date", inherited("publish_start_date", inherited("publish_date", ""))) or ""
+        ).strip(),
+        "start_hour": start_hour,
+        "end_hour": end_hour,
+        "per_hour_count": per_hour_count,
+        "custom_minutes": str(inherited("custom_minutes", "") or "").strip(),
     }
+
+
+def new_browser_queue_id():
+    """队列项必须有独立标识；同一浏览器可以在队列中出现多次。"""
+    return f"browser_{uuid.uuid4().hex[:12]}"
+
+
+def browser_runtime_identity(account):
+    """判断两个队列项是否连接同一个浏览器运行实例。"""
+    def normalized_path(value):
+        text = str(value or "").strip()
+        return os.path.normcase(os.path.normpath(text)) if text else ""
+
+    return (
+        normalized_path(account.get("browser_path")),
+        normalized_path(account.get("browser_user_data_dir")),
+        str(account.get("browser_profile_directory") or "").strip().casefold(),
+    )
+
+
+def validate_browser_queue_ports(accounts):
+    """相同浏览器可复用端口；不同浏览器仍禁止端口冲突。"""
+    port_owners = {}
+    for account in accounts:
+        port = int(account.get("cdp_port", 0) or 0)
+        identity = browser_runtime_identity(account)
+        previous = port_owners.get(port)
+        if previous is not None and previous != identity:
+            raise RuntimeError(
+                f"CDP 调试端口 {port} 被不同浏览器队列项重复使用；"
+                "同一浏览器可以重复排队，但不同浏览器必须使用不同端口。"
+            )
+        port_owners[port] = identity
 
 
 def browser_accounts_from_config(cfg, enabled_only=False):
     raw_accounts = cfg.get("browser_accounts")
     accounts = []
+    used_ids = set()
     if isinstance(raw_accounts, list):
         for index, raw in enumerate(raw_accounts):
-            accounts.append(normalize_browser_account(raw, index, cfg))
+            account = normalize_browser_account(raw, index, cfg)
+            account_id = str(account.get("id") or "").strip()
+            if account_id in used_ids:
+                seed = f"{account_id}|{index}|{account.get('browser_path')}|{account.get('name')}"
+                suffix = hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:8]
+                account_id = f"{account_id}_queue_{suffix}"
+                account["id"] = account_id
+            used_ids.add(account_id)
+            accounts.append(account)
     if not accounts:
         accounts = [normalize_browser_account({}, 0, cfg)]
         existing_paths = {str(Path(accounts[0]["browser_path"])).lower()}
@@ -385,17 +446,26 @@ def config_for_browser_account(cfg, account):
     result["cdp_port"] = int(account["cdp_port"])
     result["active_browser_account_id"] = account.get("id", "")
     result["active_browser_account_name"] = account.get("name", "")
-    if parse_bool(account.get("independent_content"), False):
-        for key in ("image_dir", "excel_path", "sheet_name"):
-            value = str(account.get(key) or "").strip()
-            if value:
-                result[key] = value
-        # 独立内容池必须有独立游标，避免账号 A 的进度跳过账号 B 的文案。
-        state_path = Path(str(cfg.get("state_path") or "douyin_publish_state.json"))
-        safe_id = re.sub(r"[^0-9A-Za-z_-]+", "_", str(account.get("id") or "account"))
-        result["state_path"] = str(
-            state_path.with_name(f"{state_path.stem}_{safe_id}{state_path.suffix or '.json'}")
+    # 每个队列项都拥有独立进度。排期序号不会从前一个浏览器接着累计；
+    # 同一个浏览器重复入队时，也按每一行队列任务分别计算。
+    base_state_path = Path(
+        str(cfg.get("_queue_state_base_path") or cfg.get("state_path") or "douyin_publish_state.json")
+    )
+    safe_id = re.sub(r"[^0-9A-Za-z_-]+", "_", str(account.get("id") or "account"))
+    result["_queue_state_base_path"] = str(base_state_path)
+    result["state_path"] = str(
+        base_state_path.with_name(
+            f"{base_state_path.stem}_{safe_id}{base_state_path.suffix or '.json'}"
         )
+    )
+    for key in (
+        "image_dir", "excel_path", "sheet_name", "publish_start_date",
+        "publish_end_date", "custom_minutes",
+    ):
+        result[key] = str(account.get(key) or "").strip()
+    for key in ("start_hour", "end_hour", "per_hour_count"):
+        result[key] = int(account.get(key, result.get(key, 0)) or 0)
+    result["use_schedule"] = parse_bool(account.get("use_schedule"), True)
     return result
 
 
@@ -428,7 +498,6 @@ def save_config(cfg):
 
 
 LEGACY_INSTALL_FILES = [
-    "Start_Douyin_Publisher.vbs",
     "Start_Douyin_Publisher.bat",
     "start_app.vbs",
     "start_app.bat",
@@ -924,7 +993,7 @@ def schedule_signature(cfg):
     ]
     return "|".join(f"{k}={str(cfg.get(k, ''))}" for k in keys)
 
-def build_slots(cfg):
+def build_slots(cfg, log_result=True):
     """
     v2.1：支持一次运行多日定时。
     新字段：publish_start_date / publish_end_date。
@@ -999,7 +1068,8 @@ def build_slots(cfg):
 
     if not slots:
         raise RuntimeError("没有生成任何定时时间，请检查日期、开始小时、结束小时、每小时条数和分钟点。")
-    wlog(f"已生成多日排期 {len(slots)} 个：从 {slots[0].strftime('%Y-%m-%d %H:%M')} 到 {slots[-1].strftime('%Y-%m-%d %H:%M')}")
+    if log_result:
+        wlog(f"已生成多日排期 {len(slots)} 个：从 {slots[0].strftime('%Y-%m-%d %H:%M')} 到 {slots[-1].strftime('%Y-%m-%d %H:%M')}")
     return slots
 
 
@@ -1014,6 +1084,23 @@ def list_images(cfg):
 
 
 COPY_FILE_EXTS = {".xlsx", ".xls", ".xlsm"}
+COPY_HEADER_NAMES = {
+    "文案", "正文", "内容", "标题", "发布文案", "抖音文案", "作品文案",
+    "文案内容", "正文内容", "发布内容",
+}
+
+BROWSER_QUEUE_TABLE_COLUMNS = [
+    ("顺序", "_order"), ("队列ID", "id"), ("账号名称", "name"),
+    ("启用", "enabled"), ("浏览器路径", "browser_path"),
+    ("用户数据目录", "browser_user_data_dir"), ("Profile目录", "browser_profile_directory"),
+    ("CDP端口", "cdp_port"), ("发布条数", "posts_per_run"),
+    ("完成后关闭浏览器", "close_after_finish"), ("图片文件夹", "image_dir"),
+    ("文案Excel", "excel_path"), ("工作表名", "sheet_name"),
+    ("使用定时发布", "use_schedule"), ("开始日期", "publish_start_date"),
+    ("结束日期", "publish_end_date"), ("开始小时", "start_hour"),
+    ("结束小时", "end_hour"), ("每小时条数", "per_hour_count"),
+    ("分钟点", "custom_minutes"),
+]
 
 
 def validate_copy_file_path(p):
@@ -1053,6 +1140,48 @@ def read_plain_copy_file(p):
     raise RuntimeError(f"无法读取文案文本文件：{p}")
 
 
+def copy_cell_text(value):
+    if value is None or (not isinstance(value, str) and pd.isna(value)):
+        return ""
+    return str(value).strip()
+
+
+def is_copy_header(value):
+    text = re.sub(r"[\s_\-/（）()：:]+", "", copy_cell_text(value)).casefold()
+    return text in COPY_HEADER_NAMES
+
+
+def extract_copy_texts(df):
+    """同时兼容有表头和无表头；无表头时第一行就是第一条文案。"""
+    if df is None:
+        return []
+    frame = df.dropna(how="all")
+    if frame.empty:
+        return []
+    frame = frame.reset_index(drop=True)
+    header_column = next(
+        (column for column in frame.columns if is_copy_header(frame.at[0, column])),
+        None,
+    )
+    if header_column is not None:
+        copy_column = header_column
+        first_data_row = 1
+    else:
+        copy_column = next(
+            (
+                column for column in frame.columns
+                if any(copy_cell_text(value) for value in frame[column].tolist())
+            ),
+            frame.columns[0],
+        )
+        first_data_row = 0
+    return [
+        copy_cell_text(value)
+        for value in frame.loc[first_data_row:, copy_column].tolist()
+        if copy_cell_text(value)
+    ]
+
+
 def read_copies(cfg):
     p = validate_copy_file_path(cfg.get("excel_path", ""))
     suffix = p.suffix.lower()
@@ -1070,13 +1199,16 @@ def read_copies(cfg):
             f"原始错误：{repr(e)}"
         ) from e
 
-    sheet = next((s for s in xls.sheet_names if s.lower() == str(cfg["sheet_name"]).lower()), None)
-    if not sheet:
-        raise RuntimeError(f"找不到工作表：{cfg['sheet_name']}；当前工作表：{xls.sheet_names}")
-
     try:
-        df = pd.read_excel(p, sheet_name=sheet, engine=engine).dropna(how="all")
+        sheet_names = list(xls.sheet_names)
+        sheet = next((s for s in sheet_names if s.lower() == str(cfg["sheet_name"]).lower()), None)
+        if not sheet:
+            raise RuntimeError(f"找不到工作表：{cfg['sheet_name']}；当前工作表：{sheet_names}")
+        # 必须用 header=None 原样读取。否则无表头表格的第一条正文会被 pandas 当成列名。
+        df = pd.read_excel(xls, sheet_name=sheet, header=None)
     except Exception as e:
+        if isinstance(e, RuntimeError) and str(e).startswith("找不到工作表："):
+            raise
         raise RuntimeError(
             "读取工作表失败。\n"
             f"当前选择：{p}\n"
@@ -1084,11 +1216,10 @@ def read_copies(cfg):
             "请尝试将表格另存为新的 .xlsx 文件，或新建空白表格复制文案列后再保存。\n"
             f"原始错误：{repr(e)}"
         ) from e
+    finally:
+        xls.close()
 
-    if df.empty:
-        return []
-    col = next((c for c in df.columns if "文案" in str(c)), df.columns[0])
-    return [str(v).strip() for v in df[col].tolist() if not pd.isna(v) and str(v).strip()]
+    return extract_copy_texts(df)
 
 
 def normalize_copy_text(value):
@@ -1155,6 +1286,7 @@ def delete_copy_from_excel(cfg, copy_text):
     sheet_name = next((s for s in wb.sheetnames if s.lower() == str(cfg["sheet_name"]).lower()), None)
     if not sheet_name:
         wlog(f"提醒：找不到工作表，无法删除已用文案：{cfg.get('sheet_name')}")
+        wb.close()
         return False
 
     ws = wb[sheet_name]
@@ -1162,7 +1294,7 @@ def delete_copy_from_excel(cfg, copy_text):
     copy_col = None
     for c in range(1, ws.max_column + 1):
         header = normalize_copy_text(ws.cell(row=1, column=c).value)
-        if "文案" in header:
+        if is_copy_header(header):
             copy_col = c
             break
 
@@ -1174,9 +1306,11 @@ def delete_copy_from_excel(cfg, copy_text):
 
     if copy_col is None:
         wlog("提醒：Excel 中没有找到可删除的文案列。")
+        wb.close()
         return False
 
-    candidate_rows = list(range(2, ws.max_row + 1)) + [1]
+    has_header = is_copy_header(ws.cell(row=1, column=copy_col).value)
+    candidate_rows = list(range(2 if has_header else 1, ws.max_row + 1))
 
     matched_row = None
     for r in candidate_rows:
@@ -1196,17 +1330,21 @@ def delete_copy_from_excel(cfg, copy_text):
 
     if matched_row is None:
         wlog("提醒：未在 Excel 中找到匹配的已用文案，未删除。")
+        wb.close()
         return False
 
     try:
         ws.delete_rows(matched_row, 1)
         wb.save(p)
+        wb.close()
         wlog(f"已删除 Excel 中已用文案：第 {matched_row} 行。")
         return True
     except PermissionError:
+        wb.close()
         wlog(f"删除文案失败：Excel 文件被占用，无法保存：{p}。请关闭 WPS/Excel 里的这个文件。")
         return False
     except Exception as e:
+        wb.close()
         wlog(f"删除文案失败：保存 Excel 时出错：{repr(e)}")
         return False
 
@@ -2923,17 +3061,14 @@ def account_worker(config_path):
     accounts = browser_accounts_from_config(cfg, enabled_only=True)
     if not accounts:
         raise RuntimeError("没有启用任何浏览器账号，请在发布中心至少启用一个浏览器。")
-
-    ports = [int(account["cdp_port"]) for account in accounts]
-    if len(ports) != len(set(ports)):
-        raise RuntimeError("已启用的浏览器账号存在重复调试端口，请为每个账号设置不同端口。")
+    validate_browser_queue_ports(accounts)
 
     # 独立子进程只处理一个账号；先把该账号绑定的内容池映射成有效配置。
     cfg = config_for_browser_account(cfg, accounts[0])
     cfg["browser_accounts"] = [accounts[0]]
     ACTIVE_CFG = cfg
     copies = read_copies(cfg)
-    slots = build_slots(cfg)
+    slots = build_slots(cfg) if cfg.get("use_schedule", True) else []
     state = read_state(cfg)
     current_schedule_signature = schedule_signature(cfg)
     if state.get("schedule_signature") != current_schedule_signature:
@@ -2945,17 +3080,19 @@ def account_worker(config_path):
 
     ci = 0 if cfg.get("delete_copy_after_success", True) else int(state.get("copy_index", 0) or 0)
     si = int(state.get("slot_index", 0) or 0)
-    max_run = max(0, int(cfg.get("max_posts_this_run", 0) or 0))
     retry_times = max(0, int(cfg.get("retry_times", 2) or 0))
     total_done = 0
     stop_all = False
 
     wlog(f"本轮启用 {len(accounts)} 个浏览器账号；发布失败最多重试 {retry_times} 次。")
     wlog(f"读取文案 {len(copies)} 条，当前文案序号：{ci + 1}")
-    wlog(f"排期 {len(slots)} 个，当前排期序号：{si + 1}")
+    if cfg.get("use_schedule", True):
+        wlog(f"独立排期 {len(slots)} 个，当前排期序号：{si + 1}")
+    else:
+        wlog("此队列项使用立即发布；发布条数只取账号队列配置。")
 
     for account_index, account in enumerate(accounts, start=1):
-        if stop_all or (max_run and total_done >= max_run):
+        if stop_all:
             break
 
         account_cfg = config_for_browser_account(cfg, account)
@@ -2969,7 +3106,23 @@ def account_worker(config_path):
 
         wlog("=" * 60)
         wlog(f"切换到 {account_name}（{account_index}/{len(accounts)}），本账号计划发布 {account_quota} 条。")
+        wlog(
+            f"{account_name} 使用独立队列进度；本轮条数只取账号队列配置，"
+            f"当前从排期序号 {si + 1} 开始。"
+        )
         emit_browser_status(account, "launching", "正在启动并连接浏览器", account_done, account_quota)
+
+        if account_cfg.get("use_schedule", True) and si + account_quota > len(slots):
+            remaining = max(0, len(slots) - si)
+            message = (
+                f"排期容量不足：{account_name} 的队列发布条数为 {account_quota}，"
+                f"但从当前独立进度开始只剩 {remaining} 个定时时间。"
+                "请增加日期、小时范围或每小时条数后重新开始。"
+            )
+            emit_browser_status(account, "error", message, account_done, account_quota)
+            alert_auto_pause(message)
+            stop_all = True
+            break
 
         try:
             playwright_manager = sync_playwright()
@@ -2988,11 +3141,6 @@ def account_worker(config_path):
             emit_browser_status(account, "ready", "登录有效，已进入图文发布页", account_done, account_quota)
 
             while account_done < account_quota:
-                if max_run and total_done >= max_run:
-                    wlog(f"已达到本次运行总数量限制：{max_run}")
-                    stop_all = True
-                    break
-
                 imgs = list_images(account_cfg)
                 if not imgs:
                     alert_auto_pause("提醒：图片文件夹已没有可发布图片，全部任务结束。")
@@ -3191,38 +3339,25 @@ def run_isolated_browser_sequence(config_path, child_switch, publish_mode=False)
     accounts = browser_accounts_from_config(cfg, enabled_only=True)
     if not accounts:
         raise RuntimeError("没有启用任何浏览器账号。")
-    ports = [int(account["cdp_port"]) for account in accounts]
-    if len(ports) != len(set(ports)):
-        raise RuntimeError("启用的浏览器账号存在重复 CDP 调试端口。")
-
-    if publish_mode:
-        state = read_state(cfg)
-        signature = schedule_signature(cfg)
-        if state.get("schedule_signature") != signature:
-            state["slot_index"] = 0
-            state["schedule_signature"] = signature
-            write_state(cfg, state)
-
-    global_limit = max(0, int(cfg.get("max_posts_this_run", 0) or 0)) if publish_mode else 0
+    validate_browser_queue_ports(accounts)
     total_done = 0
     temp_root = Path(tempfile.mkdtemp(prefix="douyin_browser_sequence_"))
     try:
         for index, account in enumerate(accounts, start=1):
-            if global_limit and total_done >= global_limit:
-                break
             child_cfg = copy.deepcopy(cfg)
             child_account = copy.deepcopy(account)
             quota = max(1, int(child_account.get("posts_per_run", 1) or 1))
-            if global_limit:
-                quota = min(quota, global_limit - total_done)
             child_account["posts_per_run"] = quota
             child_cfg["browser_accounts"] = [child_account]
-            if publish_mode:
-                child_cfg["max_posts_this_run"] = quota
             child_path = temp_root / f"account_{index}.json"
             child_path.write_text(json.dumps(child_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
             resolved_child_cfg = config_for_browser_account(child_cfg, child_account)
-            before_slot = int(read_state(resolved_child_cfg).get("slot_index", 0) or 0) if publish_mode else 0
+            before_state = read_state(resolved_child_cfg) if publish_mode else {}
+            before_slot = (
+                int(before_state.get("slot_index", 0) or 0)
+                if before_state.get("schedule_signature") == schedule_signature(resolved_child_cfg)
+                else 0
+            ) if publish_mode else 0
             wlog(f"独立进程 {index}/{len(accounts)}：{account['name']}")
             command = application_command(child_switch, child_path)
             env = os.environ.copy()
@@ -3279,9 +3414,7 @@ def probe_account_in_process(config_path):
     accounts = browser_accounts_from_config(cfg, enabled_only=True)
     if not accounts:
         raise RuntimeError("没有启用任何浏览器账号。")
-    ports = [int(account["cdp_port"]) for account in accounts]
-    if len(ports) != len(set(ports)):
-        raise RuntimeError("浏览器账号存在重复 CDP 调试端口。")
+    validate_browser_queue_ports(accounts)
     ready_count = 0
     for index, account in enumerate(accounts, start=1):
         account_cfg = config_for_browser_account(cfg, account)
@@ -3383,7 +3516,7 @@ class BrowserAccountDialog:
         self.result = None
         self.window = tk.Toplevel(owner)
         self.window.title(title)
-        self.window.geometry("760x680")
+        self.window.geometry("820x720")
         self.window.resizable(False, False)
         self.window.transient(owner)
         self.window.grab_set()
@@ -3397,12 +3530,16 @@ class BrowserAccountDialog:
             "image_dir": tk.StringVar(value=str(account.get("image_dir", ""))),
             "excel_path": tk.StringVar(value=str(account.get("excel_path", ""))),
             "sheet_name": tk.StringVar(value=str(account.get("sheet_name", ""))),
+            "publish_start_date": tk.StringVar(value=str(account.get("publish_start_date", ""))),
+            "publish_end_date": tk.StringVar(value=str(account.get("publish_end_date", ""))),
+            "start_hour": tk.StringVar(value=str(account.get("start_hour", 8))),
+            "end_hour": tk.StringVar(value=str(account.get("end_hour", 18))),
+            "per_hour_count": tk.StringVar(value=str(account.get("per_hour_count", 3))),
+            "custom_minutes": tk.StringVar(value=str(account.get("custom_minutes", ""))),
         }
         self.enabled_var = tk.BooleanVar(value=parse_bool(account.get("enabled"), True))
         self.close_var = tk.BooleanVar(value=parse_bool(account.get("close_after_finish"), True))
-        self.independent_content_var = tk.BooleanVar(
-            value=parse_bool(account.get("independent_content"), False)
-        )
+        self.use_schedule_var = tk.BooleanVar(value=parse_bool(account.get("use_schedule"), True))
         self.original_id = str(account.get("id", ""))
         self._build()
         self.window.protocol("WM_DELETE_WINDOW", self.window.destroy)
@@ -3411,9 +3548,16 @@ class BrowserAccountDialog:
     def _build(self):
         outer = ttk.Frame(self.window, padding=20)
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="浏览器账号配置", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor="w")
-        form = ttk.Frame(outer)
-        form.pack(fill="x", pady=(14, 0))
+        ttk.Label(outer, text="浏览器队列项配置", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor="w")
+        notebook = ttk.Notebook(outer)
+        notebook.pack(fill="both", expand=True, pady=(14, 10))
+        account_tab = ttk.Frame(notebook, padding=16)
+        schedule_tab = ttk.Frame(notebook, padding=16)
+        notebook.add(account_tab, text="浏览器与内容")
+        notebook.add(schedule_tab, text="独立发布时间")
+
+        form = ttk.Frame(account_tab)
+        form.pack(fill="x")
         rows = [
             ("账号名称", "name", None),
             ("快捷方式 / EXE", "browser_path", "file"),
@@ -3428,23 +3572,18 @@ class BrowserAccountDialog:
             if browse:
                 ttk.Button(form, text="选择", command=lambda k=key, b=browse: self._browse(k, b)).grid(row=row, column=2, padx=(8, 0), pady=7)
         form.columnconfigure(1, weight=1)
-        checks = ttk.Frame(outer)
+        checks = ttk.Frame(account_tab)
         checks.pack(fill="x", pady=(12, 8))
         ttk.Checkbutton(checks, text="启用此浏览器账号", variable=self.enabled_var).pack(side="left", padx=(150, 18))
         ttk.Checkbutton(checks, text="完成后关闭本软件启动的浏览器", variable=self.close_var).pack(side="left")
-        content = ttk.LabelFrame(outer, text="账号专属内容", padding=12)
+        content = ttk.LabelFrame(account_tab, text="账号发布内容", padding=12)
         content.pack(fill="x", pady=(8, 8))
-        ttk.Checkbutton(
-            content,
-            text="使用账号专属内容",
-            variable=self.independent_content_var,
-        ).grid(row=0, column=0, columnspan=3, sticky="w", pady=(0, 7))
         content_rows = [
             ("图片文件夹", "image_dir", "folder"),
             ("文案 Excel", "excel_path", "excel"),
             ("工作表名", "sheet_name", None),
         ]
-        for row, (label, key, browse) in enumerate(content_rows, start=1):
+        for row, (label, key, browse) in enumerate(content_rows):
             ttk.Label(content, text=label, width=16, anchor="e").grid(
                 row=row, column=0, padx=(0, 10), pady=5, sticky="e"
             )
@@ -3458,8 +3597,33 @@ class BrowserAccountDialog:
                     command=lambda k=key, b=browse: self._browse(k, b),
                 ).grid(row=row, column=2, padx=(8, 0), pady=5)
         content.columnconfigure(1, weight=1)
+
+        ttk.Checkbutton(
+            schedule_tab,
+            text="使用抖音定时发布（未勾选时立即发布）",
+            variable=self.use_schedule_var,
+        ).pack(anchor="w", pady=(0, 12))
+        schedule_form = ttk.Frame(schedule_tab)
+        schedule_form.pack(fill="x")
+        schedule_rows = [
+            ("开始日期", "publish_start_date"),
+            ("结束日期", "publish_end_date"),
+            ("开始小时", "start_hour"),
+            ("结束小时 0-24", "end_hour"),
+            ("每小时条数", "per_hour_count"),
+            ("分钟点", "custom_minutes"),
+        ]
+        for row, (label, key) in enumerate(schedule_rows):
+            ttk.Label(schedule_form, text=label, width=20, anchor="e").grid(
+                row=row, column=0, padx=(0, 10), pady=8, sticky="e"
+            )
+            ttk.Entry(schedule_form, textvariable=self.vars[key], width=52).grid(
+                row=row, column=1, pady=8, sticky="we"
+            )
+        schedule_form.columnconfigure(1, weight=1)
+
         actions = ttk.Frame(outer)
-        actions.pack(fill="x", side="bottom")
+        actions.pack(fill="x")
         ttk.Button(actions, text="取消", command=self.window.destroy).pack(side="right", padx=(8, 0))
         ttk.Button(actions, text="保存账号", style="Accent.TButton", command=self._save).pack(side="right")
 
@@ -3495,14 +3659,12 @@ class BrowserAccountDialog:
                 raise ValueError("CDP 调试端口必须在 1—65535 之间。")
             if posts < 1:
                 raise ValueError("每个浏览器本轮至少发布 1 条。")
-            independent_content = self.independent_content_var.get()
             image_dir = self.vars["image_dir"].get().strip()
             excel_path = self.vars["excel_path"].get().strip()
             sheet_name = self.vars["sheet_name"].get().strip()
-            if independent_content:
-                if not image_dir or not excel_path or not sheet_name:
-                    raise ValueError("启用账号专属内容后，图片文件夹、文案 Excel 和工作表名都必须填写。")
-                validate_copy_file_path(excel_path)
+            if not image_dir or not excel_path or not sheet_name:
+                raise ValueError("图片文件夹、文案 Excel 和工作表名都必须填写。")
+            validate_copy_file_path(excel_path)
             raw = {
                 "id": self.original_id,
                 "name": name,
@@ -3513,14 +3675,27 @@ class BrowserAccountDialog:
                 "cdp_port": port,
                 "posts_per_run": posts,
                 "close_after_finish": self.close_var.get(),
-                "independent_content": independent_content,
+                "independent_content": True,
                 "image_dir": image_dir,
                 "excel_path": excel_path,
                 "sheet_name": sheet_name,
+                "use_schedule": self.use_schedule_var.get(),
+                "publish_start_date": self.vars["publish_start_date"].get().strip(),
+                "publish_end_date": self.vars["publish_end_date"].get().strip(),
+                "start_hour": int(self.vars["start_hour"].get().strip() or 0),
+                "end_hour": int(self.vars["end_hour"].get().strip() or 0),
+                "per_hour_count": int(self.vars["per_hour_count"].get().strip() or 0),
+                "custom_minutes": self.vars["custom_minutes"].get().strip(),
             }
             self.result = normalize_browser_account(raw, 0, {})
             if self.original_id:
                 self.result["id"] = self.original_id
+            if self.result.get("use_schedule", True):
+                slots = build_slots(config_for_browser_account({}, self.result))
+                if posts > len(slots):
+                    raise ValueError(
+                        f"此队列项计划发布 {posts} 条，但独立发布时间只生成 {len(slots)} 个时间点。"
+                    )
             self.window.destroy()
         except Exception as exc:
             messagebox.showwarning("账号配置无效", str(exc), parent=self.window)
@@ -3738,7 +3913,7 @@ class App:
         self.notebook = notebook
         notebook.grid(row=1, column=0, sticky="nsew", padx=14, pady=(12, 14))
         publish_tab = self._create_scrollable_tab(notebook, "发布中心")
-        settings_tab = self._create_scrollable_tab(notebook, "发布设置")
+        settings_tab = self._create_scrollable_tab(notebook, "账号与排期")
         weekly_tab = self._create_scrollable_tab(notebook, "自动启动")
         system_tab = self._create_scrollable_tab(notebook, "系统与日志")
         self._build_publish_tab(publish_tab)
@@ -3754,28 +3929,47 @@ class App:
 
     def _build_publish_tab(self, parent):
         parent.grid_columnconfigure(0, weight=1)
-        parent.grid_rowconfigure(1, weight=1)
-        card, body = self._card(parent, "发布内容")
-        card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        body.columnconfigure(1, weight=1)
-        row = 0
-        row = self.add_row(body, row, "图片文件夹", "image_dir", "folder")
-        row = self.add_row(body, row, "文案 Excel", "excel_path", "file")
-        self.add_row(body, row, "工作表名", "sheet_name", width=30)
+        wait_card, waits = self._card(parent, "等待与检测")
+        wait_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        fields = [
+            ("每步最小等待秒", "wait_min_seconds"), ("每步最大等待秒", "wait_max_seconds"),
+            ("发布间隔最小秒", "publish_interval_min_seconds"), ("发布间隔最大秒", "publish_interval_max_seconds"),
+            ("上传检测间隔秒", "upload_check_interval_seconds"), ("上传最大等待秒", "upload_max_wait_seconds"),
+            ("话题识别等待秒", "topic_wait_seconds"), ("创作者中心等待秒", "creator_center_wait_seconds"),
+            ("失败重试次数", "retry_times"),
+        ]
+        self._build_field_grid(waits, fields, columns=4)
 
+        option_card, options = self._card(parent, "运行选项")
+        option_card.grid(row=1, column=0, sticky="ew")
+        option_items = [
+            ("发布成功后删除图片", "delete_image_after_success"),
+            ("发布成功后删除文案", "delete_copy_after_success"),
+            ("随机使用图片", "random_image"),
+            ("复用已存在调试端口", "reuse_existing_cdp"),
+            ("启动前关闭 Chrome 残留", "close_chrome_before_start"),
+            ("后台运行不拉起浏览器", "no_raise_browser"),
+        ]
+        for index, (text, key) in enumerate(option_items):
+            value = tk.BooleanVar(value=parse_bool(self.cfg.get(key), False))
+            self.bool_vars[key] = value
+            ttk.Checkbutton(options, text=text, variable=value).grid(
+                row=index // 3, column=index % 3, padx=12, pady=8, sticky="w"
+            )
+
+    def _build_browser_queue_card(self, parent):
         card, body = self._card(parent, "浏览器账号队列")
-        card.grid(row=1, column=0, sticky="nsew", pady=(0, 10))
         tree_frame = ttk.Frame(body)
         tree_frame.pack(fill="both", expand=True)
         tree_frame.grid_rowconfigure(0, weight=1)
         tree_frame.grid_columnconfigure(0, weight=1)
-        columns = ("order", "name", "path", "content", "port", "quota", "enabled", "status")
-        self.browser_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=3, selectmode="browse")
-        headings = {"order": "顺序", "name": "账号名称", "path": "浏览器快捷方式 / EXE", "content": "内容来源", "port": "端口", "quota": "发布条数", "enabled": "启用", "status": "运行状态"}
-        widths = {"order": 48, "name": 105, "path": 310, "content": 115, "port": 66, "quota": 76, "enabled": 58, "status": 145}
+        columns = ("order", "name", "path", "image", "excel", "schedule", "port", "quota", "enabled", "status")
+        self.browser_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=8, selectmode="browse")
+        headings = {"order": "顺序", "name": "账号名称", "path": "浏览器快捷方式 / EXE", "image": "图片文件夹", "excel": "文案 Excel", "schedule": "独立发布时间", "port": "端口", "quota": "发布条数", "enabled": "启用", "status": "运行状态"}
+        widths = {"order": 48, "name": 105, "path": 250, "image": 190, "excel": 190, "schedule": 230, "port": 66, "quota": 76, "enabled": 58, "status": 145}
         for key in columns:
             self.browser_tree.heading(key, text=headings[key])
-            self.browser_tree.column(key, width=widths[key], anchor="center" if key != "path" else "w", stretch=(key == "path"))
+            self.browser_tree.column(key, width=widths[key], anchor="center" if key not in {"path", "image", "excel", "schedule"} else "w", stretch=(key == "path"))
         vertical_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.browser_tree.yview)
         horizontal_scroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.browser_tree.xview)
         self.browser_tree.configure(
@@ -3792,11 +3986,21 @@ class App:
         actions = ttk.Frame(body)
         actions.pack(fill="x", pady=(10, 0))
         for text, command in [
-            ("添加", self.add_browser_account), ("编辑", self.edit_browser_account),
+            ("添加", self.add_browser_account), ("复制", self.duplicate_browser_account),
+            ("编辑", self.edit_browser_account),
             ("删除", self.remove_browser_account), ("上移", lambda: self.move_browser_account(-1)),
-            ("下移", lambda: self.move_browser_account(1)), ("批量导入快捷方式", self.import_browser_shortcuts),
+            ("下移", lambda: self.move_browser_account(1)),
         ]:
             ttk.Button(actions, text=text, command=command).pack(side="left", padx=(0, 6))
+        table_actions = ttk.Frame(body)
+        table_actions.pack(fill="x", pady=(8, 0))
+        for text, command in [
+            ("批量导入快捷方式", self.import_browser_shortcuts),
+            ("导入队列全表", self.import_browser_queue_table),
+            ("导出队列全表", self.export_browser_queue_table),
+        ]:
+            ttk.Button(table_actions, text=text, command=command).pack(side="left", padx=(0, 6))
+        return card
 
     def _build_runtime_panel(self, parent):
         runtime_card, runtime = self._card(parent, "运行日志")
@@ -3827,41 +4031,8 @@ class App:
 
     def _build_settings_tab(self, parent):
         parent.grid_columnconfigure(0, weight=1)
-        schedule_card, schedule = self._card(parent, "抖音发布时间")
-        schedule_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
-        fields = [
-            ("开始日期", "publish_start_date"), ("结束日期", "publish_end_date"),
-            ("开始小时", "start_hour"), ("结束小时 0-24", "end_hour"),
-            ("每小时条数", "per_hour_count"), ("分钟点", "custom_minutes"),
-            ("本轮最多发布 0 不限", "max_posts_this_run"), ("失败重试次数", "retry_times"),
-        ]
-        self._build_field_grid(schedule, fields, columns=4)
-
-        wait_card, waits = self._card(parent, "等待与检测")
-        wait_card.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        fields = [
-            ("每步最小等待秒", "wait_min_seconds"), ("每步最大等待秒", "wait_max_seconds"),
-            ("发布间隔最小秒", "publish_interval_min_seconds"), ("发布间隔最大秒", "publish_interval_max_seconds"),
-            ("上传检测间隔秒", "upload_check_interval_seconds"), ("上传最大等待秒", "upload_max_wait_seconds"),
-            ("话题识别等待秒", "topic_wait_seconds"), ("创作者中心等待秒", "creator_center_wait_seconds"),
-        ]
-        self._build_field_grid(waits, fields, columns=4)
-
-        option_card, options = self._card(parent, "运行选项")
-        option_card.grid(row=2, column=0, sticky="ew")
-        option_items = [
-            ("发布成功后删除图片", "delete_image_after_success"),
-            ("发布成功后删除文案", "delete_copy_after_success"),
-            ("使用抖音定时发布", "use_schedule"),
-            ("随机使用图片", "random_image"),
-            ("复用已存在调试端口", "reuse_existing_cdp"),
-            ("启动前关闭 Chrome 残留", "close_chrome_before_start"),
-            ("后台运行不拉起浏览器", "no_raise_browser"),
-        ]
-        for index, (text, key) in enumerate(option_items):
-            value = tk.BooleanVar(value=parse_bool(self.cfg.get(key), False))
-            self.bool_vars[key] = value
-            ttk.Checkbutton(options, text=text, variable=value).grid(row=index // 3, column=index % 3, padx=12, pady=8, sticky="w")
+        queue_card = self._build_browser_queue_card(parent)
+        queue_card.grid(row=0, column=0, sticky="ew")
 
     def _build_field_grid(self, parent, fields, columns=4):
         for index, (label, key) in enumerate(fields):
@@ -4261,8 +4432,7 @@ class App:
         self.telemetry_task_id = uuid.uuid4().hex
         accounts = browser_accounts_from_config(self.cfg, enabled_only=True)
         planned = sum(max(1, int(item.get("posts_per_run", 1) or 1)) for item in accounts)
-        global_limit = max(0, int(self.cfg.get("max_posts_this_run", 0) or 0))
-        self.telemetry_planned_count = min(planned, global_limit) if global_limit else planned
+        self.telemetry_planned_count = planned
         self.telemetry_success_by_account = {}
         self.telemetry_failed_accounts = set()
 
@@ -4389,7 +4559,7 @@ class App:
 
     def collect_cfg(self):
         cfg = self.cfg.copy()
-        int_keys = {"start_hour", "end_hour", "per_hour_count", "max_posts_this_run", "retry_times"}
+        int_keys = {"retry_times"}
         float_keys = {
             "wait_min_seconds", "wait_max_seconds", "publish_interval_min_seconds",
             "publish_interval_max_seconds", "upload_check_interval_seconds",
@@ -4414,24 +4584,33 @@ class App:
         enabled = [account for account in cfg["browser_accounts"] if account.get("enabled", True)]
         if not enabled:
             raise ValueError("至少启用一个浏览器账号。")
-        ports = [int(account["cdp_port"]) for account in enabled]
-        if len(ports) != len(set(ports)):
-            raise ValueError("启用的浏览器账号不能使用重复的 CDP 调试端口。")
+        validate_browser_queue_ports(enabled)
         for account in enabled:
             if not account.get("browser_path"):
                 raise ValueError(f"浏览器账号“{account.get('name')}”未设置快捷方式或 EXE。")
-        excel_path = str(cfg.get("excel_path", "")).strip()
-        if excel_path and Path(excel_path).suffix.lower() not in COPY_FILE_EXTS:
-            raise ValueError("文案文件只能选择 .xlsx、.xls 或 .xlsm。")
         for account in enabled:
-            if not parse_bool(account.get("independent_content"), False):
-                continue
             account_cfg = config_for_browser_account(cfg, account)
             validate_copy_file_path(account_cfg.get("excel_path", ""))
             if not Path(account_cfg.get("image_dir", "")).is_dir():
-                raise ValueError(f"账号“{account['name']}”的专属图片文件夹不存在。")
+                raise ValueError(f"队列项“{account['name']}”的图片文件夹不存在。")
             if not str(account_cfg.get("sheet_name") or "").strip():
-                raise ValueError(f"账号“{account['name']}”的专属工作表名不能为空。")
+                raise ValueError(f"队列项“{account['name']}”的工作表名不能为空。")
+            if account_cfg.get("use_schedule", True):
+                slots = build_slots(account_cfg, log_result=False)
+                state = read_state(account_cfg)
+                slot_index = (
+                    int(state.get("slot_index", 0) or 0)
+                    if state.get("schedule_signature") == schedule_signature(account_cfg)
+                    else 0
+                )
+                quota = max(1, int(account.get("posts_per_run", 1) or 1))
+                remaining = max(0, len(slots) - slot_index)
+                if quota > remaining:
+                    raise ValueError(
+                        f"队列项“{account['name']}”本轮要发布 {quota} 条，"
+                        f"但从自己的当前排期进度开始只剩 {remaining} 个时间点。"
+                        "请增加该队列项的日期、小时范围或每小时条数，或重置发布进度。"
+                    )
         first = enabled[0]
         cfg["browser_path"] = first["browser_path"]
         cfg["browser_user_data_dir"] = first.get("browser_user_data_dir", "")
@@ -4471,13 +4650,24 @@ class App:
             account_id = str(account["id"])
             status = self.browser_statuses.get(account_id, "等待任务")
             tag = "error" if any(word in status for word in ("掉号", "失败", "错误")) else ("ok" if any(word in status for word in ("完成", "就绪")) else "warn" if "检查" in status else "")
+            schedule_text = "立即发布"
+            if parse_bool(account.get("use_schedule"), True):
+                start_date = str(account.get("publish_start_date") or "")
+                end_date = str(account.get("publish_end_date") or start_date)
+                date_text = start_date if start_date == end_date else f"{start_date}~{end_date}"
+                schedule_text = (
+                    f"{date_text} {account.get('start_hour', 0)}-{account.get('end_hour', 0)}时 "
+                    f"{account.get('custom_minutes') or (str(account.get('per_hour_count', 1)) + '条/时')}"
+                )
             self.browser_tree.insert(
                 "", "end", iid=account_id,
                 values=(
                     index,
                     account["name"],
                     account["browser_path"],
-                    "账号专属" if account.get("independent_content") else "继承全局",
+                    account.get("image_dir", ""),
+                    account.get("excel_path", ""),
+                    schedule_text,
                     account["cdp_port"],
                     account["posts_per_run"],
                     "是" if account.get("enabled", True) else "否",
@@ -4515,16 +4705,30 @@ class App:
     def add_browser_account(self):
         if not self.ensure_account_editable():
             return
-        dialog = BrowserAccountDialog(self.root, {
+        initial = normalize_browser_account({
+            "id": new_browser_queue_id(),
             "name": f"浏览器{len(self.browser_accounts) + 1}", "cdp_port": self.next_available_port(),
             "posts_per_run": 1, "enabled": True, "close_after_finish": True,
-        }, "添加浏览器账号")
+        }, len(self.browser_accounts), self.cfg)
+        dialog = BrowserAccountDialog(self.root, initial, "添加浏览器队列项")
         if dialog.result:
-            if any(Path(account["browser_path"]) == Path(dialog.result["browser_path"]) for account in self.browser_accounts):
-                messagebox.showwarning("重复账号", "这个浏览器快捷方式已经在列表中。")
-                return
+            dialog.result["id"] = initial["id"]
             self.browser_accounts.append(dialog.result)
             self.refresh_browser_tree()
+
+    def duplicate_browser_account(self):
+        if not self.ensure_account_editable():
+            return
+        index = self.selected_browser_index()
+        if index is None:
+            messagebox.showinfo("请选择队列项", "请先选择要复制的浏览器队列项。")
+            return
+        duplicate = copy.deepcopy(self.browser_accounts[index])
+        duplicate["id"] = new_browser_queue_id()
+        duplicate["name"] = f"{duplicate.get('name') or '浏览器'}（再次执行）"
+        self.browser_accounts.insert(index + 1, duplicate)
+        self.refresh_browser_tree()
+        self.browser_tree.selection_set(duplicate["id"])
 
     def edit_browser_account(self):
         if not self.ensure_account_editable():
@@ -4571,22 +4775,146 @@ class App:
             initialdir="D:\\" if Path("D:\\").exists() else None,
             filetypes=[("浏览器快捷方式", "*.lnk"), ("浏览器程序", "*.exe")],
         )
-        existing = {str(Path(account["browser_path"])).lower() for account in self.browser_accounts}
         added = 0
         for path in paths:
-            if str(Path(path)).lower() in existing:
-                continue
-            account = normalize_browser_account({
-                "name": Path(path).stem, "browser_path": path,
-                "cdp_port": self.next_available_port(), "posts_per_run": 1,
-                "enabled": True, "close_after_finish": True,
-            }, len(self.browser_accounts), self.cfg)
+            existing = next(
+                (item for item in self.browser_accounts if os.path.normcase(item.get("browser_path", "")) == os.path.normcase(path)),
+                None,
+            )
+            if existing:
+                account = copy.deepcopy(existing)
+                account["name"] = f"{existing.get('name') or Path(path).stem}（再次执行）"
+            else:
+                account = normalize_browser_account({
+                    "name": Path(path).stem, "browser_path": path,
+                    "cdp_port": self.next_available_port(), "posts_per_run": 1,
+                    "enabled": True, "close_after_finish": True,
+                }, len(self.browser_accounts), self.cfg)
+            account["id"] = new_browser_queue_id()
             self.browser_accounts.append(account)
-            existing.add(str(Path(path)).lower())
             added += 1
         self.refresh_browser_tree()
         if paths:
-            self.write_ui(f"批量导入完成：新增 {added} 个浏览器账号。\n")
+            self.write_ui(f"批量导入完成：新增 {added} 个队列项；重复浏览器已保留。\n")
+
+    def export_browser_queue_table(self):
+        if not self.browser_accounts:
+            messagebox.showinfo("没有队列", "当前没有可导出的浏览器队列项。")
+            return
+        path = filedialog.asksaveasfilename(
+            title="导出浏览器账号队列全表",
+            defaultextension=".xlsx",
+            initialfile="浏览器账号队列.xlsx",
+            filetypes=[("Excel 工作簿", "*.xlsx")],
+        )
+        if not path:
+            return
+        workbook = None
+        try:
+            workbook = Workbook()
+            sheet = workbook.active
+            sheet.title = "浏览器账号队列"
+            sheet.append([label for label, _key in BROWSER_QUEUE_TABLE_COLUMNS])
+            bool_keys = {"enabled", "close_after_finish", "use_schedule"}
+            for order, account in enumerate(self.browser_accounts, start=1):
+                row = []
+                for _label, key in BROWSER_QUEUE_TABLE_COLUMNS:
+                    if key == "_order":
+                        value = order
+                    else:
+                        value = account.get(key, "")
+                    if key in bool_keys:
+                        value = "是" if parse_bool(value, False) else "否"
+                    row.append(value)
+                sheet.append(row)
+            sheet.freeze_panes = "A2"
+            sheet.auto_filter.ref = sheet.dimensions
+            for column in sheet.columns:
+                max_width = max(len(str(cell.value or "")) for cell in column)
+                sheet.column_dimensions[column[0].column_letter].width = min(45, max(10, max_width + 2))
+            workbook.save(path)
+            workbook.close()
+            workbook = None
+            self.write_ui(f"已导出浏览器账号队列全表：{path}\n")
+            messagebox.showinfo("导出完成", f"已导出 {len(self.browser_accounts)} 个队列项。")
+        except Exception as exc:
+            messagebox.showerror("导出失败", str(exc))
+        finally:
+            try:
+                if workbook is not None:
+                    workbook.close()
+            except Exception:
+                pass
+
+    def import_browser_queue_table(self):
+        if not self.ensure_account_editable():
+            return
+        path = filedialog.askopenfilename(
+            title="导入浏览器账号队列全表",
+            filetypes=[("Excel 队列表", "*.xlsx *.xlsm")],
+        )
+        if not path:
+            return
+        workbook = None
+        try:
+            workbook = load_workbook(path, data_only=True, read_only=True)
+            sheet = workbook[workbook.sheetnames[0]]
+            headers = {
+                str(cell.value or "").strip(): index
+                for index, cell in enumerate(sheet[1])
+                if str(cell.value or "").strip()
+            }
+            required = {"账号名称", "浏览器路径", "CDP端口", "发布条数", "图片文件夹", "文案Excel", "工作表名"}
+            missing = sorted(required - set(headers))
+            if missing:
+                raise ValueError("队列表缺少列：" + "、".join(missing))
+            imported = []
+            bool_keys = {"enabled", "close_after_finish", "use_schedule"}
+            int_keys = {"cdp_port", "posts_per_run", "start_hour", "end_hour", "per_hour_count"}
+            for row_number, cells in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
+                if not any(value not in {None, ""} for value in cells):
+                    continue
+                raw = {}
+                for label, key in BROWSER_QUEUE_TABLE_COLUMNS:
+                    if key == "_order" or label not in headers:
+                        continue
+                    column = headers[label]
+                    value = cells[column] if column < len(cells) else ""
+                    if key in bool_keys:
+                        value = parse_bool(value, True)
+                    elif key in int_keys:
+                        value = int(value or 0)
+                    raw[key] = value
+                if not str(raw.get("id") or "").strip():
+                    raw["id"] = new_browser_queue_id()
+                account = normalize_browser_account(raw, len(imported), self.cfg)
+                if not account.get("browser_path"):
+                    raise ValueError(f"第 {row_number} 行没有浏览器路径。")
+                imported.append(account)
+            workbook.close()
+            workbook = None
+            if not imported:
+                raise ValueError("队列表中没有可导入的数据行。")
+            validate_browser_queue_ports([item for item in imported if item.get("enabled", True)])
+            if self.browser_accounts and not messagebox.askyesno(
+                "替换当前队列",
+                f"将用表格中的 {len(imported)} 个队列项替换当前队列，是否继续？",
+            ):
+                return
+            self.browser_accounts = browser_accounts_from_config(
+                {**self.cfg, "browser_accounts": imported}
+            )
+            self.refresh_browser_tree()
+            self.write_ui(f"已导入浏览器账号队列全表：{len(imported)} 个队列项；请保存配置。\n")
+            messagebox.showinfo("导入完成", f"已导入 {len(imported)} 个队列项。")
+        except Exception as exc:
+            messagebox.showerror("导入失败", str(exc))
+        finally:
+            try:
+                if workbook is not None:
+                    workbook.close()
+            except Exception:
+                pass
 
     def write_ui(self, text):
         if not hasattr(self, "logbox"):
@@ -4897,12 +5225,21 @@ class App:
     def reset_state(self):
         if not self.save_from_ui(show_message=False):
             return
-        path = Path(self.cfg["state_path"])
-        if messagebox.askyesno("确认重置", f"确定重置文案和排期进度吗？\n{path}\n不会删除图片、Excel、日志或调试截图。"):
-            state = read_state(self.cfg)
-            state.update({"copy_index": 0, "slot_index": 0, "used_copy_keys": [], "schedule_signature": ""})
-            write_state(self.cfg, state)
-            self.write_ui("发布进度已重置。\n")
+        accounts = browser_accounts_from_config(self.cfg)
+        state_configs = [self.cfg] + [config_for_browser_account(self.cfg, account) for account in accounts]
+        unique_configs = {}
+        for state_cfg in state_configs:
+            unique_configs[str(Path(state_cfg["state_path"]).resolve())] = state_cfg
+        if messagebox.askyesno(
+            "确认重置",
+            f"确定重置全部 {len(accounts)} 个队列项的文案和独立排期进度吗？\n"
+            "不会删除图片、Excel、日志或调试截图。",
+        ):
+            for state_cfg in unique_configs.values():
+                state = read_state(state_cfg)
+                state.update({"copy_index": 0, "slot_index": 0, "used_copy_keys": [], "schedule_signature": ""})
+                write_state(state_cfg, state)
+            self.write_ui(f"已重置 {len(accounts)} 个队列项的独立发布进度。\n")
 
     def poll_weekly_scheduler(self):
         try:
@@ -4979,6 +5316,31 @@ def run_self_test():
     body, topics = split_text_topics("正文内容 ##话题一 #话题二")
     assert "#" not in body and topics == ["话题一", "话题二"]
     assert COPY_FILE_EXTS == {".xlsx", ".xls", ".xlsm"}
+    assert extract_copy_texts(pd.DataFrame([["第一条文案"], ["第二条文案"]])) == ["第一条文案", "第二条文案"]
+    assert extract_copy_texts(pd.DataFrame([["文案"], ["第一条文案"], ["第二条文案"]])) == ["第一条文案", "第二条文案"]
+    with tempfile.TemporaryDirectory(prefix="douyin_copy_selftest_") as temp_dir:
+        headerless_path = Path(temp_dir) / "headerless.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "sheet1"
+        sheet.append(["第一条文案"])
+        sheet.append(["第二条文案"])
+        workbook.save(headerless_path)
+        workbook.close()
+        copy_cfg = {"excel_path": str(headerless_path), "sheet_name": "sheet1"}
+        assert read_copies(copy_cfg) == ["第一条文案", "第二条文案"]
+        assert delete_copy_from_excel(copy_cfg, "第一条文案") is True
+        assert read_copies(copy_cfg) == ["第二条文案"]
+
+        header_path = Path(temp_dir) / "with_header.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "sheet1"
+        sheet.append(["文案"])
+        sheet.append(["第一条文案"])
+        workbook.save(header_path)
+        workbook.close()
+        assert read_copies({"excel_path": str(header_path), "sheet_name": "sheet1"}) == ["第一条文案"]
     legacy = default_config()
     legacy["browser_path"] = r"D:\浏览器7.lnk"
     legacy["browser_account_suggestions"] = []
@@ -5001,6 +5363,42 @@ def run_self_test():
     assert mapped["image_dir"] == r"D:\账号9图片"
     assert mapped["excel_path"] == r"D:\账号9文案.xlsx"
     assert "browser_custom" in mapped["state_path"]
+    duplicate_a = normalize_browser_account(
+        {**custom, "id": "queue_a", "name": "账号第1次", "cdp_port": 9229}, 0, legacy
+    )
+    duplicate_b = normalize_browser_account(
+        {**custom, "id": "queue_b", "name": "账号第2次", "cdp_port": 9229}, 1, legacy
+    )
+    validate_browser_queue_ports([duplicate_a, duplicate_b])
+    duplicate_cfg = {**legacy, "browser_accounts": [duplicate_a, {**duplicate_b, "id": "queue_a"}]}
+    duplicate_accounts = browser_accounts_from_config(duplicate_cfg)
+    assert len({item["id"] for item in duplicate_accounts}) == 2
+    duplicate_state_a = config_for_browser_account(legacy, duplicate_accounts[0])
+    duplicate_state_b = config_for_browser_account(legacy, duplicate_accounts[1])
+    assert duplicate_state_a["state_path"] != duplicate_state_b["state_path"]
+    assert config_for_browser_account(duplicate_state_a, duplicate_accounts[0])["state_path"] == duplicate_state_a["state_path"]
+    try:
+        validate_browser_queue_ports([duplicate_a, {**duplicate_b, "browser_path": r"D:\浏览器8.lnk"}])
+        raise AssertionError("不同浏览器不应允许复用同一 CDP 端口")
+    except RuntimeError:
+        pass
+    independent_schedule = normalize_browser_account(
+        {
+            **duplicate_a,
+            "publish_start_date": "2026-08-05",
+            "publish_end_date": "2026-08-05",
+            "start_hour": 8,
+            "end_hour": 8,
+            "per_hour_count": 2,
+            "custom_minutes": "5,35",
+            "posts_per_run": 2,
+        },
+        0,
+        legacy,
+    )
+    independent_cfg = config_for_browser_account(legacy, independent_schedule)
+    assert len(build_slots(independent_cfg, log_result=False)) == 2
+    assert independent_cfg["publish_start_date"] == "2026-08-05"
     schedule_cfg = {
         "weekly_start_enabled": True,
         "weekly_start_days": [0],
@@ -5022,6 +5420,44 @@ def run_self_test():
         assert len({id(canvas) for canvas in gui.tab_scroll_canvases}) == 4
         assert not root.bind_all("<MouseWheel>")
         assert gui.start_button.master is gui.task_controls_frame
+        assert [gui.notebook.tab(index, "text") for index in range(gui.notebook.index("end"))] == [
+            "发布中心", "账号与排期", "自动启动", "系统与日志"
+        ]
+        assert "retry_times" in gui.vars
+        assert not {"image_dir", "excel_path", "publish_start_date", "publish_end_date", "max_posts_this_run"} & set(gui.vars)
+        assert "use_schedule" not in gui.bool_vars
+        assert int(gui.browser_tree.cget("height")) == 8
+        with tempfile.TemporaryDirectory(prefix="douyin_queue_selftest_") as temp_dir:
+            queue_path = Path(temp_dir) / "queue.xlsx"
+            old_save_dialog = filedialog.asksaveasfilename
+            old_open_dialog = filedialog.askopenfilename
+            old_showinfo = messagebox.showinfo
+            old_showerror = messagebox.showerror
+            old_askyesno = messagebox.askyesno
+            dialog_errors = []
+            try:
+                gui.browser_accounts = [duplicate_a, duplicate_b]
+                gui.refresh_browser_tree()
+                filedialog.asksaveasfilename = lambda **_kwargs: str(queue_path)
+                filedialog.askopenfilename = lambda **_kwargs: str(queue_path)
+                messagebox.showinfo = lambda *_args, **_kwargs: None
+                messagebox.showerror = lambda title, message, **_kwargs: dialog_errors.append((title, message))
+                messagebox.askyesno = lambda *_args, **_kwargs: True
+                gui.export_browser_queue_table()
+                assert queue_path.is_file()
+                gui.browser_accounts = []
+                gui.refresh_browser_tree()
+                gui.import_browser_queue_table()
+                assert len(gui.browser_accounts) == 2
+                assert gui.browser_accounts[0]["browser_path"] == gui.browser_accounts[1]["browser_path"]
+                assert len({item["id"] for item in gui.browser_accounts}) == 2
+                assert not dialog_errors
+            finally:
+                filedialog.asksaveasfilename = old_save_dialog
+                filedialog.askopenfilename = old_open_dialog
+                messagebox.showinfo = old_showinfo
+                messagebox.showerror = old_showerror
+                messagebox.askyesno = old_askyesno
         root.destroy()
     print("SELF_TEST_OK", flush=True)
 

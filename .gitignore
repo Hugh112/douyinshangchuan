@@ -1,0 +1,19 @@
+__pycache__/
+*.py[cod]
+*.spec
+.pytest_cache/
+build/
+dist/
+release/
+packages/DouyinPublisher_Update_v*.zip
+packages/*.zip
+
+# 用户运行数据与本机授权信息（仅保留在用户电脑）
+app/douyin_gui_config.json
+app/authorization.bin
+app/login_preferences.bin
+*.pause
+*_publish_state.json
+*_publish_log.csv
+debug_screenshots/
+*.log

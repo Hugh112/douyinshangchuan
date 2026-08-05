@@ -1,17 +1,20 @@
 {
-  "latest_version": "2.3.0",
-  "download_url": "https://raw.githubusercontent.com/Hugh112/douyinshangchuan/main/packages/douyin_single_publish_v2.3.0_no_black_window_update.zip",
-  "sha256": "b09060a1cfee662f06ac3ddc2d4c43bf0ca6ba4318aa9311a855d546fb65244a",
+  "latest_version": "2.5.1",
+  "minimum_supported_version": "2.4.0",
+  "download_url": "https://github.com/Hugh112/douyinshangchuan/releases/download/v2.5.1/DouyinPublisher_Update_v2.5.1.zip",
+  "sha256": "04c8ae512d014b3c510500d5b57f7c579618f4284710e587dc419dab1527cb75",
+  "package_size_bytes": 89794780,
   "force_update": false,
+  "is_forced": false,
+  "rollout_percentage": 100,
   "preserve_paths": [
     "app/douyin_gui_config.json"
   ],
   "release_notes": [
-    "修复普通启动时出现或停留黑色命令行窗口的问题。",
-    "新增无黑框 VBS 启动方式，普通启动时不再显示命令行窗口。",
-    "隐藏 PowerShell、浏览器启动及在线更新器产生的子进程窗口。",
-    "更新完成后使用无窗口方式自动重新启动软件。",
-    "保留检查更新、随机使用图片、逐字输入正文和话题功能。",
-    "保留调试启动入口，出现问题时仍可查看完整运行日志。"
+    "启动时先完成授权恢复或软件账号登录，授权成功后才展示发布配置主界面。",
+    "四个功能标签分别使用独立滚动容器，滚动互不影响；浏览器账号列表支持横向和纵向滚动。",
+    "任务控制固定在运行日志区域，在任意标签页都可直接操作；界面移除非必要的小字说明。",
+    "安装向导始终显示安装位置选择，支持用户自定义安装目录。",
+    "继续保留多浏览器顺序发布、账号专属内容、定时启动、授权心跳、遥测和安全在线更新。"
   ]
 }

@@ -1,9 +1,9 @@
 {
-  "latest_version": "2.5.1",
-  "minimum_supported_version": "2.4.0",
-  "download_url": "https://github.com/Hugh112/douyinshangchuan/releases/download/v2.5.1/DouyinPublisher_Update_v2.5.1.zip",
-  "sha256": "739be94a80c702e5d17c551442022ae5f4fe44dd024699a89344ad72e64640ec",
-  "package_size_bytes": 89805278,
+  "latest_version": "2.5.2",
+  "minimum_supported_version": "2.3.0",
+  "download_url": "https://github.com/Hugh112/douyinshangchuan/releases/download/v2.5.2/DouyinPublisher_Update_v2.5.2.zip",
+  "sha256": "823be9d8c39ba274a788da5e33dac9a3746e9fbf822d88aad16f33f8af77bb59",
+  "package_size_bytes": 89813712,
   "force_update": false,
   "is_forced": false,
   "rollout_percentage": 100,
@@ -11,10 +11,10 @@
     "app/douyin_gui_config.json"
   ],
   "release_notes": [
-    "同一浏览器可重复加入账号队列；每行拥有独立内容、发布时间和进度。",
-    "发布条数只取队列行配置，定时时间点不足时明确提示，不再受旧全局上限静默截断。",
-    "修复无表头 Excel 第一条文案被跳过，并及时释放 Excel 文件句柄。",
-    "发布中心集中等待、检测、失败重试和运行选项；账号与排期页面扩大队列表并支持全表导入导出。",
-    "保留授权心跳、遥测、多浏览器切换、暂停弹窗、安全在线更新和旧固定快捷方式兼容。"
+    "v2.3.0 对比：新增完整 EXE 安装版、统一授权登录/切换/心跳/遥测，以及多浏览器账号独立内容和排期。",
+    "同一浏览器可重复加入队列；只发布勾选行，掉号自动切换，队列支持 Excel 全表导入导出。",
+    "每个账号按自己的发布条数执行，排期时间点可循环复用；停止任务或重启软件后从剩余条数续跑。",
+    "账号与排期表格保存手动列宽；修复 Excel 第一条文案、失败重试和任何自动暂停均弹窗等问题。",
+    "本次为可选更新，不强制升级。软件账号和密码请自行联系各组组长获取。"
   ]
 }

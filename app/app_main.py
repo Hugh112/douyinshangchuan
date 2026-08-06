@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-抖音智能发布中心 v2.5.1 - 多浏览器任务编排与统一授权版
+抖音智能发布中心 v2.5.2 - 多浏览器任务编排与统一授权版
 功能：
 1. GUI 前端配置浏览器、图片、Excel、定时、等待、上传检测、重试等。
 2. 自动打开抖音创作者平台图文发布页。
@@ -90,7 +90,7 @@ APP_DATA_DIR = (
 CONFIG_PATH = APP_DATA_DIR / "douyin_gui_config.json"
 AUTH_TOKEN_PATH = APP_DATA_DIR / "authorization.bin"
 AUTH_LOGIN_PREFERENCES_PATH = APP_DATA_DIR / "login_preferences.bin"
-APP_VERSION = "2.5.1"
+APP_VERSION = "2.5.2"
 APP_NAME = f"抖音智能发布中心 v{APP_VERSION}"
 LOGO_ICO = RESOURCE_DIR / "assets" / "app_logo.ico"
 LOGO_PNG = RESOURCE_DIR / "assets" / "app_logo.png"
@@ -230,6 +230,37 @@ def format_release_notes(manifest):
     return str(notes).strip()
 
 
+BROWSER_QUEUE_COLUMNS = (
+    "publish", "order", "name", "path", "image", "excel", "schedule", "port", "quota", "status",
+)
+BROWSER_QUEUE_COLUMN_HEADINGS = {
+    "publish": "发布", "order": "顺序", "name": "账号名称", "path": "浏览器快捷方式 / EXE",
+    "image": "图片文件夹", "excel": "文案 Excel", "schedule": "独立发布时间",
+    "port": "端口", "quota": "发布条数", "status": "运行状态",
+}
+BROWSER_QUEUE_DEFAULT_WIDTHS = {
+    "publish": 58, "order": 48, "name": 105, "path": 250, "image": 190,
+    "excel": 190, "schedule": 230, "port": 66, "quota": 76, "status": 145,
+}
+BROWSER_QUEUE_MIN_WIDTHS = {
+    "publish": 46, "order": 42, "name": 72, "path": 120, "image": 100,
+    "excel": 100, "schedule": 130, "port": 52, "quota": 62, "status": 90,
+}
+
+
+def normalize_browser_queue_column_widths(raw):
+    """只接受已知列和合理像素范围，避免损坏配置让表格不可用。"""
+    raw = raw if isinstance(raw, dict) else {}
+    result = {}
+    for key in BROWSER_QUEUE_COLUMNS:
+        try:
+            width = int(raw.get(key, BROWSER_QUEUE_DEFAULT_WIDTHS[key]))
+        except Exception:
+            width = BROWSER_QUEUE_DEFAULT_WIDTHS[key]
+        result[key] = max(BROWSER_QUEUE_MIN_WIDTHS[key], min(1200, width))
+    return result
+
+
 
 def default_config():
     user = Path(os.environ.get("USERPROFILE", str(Path.home())))
@@ -265,6 +296,7 @@ def default_config():
         "browser_user_data_dir": "",
         "browser_profile_directory": "",
         "browser_accounts": [],
+        "browser_queue_column_widths": dict(BROWSER_QUEUE_DEFAULT_WIDTHS),
         "browser_account_suggestions": [
             {
                 "name": "浏览器9",
@@ -655,6 +687,33 @@ def pause_flag_path(cfg):
         return APP_DIR / "douyin_pause.flag"
 
 
+def pause_flag_paths_for_queue(cfg, accounts=None):
+    """GUI 与账号 worker 使用同一组暂停标记，停止或重启时可完整解除。"""
+    paths = [pause_flag_path(cfg)]
+    try:
+        queue_accounts = accounts if accounts is not None else browser_accounts_from_config(cfg)
+        paths.extend(pause_flag_path(config_for_browser_account(cfg, account)) for account in queue_accounts)
+    except Exception:
+        pass
+    unique = []
+    seen = set()
+    for path in paths:
+        key = os.path.normcase(os.path.abspath(str(path)))
+        if key not in seen:
+            seen.add(key)
+            unique.append(Path(path))
+    return unique
+
+
+def clear_pause_flags_for_queue(cfg, accounts=None):
+    for flag in pause_flag_paths_for_queue(cfg, accounts):
+        try:
+            if flag.exists():
+                flag.unlink()
+        except OSError:
+            pass
+
+
 def wait_if_paused(cfg):
     """
     前端点击"暂停/继续"时使用。
@@ -960,7 +1019,83 @@ def read_state(cfg):
 def write_state(cfg, state):
     p = Path(cfg["state_path"])
     p.parent.mkdir(parents=True, exist_ok=True)
-    p.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+    temp_path = p.with_name(f".{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    try:
+        temp_path.write_text(json.dumps(state, ensure_ascii=False, indent=2), encoding="utf-8")
+        os.replace(temp_path, p)
+    finally:
+        try:
+            if temp_path.exists():
+                temp_path.unlink()
+        except OSError:
+            pass
+
+
+def _nonnegative_state_int(value, default=0):
+    try:
+        return max(0, int(value or 0))
+    except Exception:
+        return max(0, int(default or 0))
+
+
+def account_run_resume_progress(state, queue_run_id, quota):
+    """恢复同一队列轮次的账号进度，并兼容 2.5.1 仅有 slot_index 的状态。"""
+    state = state if isinstance(state, dict) else {}
+    quota = max(1, _nonnegative_state_int(quota, 1))
+    stored_run_id = str(state.get("queue_run_id") or "").strip()
+    current_run_id = str(queue_run_id or "").strip()
+    if stored_run_id and current_run_id and stored_run_id == current_run_id:
+        return min(quota, _nonnegative_state_int(state.get("run_progress"), 0))
+    if stored_run_id or "run_progress" in state:
+        return 0
+    # 旧版没有本轮进度字段。slot_index 每次成功后才递增，因此可用于恢复未完成配额。
+    return _nonnegative_state_int(state.get("slot_index"), 0) % quota
+
+
+def queue_run_signature(accounts):
+    return "|".join(
+        f"{str(account.get('id') or '')}:{max(1, _nonnegative_state_int(account.get('posts_per_run'), 1))}"
+        for account in accounts
+    )
+
+
+def prepare_queue_run(cfg, accounts):
+    """开始新队列轮次或恢复上次被停止的轮次。"""
+    state = read_state(cfg)
+    account_ids = {str(account.get("id") or "") for account in accounts}
+    active = parse_bool(state.get("queue_run_active"), False)
+    run_id = str(state.get("queue_run_id") or "").strip()
+    if not active or not run_id:
+        run_id = f"queue_{uuid.uuid4().hex}"
+        completed = set()
+        resumed = False
+    else:
+        completed = {
+            str(account_id) for account_id in (state.get("queue_completed_account_ids") or [])
+            if str(account_id) in account_ids
+        }
+        resumed = True
+    state.update({
+        "queue_run_id": run_id,
+        "queue_run_active": True,
+        "queue_run_signature": queue_run_signature(accounts),
+        "queue_completed_account_ids": sorted(completed),
+    })
+    write_state(cfg, state)
+    return run_id, completed, resumed
+
+
+def update_queue_run_state(cfg, run_id, accounts, completed_ids, active):
+    state = read_state(cfg)
+    state.update({
+        "queue_run_id": str(run_id or ""),
+        "queue_run_active": bool(active),
+        "queue_run_signature": queue_run_signature(accounts),
+        "queue_completed_account_ids": sorted({str(item) for item in completed_ids if str(item)}),
+    })
+    if not active:
+        state["queue_run_completed_at"] = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    write_state(cfg, state)
 
 
 def append_log(cfg, row):
@@ -1071,6 +1206,18 @@ def build_slots(cfg, log_result=True):
     if log_result:
         wlog(f"已生成多日排期 {len(slots)} 个：从 {slots[0].strftime('%Y-%m-%d %H:%M')} 到 {slots[-1].strftime('%Y-%m-%d %H:%M')}")
     return slots
+
+
+def repeating_schedule_slot(slots, progress_index):
+    """时间点用完后从本轮第一个时间点继续，返回时间点、轮次和轮内序号。"""
+    if not slots:
+        raise RuntimeError("定时发布时间点为空，无法循环使用。")
+    try:
+        progress = max(0, int(progress_index or 0))
+    except Exception:
+        progress = 0
+    cycle_index, slot_offset = divmod(progress, len(slots))
+    return slots[slot_offset], cycle_index + 1, slot_offset
 
 
 def list_images(cfg):
@@ -3066,17 +3213,33 @@ def account_worker(config_path):
     # 独立子进程只处理一个账号；先把该账号绑定的内容池映射成有效配置。
     cfg = config_for_browser_account(cfg, accounts[0])
     cfg["browser_accounts"] = [accounts[0]]
+    accounts = [accounts[0]]
     ACTIVE_CFG = cfg
     copies = read_copies(cfg)
     slots = build_slots(cfg) if cfg.get("use_schedule", True) else []
     state = read_state(cfg)
+    primary_account = accounts[0]
+    primary_quota = max(1, int(primary_account.get("posts_per_run", 1) or 1))
+    queue_run_id = str(cfg.get("_queue_run_id") or f"direct_{uuid.uuid4().hex}")
+    resume_progress = account_run_resume_progress(state, queue_run_id, primary_quota)
     current_schedule_signature = schedule_signature(cfg)
     if state.get("schedule_signature") != current_schedule_signature:
         old_si = int(state.get("slot_index", 0) or 0)
         state["slot_index"] = 0
         state["schedule_signature"] = current_schedule_signature
         write_state(cfg, state)
-        wlog(f"检测到排期配置已变化，已重置定时序号：{old_si + 1} -> 1")
+        wlog(
+            f"检测到排期配置已变化，定时时间点从 {old_si + 1} 调整为 1；"
+            f"本轮已完成 {resume_progress}/{primary_quota} 条继续保留。"
+        )
+
+    state.update({
+        "queue_run_id": queue_run_id,
+        "run_progress": resume_progress,
+        "run_quota": primary_quota,
+        "run_active": resume_progress < primary_quota,
+    })
+    write_state(cfg, state)
 
     ci = 0 if cfg.get("delete_copy_after_success", True) else int(state.get("copy_index", 0) or 0)
     si = int(state.get("slot_index", 0) or 0)
@@ -3087,7 +3250,11 @@ def account_worker(config_path):
     wlog(f"本轮启用 {len(accounts)} 个浏览器账号；发布失败最多重试 {retry_times} 次。")
     wlog(f"读取文案 {len(copies)} 条，当前文案序号：{ci + 1}")
     if cfg.get("use_schedule", True):
-        wlog(f"独立排期 {len(slots)} 个，当前排期序号：{si + 1}")
+        _slot, current_cycle, current_offset = repeating_schedule_slot(slots, si)
+        wlog(
+            f"独立排期 {len(slots)} 个，当前为第 {current_cycle} 轮、"
+            f"轮内时间点 {current_offset + 1}/{len(slots)}。"
+        )
     else:
         wlog("此队列项使用立即发布；发布条数只取账号队列配置。")
 
@@ -3099,30 +3266,46 @@ def account_worker(config_path):
         ACTIVE_CFG = account_cfg
         account_name = account.get("name") or f"浏览器{account_index}"
         account_quota = max(1, int(account.get("posts_per_run", 1) or 1))
-        account_done = 0
+        account_done = min(account_quota, resume_progress)
         launch_info = None
         browser = None
         playwright_manager = None
 
         wlog("=" * 60)
         wlog(f"切换到 {account_name}（{account_index}/{len(accounts)}），本账号计划发布 {account_quota} 条。")
-        wlog(
-            f"{account_name} 使用独立队列进度；本轮条数只取账号队列配置，"
-            f"当前从排期序号 {si + 1} 开始。"
-        )
+        if account_done:
+            wlog(
+                f"已恢复上一轮进度：{account_name} 已完成 {account_done}/{account_quota} 条，"
+                f"本次继续剩余 {max(0, account_quota - account_done)} 条。"
+            )
+        if account_cfg.get("use_schedule", True):
+            _slot, current_cycle, current_offset = repeating_schedule_slot(slots, si)
+            wlog(
+                f"{account_name} 使用独立队列进度；本轮条数只取账号队列配置，"
+                f"当前从第 {current_cycle} 轮、轮内时间点 {current_offset + 1}/{len(slots)} 开始。"
+            )
+        else:
+            wlog(f"{account_name} 使用独立队列进度；本轮条数只取账号队列配置，当前为立即发布。")
+        if account_done >= account_quota:
+            completed_state = read_state(account_cfg)
+            completed_state.update({
+                "queue_run_id": queue_run_id,
+                "run_progress": account_quota,
+                "run_quota": account_quota,
+                "run_active": False,
+            })
+            write_state(account_cfg, completed_state)
+            emit_browser_status(account, "done", "上一轮中本账号配额已经完成", account_done, account_quota)
+            wlog(f"{account_name} 在上一轮中已经完成，无需重新启动浏览器。")
+            continue
+
         emit_browser_status(account, "launching", "正在启动并连接浏览器", account_done, account_quota)
 
-        if account_cfg.get("use_schedule", True) and si + account_quota > len(slots):
-            remaining = max(0, len(slots) - si)
-            message = (
-                f"排期容量不足：{account_name} 的队列发布条数为 {account_quota}，"
-                f"但从当前独立进度开始只剩 {remaining} 个定时时间。"
-                "请增加日期、小时范围或每小时条数后重新开始。"
+        if account_cfg.get("use_schedule", True) and account_quota > len(slots):
+            wlog(
+                f"{account_name} 本轮计划 {account_quota} 条、生成 {len(slots)} 个时间点；"
+                "时间点用完后将从本轮第一个时间点继续循环。"
             )
-            emit_browser_status(account, "error", message, account_done, account_quota)
-            alert_auto_pause(message)
-            stop_all = True
-            break
 
         try:
             playwright_manager = sync_playwright()
@@ -3170,14 +3353,16 @@ def account_worker(config_path):
                     alert_auto_pause("提醒：文案序号超过当前文案数量，请重置发布进度。")
                     stop_all = True
                     break
-                if account_cfg.get("use_schedule", True) and si >= len(slots):
-                    alert_auto_pause("提醒：当前日期时间范围内的全部定时发布位置已完成。")
-                    stop_all = True
-                    break
-
                 img = random.choice(imgs) if account_cfg.get("random_image", False) else imgs[0]
                 copy_text = copies[ci]
-                slot = slots[si] if si < len(slots) else datetime.now()
+                schedule_cycle = 1
+                schedule_offset = 0
+                if account_cfg.get("use_schedule", True):
+                    slot, schedule_cycle, schedule_offset = repeating_schedule_slot(slots, si)
+                    if schedule_offset == 0 and si > 0:
+                        wlog(f"{account_name} 定时时间点已循环到第 {schedule_cycle} 轮。")
+                else:
+                    slot = datetime.now()
                 ok = False
                 last_error = None
                 emit_browser_status(
@@ -3287,6 +3472,10 @@ def account_worker(config_path):
                     "slot_index": si,
                     "used_copy_keys": state_now.get("used_copy_keys", []),
                     "schedule_signature": schedule_signature(account_cfg),
+                    "queue_run_id": queue_run_id,
+                    "run_progress": account_done,
+                    "run_quota": account_quota,
+                    "run_active": account_done < account_quota,
                 })
                 write_state(account_cfg, state_now)
                 emit_browser_status(
@@ -3295,10 +3484,9 @@ def account_worker(config_path):
                     account_done, account_quota
                 )
 
-                remaining_slots = len(slots) - si if account_cfg.get("use_schedule", True) else None
                 more_needed = account_done < account_quota or account_index < len(accounts)
-                if more_needed and (remaining_slots is None or remaining_slots > 0):
-                    wait_publish_interval(account_cfg, total_done, remaining_slots=remaining_slots)
+                if more_needed:
+                    wait_publish_interval(account_cfg, total_done)
 
             if account_done >= account_quota:
                 wlog(f"{account_name} 已完成本账号配额：{account_done}/{account_quota}。")
@@ -3341,14 +3529,32 @@ def run_isolated_browser_sequence(config_path, child_switch, publish_mode=False)
         raise RuntimeError("没有启用任何浏览器账号。")
     validate_browser_queue_ports(accounts)
     total_done = 0
+    queue_run_id = ""
+    completed_account_ids = set()
+    if publish_mode:
+        queue_run_id, completed_account_ids, resumed = prepare_queue_run(cfg, accounts)
+        if resumed:
+            wlog(
+                f"继续上一轮队列任务：已有 {len(completed_account_ids)}/{len(accounts)} 个账号处理完成，"
+                "其余账号从各自保存进度继续。"
+            )
+        else:
+            wlog(f"开始新的队列轮次：共 {len(accounts)} 个已勾选账号。")
     temp_root = Path(tempfile.mkdtemp(prefix="douyin_browser_sequence_"))
     try:
         for index, account in enumerate(accounts, start=1):
+            account_id = str(account.get("id") or "")
+            quota = max(1, int(account.get("posts_per_run", 1) or 1))
+            if publish_mode and account_id in completed_account_ids:
+                wlog(f"独立进程 {index}/{len(accounts)}：{account['name']} 在上一轮已经处理，跳过重复发布。")
+                emit_browser_status(account, "done", "上一轮已经处理，继续下一个账号", quota, quota)
+                continue
             child_cfg = copy.deepcopy(cfg)
             child_account = copy.deepcopy(account)
-            quota = max(1, int(child_account.get("posts_per_run", 1) or 1))
             child_account["posts_per_run"] = quota
             child_cfg["browser_accounts"] = [child_account]
+            if publish_mode:
+                child_cfg["_queue_run_id"] = queue_run_id
             child_path = temp_root / f"account_{index}.json"
             child_path.write_text(json.dumps(child_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
             resolved_child_cfg = config_for_browser_account(child_cfg, child_account)
@@ -3384,6 +3590,9 @@ def run_isolated_browser_sequence(config_path, child_switch, publish_mode=False)
             if publish_mode:
                 after_slot = int(read_state(resolved_child_cfg).get("slot_index", 0) or 0)
                 total_done += max(0, after_slot - before_slot)
+                if code == 0:
+                    completed_account_ids.add(account_id)
+                    update_queue_run_state(cfg, queue_run_id, accounts, completed_account_ids, active=True)
             try:
                 child_path.unlink()
             except Exception:
@@ -3394,7 +3603,18 @@ def run_isolated_browser_sequence(config_path, child_switch, publish_mode=False)
         except Exception:
             pass
     if publish_mode:
-        wlog(f"多浏览器独立进程编排结束，本轮共确认成功 {total_done} 条。")
+        remaining_ids = {
+            str(account.get("id") or "") for account in accounts
+            if str(account.get("id") or "") not in completed_account_ids
+        }
+        update_queue_run_state(
+            cfg, queue_run_id, accounts, completed_account_ids, active=bool(remaining_ids)
+        )
+        if remaining_ids:
+            raise RuntimeError(
+                f"本轮仍有 {len(remaining_ids)} 个账号未处理完成，进度已保留；下次启动将继续。"
+            )
+        wlog(f"多浏览器独立进程编排结束，本次新增确认成功 {total_done} 条，本轮队列已完成。")
     else:
         wlog("多浏览器独立登录检查结束。")
 
@@ -3691,11 +3911,7 @@ class BrowserAccountDialog:
             if self.original_id:
                 self.result["id"] = self.original_id
             if self.result.get("use_schedule", True):
-                slots = build_slots(config_for_browser_account({}, self.result))
-                if posts > len(slots):
-                    raise ValueError(
-                        f"此队列项计划发布 {posts} 条，但独立发布时间只生成 {len(slots)} 个时间点。"
-                    )
+                build_slots(config_for_browser_account({}, self.result))
             self.window.destroy()
         except Exception as exc:
             messagebox.showwarning("账号配置无效", str(exc), parent=self.window)
@@ -3750,6 +3966,7 @@ class App:
         self.post_login_jobs_started = False
         self.tab_scroll_canvases = []
         self.tab_scroll_areas = []
+        self.browser_tree_resize_active = False
         self.authorization_window = None
         self._configure_style()
         self.build()
@@ -3963,13 +4180,19 @@ class App:
         tree_frame.pack(fill="both", expand=True)
         tree_frame.grid_rowconfigure(0, weight=1)
         tree_frame.grid_columnconfigure(0, weight=1)
-        columns = ("order", "name", "path", "image", "excel", "schedule", "port", "quota", "enabled", "status")
+        columns = BROWSER_QUEUE_COLUMNS
         self.browser_tree = ttk.Treeview(tree_frame, columns=columns, show="headings", height=8, selectmode="browse")
-        headings = {"order": "顺序", "name": "账号名称", "path": "浏览器快捷方式 / EXE", "image": "图片文件夹", "excel": "文案 Excel", "schedule": "独立发布时间", "port": "端口", "quota": "发布条数", "enabled": "启用", "status": "运行状态"}
-        widths = {"order": 48, "name": 105, "path": 250, "image": 190, "excel": 190, "schedule": 230, "port": 66, "quota": 76, "enabled": 58, "status": 145}
+        widths = normalize_browser_queue_column_widths(self.cfg.get("browser_queue_column_widths"))
+        self.cfg["browser_queue_column_widths"] = dict(widths)
         for key in columns:
-            self.browser_tree.heading(key, text=headings[key])
-            self.browser_tree.column(key, width=widths[key], anchor="center" if key not in {"path", "image", "excel", "schedule"} else "w", stretch=(key == "path"))
+            self.browser_tree.heading(key, text=BROWSER_QUEUE_COLUMN_HEADINGS[key])
+            self.browser_tree.column(
+                key,
+                width=widths[key],
+                minwidth=BROWSER_QUEUE_MIN_WIDTHS[key],
+                anchor="center" if key not in {"path", "image", "excel", "schedule"} else "w",
+                stretch=False,
+            )
         vertical_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.browser_tree.yview)
         horizontal_scroll = ttk.Scrollbar(tree_frame, orient="horizontal", command=self.browser_tree.xview)
         self.browser_tree.configure(
@@ -3979,7 +4202,10 @@ class App:
         self.browser_tree.grid(row=0, column=0, sticky="nsew")
         vertical_scroll.grid(row=0, column=1, sticky="ns")
         horizontal_scroll.grid(row=1, column=0, sticky="ew")
-        self.browser_tree.bind("<Double-1>", lambda _event: self.edit_browser_account())
+        self.browser_tree.bind("<Button-1>", self.on_browser_tree_click, add="+")
+        self.browser_tree.bind("<ButtonPress-1>", self.on_browser_tree_resize_press, add="+")
+        self.browser_tree.bind("<ButtonRelease-1>", self.on_browser_tree_resize_release, add="+")
+        self.browser_tree.bind("<Double-1>", self.on_browser_tree_double_click)
         self.browser_tree.tag_configure("ok", foreground="#047857")
         self.browser_tree.tag_configure("warn", foreground="#B45309")
         self.browser_tree.tag_configure("error", foreground="#B42318")
@@ -3990,6 +4216,8 @@ class App:
             ("编辑", self.edit_browser_account),
             ("删除", self.remove_browser_account), ("上移", lambda: self.move_browser_account(-1)),
             ("下移", lambda: self.move_browser_account(1)),
+            ("全选发布", lambda: self.set_all_browser_accounts_enabled(True)),
+            ("全部取消", lambda: self.set_all_browser_accounts_enabled(False)),
         ]:
             ttk.Button(actions, text=text, command=command).pack(side="left", padx=(0, 6))
         table_actions = ttk.Frame(body)
@@ -4596,21 +4824,7 @@ class App:
             if not str(account_cfg.get("sheet_name") or "").strip():
                 raise ValueError(f"队列项“{account['name']}”的工作表名不能为空。")
             if account_cfg.get("use_schedule", True):
-                slots = build_slots(account_cfg, log_result=False)
-                state = read_state(account_cfg)
-                slot_index = (
-                    int(state.get("slot_index", 0) or 0)
-                    if state.get("schedule_signature") == schedule_signature(account_cfg)
-                    else 0
-                )
-                quota = max(1, int(account.get("posts_per_run", 1) or 1))
-                remaining = max(0, len(slots) - slot_index)
-                if quota > remaining:
-                    raise ValueError(
-                        f"队列项“{account['name']}”本轮要发布 {quota} 条，"
-                        f"但从自己的当前排期进度开始只剩 {remaining} 个时间点。"
-                        "请增加该队列项的日期、小时范围或每小时条数，或重置发布进度。"
-                    )
+                build_slots(account_cfg, log_result=False)
         first = enabled[0]
         cfg["browser_path"] = first["browser_path"]
         cfg["browser_user_data_dir"] = first.get("browser_user_data_dir", "")
@@ -4662,6 +4876,7 @@ class App:
             self.browser_tree.insert(
                 "", "end", iid=account_id,
                 values=(
+                    "☑" if account.get("enabled", True) else "☐",
                     index,
                     account["name"],
                     account["browser_path"],
@@ -4670,7 +4885,6 @@ class App:
                     schedule_text,
                     account["cdp_port"],
                     account["posts_per_run"],
-                    "是" if account.get("enabled", True) else "否",
                     status,
                 ),
                 tags=(tag,) if tag else (),
@@ -4688,6 +4902,71 @@ class App:
             if account["id"] == selected[0]:
                 return index
         return None
+
+    def on_browser_tree_click(self, event):
+        if self.browser_tree.identify_region(event.x, event.y) != "cell":
+            return None
+        if self.browser_tree.identify_column(event.x) != "#1":
+            return None
+        account_id = self.browser_tree.identify_row(event.y)
+        if account_id:
+            self.toggle_browser_account_enabled(account_id)
+        return "break"
+
+    def on_browser_tree_resize_press(self, event):
+        self.browser_tree_resize_active = self.browser_tree.identify_region(event.x, event.y) == "separator"
+
+    def on_browser_tree_resize_release(self, _event):
+        if not self.browser_tree_resize_active:
+            return None
+        self.browser_tree_resize_active = False
+        self.root.after_idle(self.persist_browser_tree_column_widths)
+        return None
+
+    def persist_browser_tree_column_widths(self):
+        if not hasattr(self, "browser_tree"):
+            return False
+        widths = normalize_browser_queue_column_widths({
+            key: self.browser_tree.column(key, "width") for key in BROWSER_QUEUE_COLUMNS
+        })
+        if widths == normalize_browser_queue_column_widths(self.cfg.get("browser_queue_column_widths")):
+            return False
+        self.cfg["browser_queue_column_widths"] = dict(widths)
+        try:
+            save_config(self.cfg)
+            return True
+        except Exception as exc:
+            self.write_ui(f"保存账号队列表列宽失败：{exc}\n")
+            return False
+
+    def on_browser_tree_double_click(self, event):
+        if self.browser_tree.identify_column(event.x) == "#1":
+            return "break"
+        self.edit_browser_account()
+        return None
+
+    def toggle_browser_account_enabled(self, account_id):
+        if not self.ensure_account_editable():
+            return False
+        account = next((item for item in self.browser_accounts if str(item.get("id")) == str(account_id)), None)
+        if account is None:
+            return False
+        account["enabled"] = not parse_bool(account.get("enabled"), True)
+        self.browser_statuses[str(account["id"])] = "等待任务" if account["enabled"] else "未启用"
+        self.refresh_browser_tree()
+        self.browser_tree.selection_set(str(account["id"]))
+        self.browser_tree.focus(str(account["id"]))
+        return True
+
+    def set_all_browser_accounts_enabled(self, enabled):
+        if not self.ensure_account_editable():
+            return False
+        enabled = bool(enabled)
+        for account in self.browser_accounts:
+            account["enabled"] = enabled
+            self.browser_statuses[str(account["id"])] = "等待任务" if enabled else "未启用"
+        self.refresh_browser_tree()
+        return True
 
     def ensure_account_editable(self):
         if self.proc and self.proc.poll() is None:
@@ -5106,7 +5385,7 @@ class App:
             self.browser_statuses[account["id"]] = "等待检查" if account.get("enabled", True) else "未启用"
         self.refresh_browser_tree()
         cmd = application_command("--probe-accounts", CONFIG_PATH)
-        self.write_ui("\n开始检查全部浏览器账号：只进入发布页，不上传、不填写、不发布。\n")
+        self.write_ui("\n开始检查已勾选的浏览器账号：只进入发布页，不上传、不填写、不发布。\n")
         self.reset_countdown_display("状态：检查账号", "准备第一个浏览器")
         self.run_subprocess(cmd, mode="probe")
 
@@ -5146,12 +5425,9 @@ class App:
             if not scheduled:
                 messagebox.showwarning("无法开始", str(exc))
             return False
-        try:
-            flag = pause_flag_path(self.cfg)
-            if flag.exists():
-                flag.unlink()
-        except Exception:
-            pass
+        clear_pause_flags_for_queue(
+            self.cfg, browser_accounts_from_config(self.cfg, enabled_only=True)
+        )
         for account in self.browser_accounts:
             self.browser_statuses[account["id"]] = "等待任务" if account.get("enabled", True) else "未启用"
         self.refresh_browser_tree()
@@ -5168,22 +5444,21 @@ class App:
             return
         if not self.save_from_ui(show_message=False):
             return
-        flag = pause_flag_path(self.cfg)
-        flag.parent.mkdir(parents=True, exist_ok=True)
-        if flag.exists():
-            try:
-                flag.unlink()
-            except Exception:
-                pass
+        flags = pause_flag_paths_for_queue(
+            self.cfg, browser_accounts_from_config(self.cfg, enabled_only=True)
+        )
+        if any(flag.exists() for flag in flags):
+            clear_pause_flags_for_queue(
+                self.cfg, browser_accounts_from_config(self.cfg, enabled_only=True)
+            )
             self.is_paused = False
             self.status_var.set("状态：运行中")
             self.countdown_reason_var.set("等待工作进程继续")
             self.write_ui("已继续脚本。\n")
         else:
-            try:
+            for flag in flags:
+                flag.parent.mkdir(parents=True, exist_ok=True)
                 flag.write_text("paused", encoding="utf-8")
-            except Exception:
-                pass
             self.is_paused = True
             self.status_var.set("状态：已暂停")
             current = self.countdown_var.get()
@@ -5218,6 +5493,7 @@ class App:
         finally:
             self.proc = None
             self.proc_mode = ""
+            clear_pause_flags_for_queue(self.cfg, self.browser_accounts)
             if was_worker:
                 self.finish_task_telemetry("stopped")
             self.reset_countdown_display("状态：已停止", "任务已停止")
@@ -5237,8 +5513,21 @@ class App:
         ):
             for state_cfg in unique_configs.values():
                 state = read_state(state_cfg)
-                state.update({"copy_index": 0, "slot_index": 0, "used_copy_keys": [], "schedule_signature": ""})
+                state.update({
+                    "copy_index": 0,
+                    "slot_index": 0,
+                    "used_copy_keys": [],
+                    "schedule_signature": "",
+                    "queue_run_id": "",
+                    "queue_run_active": False,
+                    "queue_run_signature": "",
+                    "queue_completed_account_ids": [],
+                    "run_progress": 0,
+                    "run_quota": 0,
+                    "run_active": False,
+                })
                 write_state(state_cfg, state)
+            clear_pause_flags_for_queue(self.cfg, accounts)
             self.write_ui(f"已重置 {len(accounts)} 个队列项的独立发布进度。\n")
 
     def poll_weekly_scheduler(self):
@@ -5285,6 +5574,7 @@ class App:
             if not messagebox.askyesno("退出程序", "发布任务仍在运行，退出会停止任务。确定退出吗？"):
                 return
             self.stop()
+        self.persist_browser_tree_column_widths()
         self.root.destroy()
 def run_gui():
     hide_own_console_window()
@@ -5298,20 +5588,20 @@ def run_gui():
 
 def run_self_test():
     """不连接浏览器、不发布内容的内置冒烟测试。"""
-    assert APP_VERSION == "2.5.1"
+    assert APP_VERSION == "2.5.2"
     assert APP_NAME.endswith(APP_VERSION)
     empty_release = platform_release_to_manifest({"version": {}})
     assert empty_release["latest_version"] == ""
     valid_release = platform_release_to_manifest(
         {
             "version": {
-                "latestVersion": "2.5.2",
+                "latestVersion": "2.5.3",
                 "downloadUri": "https://example.invalid/update.zip",
                 "fileSha256": "a" * 64,
             }
         }
     )
-    assert valid_release["latest_version"] == "2.5.2"
+    assert valid_release["latest_version"] == "2.5.3"
     assert valid_release["sha256"] == "a" * 64
     body, topics = split_text_topics("正文内容 ##话题一 #话题二")
     assert "#" not in body and topics == ["话题一", "话题二"]
@@ -5399,6 +5689,53 @@ def run_self_test():
     independent_cfg = config_for_browser_account(legacy, independent_schedule)
     assert len(build_slots(independent_cfg, log_result=False)) == 2
     assert independent_cfg["publish_start_date"] == "2026-08-05"
+    repeat_slots = build_slots(independent_cfg, log_result=False)
+    first_slot, first_cycle, first_offset = repeating_schedule_slot(repeat_slots, 0)
+    repeated_slot, repeated_cycle, repeated_offset = repeating_schedule_slot(repeat_slots, len(repeat_slots))
+    overflow_slot, overflow_cycle, overflow_offset = repeating_schedule_slot(repeat_slots, 5)
+    assert first_slot == repeated_slot and (first_cycle, first_offset) == (1, 0)
+    assert (repeated_cycle, repeated_offset) == (2, 0)
+    assert overflow_slot == repeat_slots[1] and (overflow_cycle, overflow_offset) == (3, 1)
+    assert account_run_resume_progress({"slot_index": 64}, "queue_test", 75) == 64
+    assert account_run_resume_progress({"slot_index": 75}, "queue_test", 75) == 0
+    assert account_run_resume_progress(
+        {"queue_run_id": "queue_test", "run_progress": 64}, "queue_test", 75
+    ) == 64
+    assert account_run_resume_progress(
+        {"queue_run_id": "queue_old", "run_progress": 64}, "queue_new", 75
+    ) == 0
+    assert normalize_browser_queue_column_widths({"path": 333})["path"] == 333
+    assert normalize_browser_queue_column_widths({"path": 1})["path"] == BROWSER_QUEUE_MIN_WIDTHS["path"]
+    with tempfile.TemporaryDirectory(prefix="douyin_resume_selftest_") as temp_dir:
+        queue_cfg = {"state_path": str(Path(temp_dir) / "queue_state.json")}
+        queue_accounts = [duplicate_a, duplicate_b]
+        queue_run_id, completed_ids, resumed = prepare_queue_run(queue_cfg, queue_accounts)
+        assert resumed is False and completed_ids == set()
+        update_queue_run_state(
+            queue_cfg, queue_run_id, queue_accounts, {duplicate_a["id"]}, active=True
+        )
+        resumed_id, resumed_completed, resumed = prepare_queue_run(queue_cfg, queue_accounts)
+        assert resumed is True and resumed_id == queue_run_id
+        assert resumed_completed == {duplicate_a["id"]}
+        pause_paths = pause_flag_paths_for_queue(queue_cfg, queue_accounts)
+        for flag in pause_paths:
+            flag.parent.mkdir(parents=True, exist_ok=True)
+            flag.write_text("paused", encoding="utf-8")
+        clear_pause_flags_for_queue(queue_cfg, queue_accounts)
+        assert all(not flag.exists() for flag in pause_paths)
+        update_queue_run_state(
+            queue_cfg, queue_run_id, queue_accounts,
+            {duplicate_a["id"], duplicate_b["id"]}, active=True,
+        )
+        queue_cfg["browser_accounts"] = queue_accounts
+        queue_config_path = Path(temp_dir) / "queue_config.json"
+        queue_config_path.write_text(
+            json.dumps(queue_cfg, ensure_ascii=False, indent=2), encoding="utf-8"
+        )
+        run_isolated_browser_sequence(queue_config_path, "--unused", publish_mode=True)
+        assert read_state(queue_cfg)["queue_run_active"] is False
+        next_run_id, next_completed, resumed = prepare_queue_run(queue_cfg, queue_accounts)
+        assert resumed is False and next_run_id != queue_run_id and next_completed == set()
     schedule_cfg = {
         "weekly_start_enabled": True,
         "weekly_start_days": [0],
@@ -5427,6 +5764,27 @@ def run_self_test():
         assert not {"image_dir", "excel_path", "publish_start_date", "publish_end_date", "max_posts_this_run"} & set(gui.vars)
         assert "use_schedule" not in gui.bool_vars
         assert int(gui.browser_tree.cget("height")) == 8
+        assert tuple(gui.browser_tree.cget("columns"))[0] == "publish"
+        assert all(not bool(gui.browser_tree.column(key, "stretch")) for key in BROWSER_QUEUE_COLUMNS)
+        saved_width_configs = []
+        old_save_config = globals()["save_config"]
+        try:
+            globals()["save_config"] = lambda cfg: saved_width_configs.append(copy.deepcopy(cfg))
+            gui.browser_tree.column("path", width=333)
+            assert gui.persist_browser_tree_column_widths() is True
+            assert saved_width_configs[-1]["browser_queue_column_widths"]["path"] == 333
+            assert gui.persist_browser_tree_column_widths() is False
+        finally:
+            globals()["save_config"] = old_save_config
+        first_account_id = gui.browser_accounts[0]["id"]
+        first_enabled = parse_bool(gui.browser_accounts[0].get("enabled"), True)
+        assert gui.toggle_browser_account_enabled(first_account_id) is True
+        assert parse_bool(gui.browser_accounts[0].get("enabled"), True) is not first_enabled
+        assert gui.set_all_browser_accounts_enabled(True) is True
+        assert len(browser_accounts_from_config({**gui.cfg, "browser_accounts": gui.browser_accounts}, enabled_only=True)) == len(gui.browser_accounts)
+        assert gui.set_all_browser_accounts_enabled(False) is True
+        assert browser_accounts_from_config({**gui.cfg, "browser_accounts": gui.browser_accounts}, enabled_only=True) == []
+        gui.set_all_browser_accounts_enabled(True)
         with tempfile.TemporaryDirectory(prefix="douyin_queue_selftest_") as temp_dir:
             queue_path = Path(temp_dir) / "queue.xlsx"
             old_save_dialog = filedialog.asksaveasfilename

@@ -39,9 +39,9 @@
 
 ```json
 {
-  "latest_version": "2.5.1",
-  "minimum_supported_version": "2.4.0",
-  "download_url": "https://github.com/Hugh112/douyinshangchuan/releases/download/v2.5.1/DouyinPublisher_Update_v2.5.1.zip",
+  "latest_version": "2.5.2",
+  "minimum_supported_version": "2.3.0",
+  "download_url": "https://github.com/Hugh112/douyinshangchuan/releases/download/v2.5.2/DouyinPublisher_Update_v2.5.2.zip",
   "sha256": "最终 ZIP 的小写 SHA256",
   "package_size_bytes": 0,
   "force_update": false,
@@ -62,7 +62,7 @@
 
 - 立即在统一后台暂停投放或降低 rollout。
 - 保留上一稳定版 Release 资产用于人工恢复。
-- 修复后发布更高补丁版本，例如 2.5.2，并使用新的 SHA256。
+- 修复后发布更高补丁版本，例如 2.5.3，并使用新的 SHA256。
 - GitHub Raw 与统一后台应保持同一稳定目标；后台优先用于快速控制，GitHub 用于清单和包体灾备。
 
 ## 6. 用户数据保护

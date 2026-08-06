@@ -1,9 +1,0 @@
-上传步骤：
-
-1. 解压 douyin_github_repo_v2.2.3_upload_ready.zip。
-2. 打开 douyin_github_repo_v2.2.3 文件夹。
-3. 把里面的 version.json、README.md、packages、.gitignore、上传到GitHub步骤.txt 上传到 GitHub 仓库根目录。
-4. 提交信息填写：fix zip filename encoding v2.2.3
-5. 点击提交更改。
-
-注意：不要把 douyin_github_repo_v2.2.3 这个外层文件夹上传进去，要上传它里面的内容。

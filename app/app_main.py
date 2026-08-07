@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-抖音智能发布中心 v2.5.2 - 多浏览器任务编排与统一授权版
+抖音智能发布中心 v3.0.0 - 城市图片与独立标题版
 功能：
 1. GUI 前端配置浏览器、图片、Excel、定时、等待、上传检测、重试等。
 2. 自动打开抖音创作者平台图文发布页。
@@ -14,6 +14,7 @@
 10. 支持多个浏览器账号按配额顺序发布、掉号跳过和独立进程隔离。
 11. 支持按星期和时间自动启动任务。
 12. 保留在线更新、无黑框普通启动和完整调试启动。
+13. 支持 Excel 城市、标题、文案三列绑定；兼容旧无表头单列文案。
 """
 
 import copy
@@ -90,7 +91,7 @@ APP_DATA_DIR = (
 CONFIG_PATH = APP_DATA_DIR / "douyin_gui_config.json"
 AUTH_TOKEN_PATH = APP_DATA_DIR / "authorization.bin"
 AUTH_LOGIN_PREFERENCES_PATH = APP_DATA_DIR / "login_preferences.bin"
-APP_VERSION = "2.5.2"
+APP_VERSION = "3.0.0"
 APP_NAME = f"抖音智能发布中心 v{APP_VERSION}"
 LOGO_ICO = RESOURCE_DIR / "assets" / "app_logo.ico"
 LOGO_PNG = RESOURCE_DIR / "assets" / "app_logo.png"
@@ -231,19 +232,19 @@ def format_release_notes(manifest):
 
 
 BROWSER_QUEUE_COLUMNS = (
-    "publish", "order", "name", "path", "image", "excel", "schedule", "port", "quota", "status",
+    "publish", "order", "name", "path", "excel", "schedule", "port", "quota", "status",
 )
 BROWSER_QUEUE_COLUMN_HEADINGS = {
     "publish": "发布", "order": "顺序", "name": "账号名称", "path": "浏览器快捷方式 / EXE",
-    "image": "图片文件夹", "excel": "文案 Excel", "schedule": "独立发布时间",
+    "excel": "文案 Excel", "schedule": "独立发布时间",
     "port": "端口", "quota": "发布条数", "status": "运行状态",
 }
 BROWSER_QUEUE_DEFAULT_WIDTHS = {
-    "publish": 58, "order": 48, "name": 105, "path": 250, "image": 190,
+    "publish": 58, "order": 48, "name": 105, "path": 250,
     "excel": 190, "schedule": 230, "port": 66, "quota": 76, "status": 145,
 }
 BROWSER_QUEUE_MIN_WIDTHS = {
-    "publish": 46, "order": 42, "name": 72, "path": 120, "image": 100,
+    "publish": 46, "order": 42, "name": 72, "path": 120,
     "excel": 100, "schedule": 130, "port": 52, "quota": 62, "status": 90,
 }
 
@@ -388,7 +389,6 @@ def normalize_browser_account(raw, index, legacy_cfg=None):
         "posts_per_run": posts,
         "close_after_finish": parse_bool(raw.get("close_after_finish"), True),
         "independent_content": True,
-        "image_dir": str(inherited("image_dir", "") or "").strip(),
         "excel_path": str(inherited("excel_path", "") or "").strip(),
         "sheet_name": str(inherited("sheet_name", "sheet1") or "sheet1").strip(),
         "use_schedule": parse_bool(inherited("use_schedule", True), True),
@@ -491,7 +491,7 @@ def config_for_browser_account(cfg, account):
         )
     )
     for key in (
-        "image_dir", "excel_path", "sheet_name", "publish_start_date",
+        "excel_path", "sheet_name", "publish_start_date",
         "publish_end_date", "custom_minutes",
     ):
         result[key] = str(account.get(key) or "").strip()
@@ -1220,28 +1220,34 @@ def repeating_schedule_slot(slots, progress_index):
     return slots[slot_offset], cycle_index + 1, slot_offset
 
 
-def list_images(cfg):
-    d = Path(cfg["image_dir"])
+IMAGE_FILE_EXTS = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
+
+
+def list_images(cfg, image_dir=None):
+    d = Path(image_dir if image_dir is not None else cfg["image_dir"])
     if not d.exists():
         raise FileNotFoundError(f"图片文件夹不存在：{d}")
-    exts = {".jpg", ".jpeg", ".png", ".webp", ".bmp"}
-    arr = [p for p in d.iterdir() if p.is_file() and p.suffix.lower() in exts]
-    arr.sort(key=lambda p: p.name)
+    if not d.is_dir():
+        raise NotADirectoryError(f"图片路径不是文件夹：{d}")
+    arr = [p for p in d.iterdir() if p.is_file() and p.suffix.lower() in IMAGE_FILE_EXTS]
+    arr.sort(key=lambda p: p.name.casefold())
     return arr
 
 
 COPY_FILE_EXTS = {".xlsx", ".xls", ".xlsm"}
 COPY_HEADER_NAMES = {
-    "文案", "正文", "内容", "标题", "发布文案", "抖音文案", "作品文案",
+    "文案", "正文", "内容", "发布文案", "抖音文案", "作品文案",
     "文案内容", "正文内容", "发布内容",
 }
+TITLE_HEADER_NAMES = {"标题", "作品标题", "发布标题", "抖音标题"}
+CITY_HEADER_NAMES = {"城市", "地区", "所在城市", "发布城市"}
 
 BROWSER_QUEUE_TABLE_COLUMNS = [
     ("顺序", "_order"), ("队列ID", "id"), ("账号名称", "name"),
     ("启用", "enabled"), ("浏览器路径", "browser_path"),
     ("用户数据目录", "browser_user_data_dir"), ("Profile目录", "browser_profile_directory"),
     ("CDP端口", "cdp_port"), ("发布条数", "posts_per_run"),
-    ("完成后关闭浏览器", "close_after_finish"), ("图片文件夹", "image_dir"),
+    ("完成后关闭浏览器", "close_after_finish"),
     ("文案Excel", "excel_path"), ("工作表名", "sheet_name"),
     ("使用定时发布", "use_schedule"), ("开始日期", "publish_start_date"),
     ("结束日期", "publish_end_date"), ("开始小时", "start_hour"),
@@ -1293,26 +1299,63 @@ def copy_cell_text(value):
     return str(value).strip()
 
 
+def normalized_header_name(value):
+    return re.sub(r"[\s_\-/（）()：:]+", "", copy_cell_text(value)).casefold()
+
+
 def is_copy_header(value):
-    text = re.sub(r"[\s_\-/（）()：:]+", "", copy_cell_text(value)).casefold()
-    return text in COPY_HEADER_NAMES
+    return normalized_header_name(value) in COPY_HEADER_NAMES
 
 
-def extract_copy_texts(df):
-    """同时兼容有表头和无表头；无表头时第一行就是第一条文案。"""
+def is_title_header(value):
+    return normalized_header_name(value) in TITLE_HEADER_NAMES
+
+
+def is_city_header(value):
+    return normalized_header_name(value) in CITY_HEADER_NAMES
+
+
+def extract_publish_records(df):
+    """
+    读取发布记录。
+
+    新格式使用“城市 / 标题 / 文案”表头；标题可以为空。存在城市列时，
+    每条记录必须填写城市，并从图片总目录下的同名子文件夹选择图片。
+    旧版无表头单列继续把第一行当作第一条文案；旧版仅以“标题”作为
+    文案列表头的单列表格也继续兼容。
+    """
     if df is None:
         return []
     frame = df.dropna(how="all")
     if frame.empty:
         return []
-    frame = frame.reset_index(drop=True)
-    header_column = next(
-        (column for column in frame.columns if is_copy_header(frame.at[0, column])),
-        None,
+
+    first_index = frame.index[0]
+    header_values = {column: copy_cell_text(frame.at[first_index, column]) for column in frame.columns}
+    copy_column = next((column for column, value in header_values.items() if is_copy_header(value)), None)
+    title_column = next((column for column, value in header_values.items() if is_title_header(value)), None)
+    city_column = next((column for column, value in header_values.items() if is_city_header(value)), None)
+    nonempty_header_columns = [column for column, value in header_values.items() if value]
+
+    structured = copy_column is not None
+    legacy_title_header = (
+        not structured
+        and title_column is not None
+        and city_column is None
+        and len(nonempty_header_columns) == 1
     )
-    if header_column is not None:
-        copy_column = header_column
-        first_data_row = 1
+
+    if structured:
+        data_frame = frame.iloc[1:]
+        data_format = "structured"
+    elif legacy_title_header:
+        # 兼容历史上把单列文案表头命名为“标题”的文件。
+        copy_column = title_column
+        title_column = None
+        data_frame = frame.iloc[1:]
+        data_format = "legacy_header"
+    elif title_column is not None or city_column is not None:
+        raise RuntimeError("Excel 已识别到“城市/标题”表头，但缺少“文案”列。请增加文案表头。")
     else:
         copy_column = next(
             (
@@ -1321,15 +1364,37 @@ def extract_copy_texts(df):
             ),
             frame.columns[0],
         )
-        first_data_row = 0
-    return [
-        copy_cell_text(value)
-        for value in frame.loc[first_data_row:, copy_column].tolist()
-        if copy_cell_text(value)
-    ]
+        title_column = None
+        city_column = None
+        data_frame = frame
+        data_format = "legacy_headerless"
+
+    records = []
+    for row_index, row in data_frame.iterrows():
+        copy_text = copy_cell_text(row.get(copy_column))
+        if not copy_text:
+            continue
+        try:
+            excel_row = int(row_index) + 1
+        except Exception:
+            excel_row = 0
+        records.append({
+            "city": copy_cell_text(row.get(city_column)) if city_column is not None else "",
+            "title": copy_cell_text(row.get(title_column)) if title_column is not None else "",
+            "copy": copy_text,
+            "excel_row": excel_row,
+            "has_city_column": city_column is not None,
+            "format": data_format,
+        })
+    return records
 
 
-def read_copies(cfg):
+def extract_copy_texts(df):
+    """同时兼容有表头和无表头；无表头时第一行就是第一条文案。"""
+    return [record["copy"] for record in extract_publish_records(df)]
+
+
+def read_publish_records(cfg):
     p = validate_copy_file_path(cfg.get("excel_path", ""))
     suffix = p.suffix.lower()
     # v2.2.7：不要让 pandas 自己猜 Excel 类型，按文件后缀指定引擎。
@@ -1366,7 +1431,12 @@ def read_copies(cfg):
     finally:
         xls.close()
 
-    return extract_copy_texts(df)
+    return extract_publish_records(df)
+
+
+def read_copies(cfg):
+    """兼容旧调用：只返回正文列表。新发布流程使用 read_publish_records。"""
+    return [record["copy"] for record in read_publish_records(cfg)]
 
 
 def normalize_copy_text(value):
@@ -1381,6 +1451,30 @@ def copy_key(value):
     return hashlib.sha1(text.encode("utf-8", errors="ignore")).hexdigest()
 
 
+def publish_record_key(record):
+    payload = {
+        "city": normalize_copy_text(record.get("city", "")),
+        "title": normalize_copy_text(record.get("title", "")),
+        "copy": normalize_copy_text(record.get("copy", "")),
+    }
+    raw = json.dumps(payload, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def filter_used_publish_records(records, state):
+    used = set(state.get("used_copy_keys", []) or [])
+    if not used:
+        return records
+    filtered = [
+        record for record in records
+        if publish_record_key(record) not in used and copy_key(record.get("copy", "")) not in used
+    ]
+    skipped = len(records) - len(filtered)
+    if skipped:
+        wlog(f"已根据进度文件跳过 {skipped} 条已发布但未能从 Excel 删除的记录。")
+    return filtered
+
+
 def filter_used_copies(copies, state):
     used = set(state.get("used_copy_keys", []) or [])
     if not used:
@@ -1390,6 +1484,17 @@ def filter_used_copies(copies, state):
     if skipped:
         wlog(f"已根据进度文件跳过 {skipped} 条已发布但未能从 Excel 删除的文案。")
     return filtered
+
+
+def mark_publish_record_used_in_state(cfg, record):
+    state = read_state(cfg)
+    used = list(state.get("used_copy_keys", []) or [])
+    key = publish_record_key(record)
+    if key not in used:
+        used.append(key)
+    state["used_copy_keys"] = used[-5000:]
+    write_state(cfg, state)
+    wlog("已把当前城市、标题和文案写入进度文件，避免后续重复使用。")
 
 
 def mark_copy_used_in_state(cfg, copy_text):
@@ -1403,7 +1508,67 @@ def mark_copy_used_in_state(cfg, copy_text):
     wlog("已把当前文案写入进度文件的已用文案列表，避免后续重复使用。")
 
 
-def delete_copy_from_excel(cfg, copy_text):
+def validate_city_folder_name(city):
+    city = copy_cell_text(city)
+    if not city:
+        raise RuntimeError("当前文案的城市为空；使用城市表头时，每条文案都必须填写城市。")
+    if city in {".", ".."} or any(ch in city for ch in ("/", "\\", ":", "\x00")):
+        raise RuntimeError(f"城市名称不能包含路径字符：{city}")
+    return city
+
+
+def resolve_image_dir_for_record(cfg, record):
+    root = Path(str(cfg.get("image_dir", "")).strip().strip('"'))
+    if not root.is_dir():
+        raise FileNotFoundError(f"图片总文件夹不存在：{root}")
+    if not record.get("has_city_column", False):
+        return root
+
+    city = validate_city_folder_name(record.get("city", ""))
+    matches = [child for child in root.iterdir() if child.is_dir() and child.name.casefold() == city.casefold()]
+    if not matches:
+        raise FileNotFoundError(f"找不到城市“{city}”对应的图片子文件夹：{root / city}")
+    exact = next((child for child in matches if child.name == city), matches[0])
+    root_resolved = root.resolve()
+    exact_resolved = exact.resolve()
+    if exact_resolved.parent != root_resolved:
+        raise RuntimeError(f"城市图片目录必须位于图片总文件夹内：{exact}")
+    return exact
+
+
+def list_images_for_record(cfg, record):
+    image_dir = resolve_image_dir_for_record(cfg, record)
+    images = list_images(cfg, image_dir=image_dir)
+    if not images:
+        city = copy_cell_text(record.get("city", ""))
+        scope = f"城市“{city}”" if record.get("has_city_column", False) else "图片根目录"
+        raise RuntimeError(f"{scope}没有可发布图片：{image_dir}")
+    return images
+
+
+def choose_image_for_record(cfg, record):
+    images = list_images_for_record(cfg, record)
+    return random.choice(images) if cfg.get("random_image", False) else images[0]
+
+
+def validate_publish_records_and_images(cfg):
+    records = read_publish_records(cfg)
+    if not records:
+        raise RuntimeError("Excel 中没有可发布文案。")
+    checked_scopes = set()
+    for record in records:
+        scope = (
+            bool(record.get("has_city_column", False)),
+            copy_cell_text(record.get("city", "")).casefold(),
+        )
+        if scope in checked_scopes:
+            continue
+        list_images_for_record(cfg, record)
+        checked_scopes.add(scope)
+    return records
+
+
+def delete_copy_from_excel(cfg, copy_record):
     """
     V28：发布成功后从 Excel 中删除已使用文案所在行。
     如果 Excel 被 WPS/Excel 打开占用，会明确提示，并返回 False。
@@ -1413,7 +1578,11 @@ def delete_copy_from_excel(cfg, copy_text):
         wlog(f"提醒：Excel 不存在，无法删除已用文案：{p}")
         return False
 
-    target = normalize_copy_text(copy_text)
+    record = copy_record if isinstance(copy_record, dict) else {
+        "city": "", "title": "", "copy": copy_record, "excel_row": 0,
+        "has_city_column": False, "format": "legacy",
+    }
+    target = normalize_copy_text(record.get("copy", ""))
     if not target:
         wlog("提醒：当前文案为空，跳过删除 Excel 文案。")
         return False
@@ -1438,12 +1607,18 @@ def delete_copy_from_excel(cfg, copy_text):
 
     ws = wb[sheet_name]
 
-    copy_col = None
-    for c in range(1, ws.max_column + 1):
-        header = normalize_copy_text(ws.cell(row=1, column=c).value)
-        if is_copy_header(header):
-            copy_col = c
-            break
+    copy_col = next((c for c in range(1, ws.max_column + 1) if is_copy_header(ws.cell(row=1, column=c).value)), None)
+    title_col = next((c for c in range(1, ws.max_column + 1) if is_title_header(ws.cell(row=1, column=c).value)), None)
+    city_col = next((c for c in range(1, ws.max_column + 1) if is_city_header(ws.cell(row=1, column=c).value)), None)
+
+    nonempty_header_cols = [
+        c for c in range(1, ws.max_column + 1)
+        if normalize_copy_text(ws.cell(row=1, column=c).value)
+    ]
+    legacy_title_header = copy_col is None and title_col is not None and city_col is None and len(nonempty_header_cols) == 1
+    if legacy_title_header:
+        copy_col = title_col
+        title_col = None
 
     if copy_col is None:
         for c in range(1, ws.max_column + 1):
@@ -1456,17 +1631,32 @@ def delete_copy_from_excel(cfg, copy_text):
         wb.close()
         return False
 
-    has_header = is_copy_header(ws.cell(row=1, column=copy_col).value)
+    has_header = is_copy_header(ws.cell(row=1, column=copy_col).value) or legacy_title_header
     candidate_rows = list(range(2 if has_header else 1, ws.max_row + 1))
 
+    target_city = normalize_copy_text(record.get("city", ""))
+    target_title = normalize_copy_text(record.get("title", ""))
+
+    def row_matches(row_number):
+        value = normalize_copy_text(ws.cell(row=row_number, column=copy_col).value)
+        if value != target:
+            return False
+        if city_col is not None and normalize_copy_text(ws.cell(row=row_number, column=city_col).value) != target_city:
+            return False
+        if title_col is not None and normalize_copy_text(ws.cell(row=row_number, column=title_col).value) != target_title:
+            return False
+        return True
+
     matched_row = None
+    preferred_row = int(record.get("excel_row", 0) or 0)
+    if preferred_row in candidate_rows and row_matches(preferred_row):
+        matched_row = preferred_row
     for r in candidate_rows:
-        value = normalize_copy_text(ws.cell(row=r, column=copy_col).value)
-        if value == target:
+        if matched_row is None and row_matches(r):
             matched_row = r
             break
 
-    if matched_row is None:
+    if matched_row is None and not isinstance(copy_record, dict):
         target_head = target[:40]
         if len(target_head) >= 10:
             for r in candidate_rows:
@@ -1943,13 +2133,106 @@ def wait_after_upload_to_editor(cfg, page):
         wlog(f"等待进入图文编辑页，{interval:.1f} 秒后重试。")
         countdown_sleep(ACTIVE_CFG or {}, interval, "等待进入图文编辑页", "edit_page_check")
 
+def editor_descriptor(item):
+    try:
+        return item.evaluate("""
+        el => [
+          el.getAttribute('placeholder') || '',
+          el.getAttribute('data-placeholder') || '',
+          el.getAttribute('aria-label') || '',
+          el.getAttribute('name') || '',
+          el.closest('label')?.innerText || '',
+          el.parentElement?.innerText?.slice(0, 80) || ''
+        ].join(' ')
+        """)
+    except Exception:
+        return ""
+
+
 def find_editor(page):
+    preferred = [
+        "[contenteditable='true'][data-placeholder*='作品描述']",
+        "[contenteditable='true'][aria-label*='作品描述']",
+        "textarea[placeholder*='作品描述']",
+        "textarea[placeholder*='描述']",
+        "[contenteditable='true'][data-placeholder*='正文']",
+    ]
+    for sel in preferred:
+        item = first_visible(page, sel)
+        if item:
+            return item
+
     selectors = ["div[contenteditable='true']", "[contenteditable='true']", "textarea", "[role='textbox']"]
+    for sel in selectors:
+        try:
+            loc = page.locator(sel)
+            for index in range(min(loc.count(), 100)):
+                item = loc.nth(index)
+                if not item.is_visible(timeout=250):
+                    continue
+                if "标题" in editor_descriptor(item):
+                    continue
+                return item
+        except Exception:
+            pass
+    return None
+
+
+def find_title_editor(page):
+    selectors = [
+        "input[placeholder*='标题']",
+        "textarea[placeholder*='标题']",
+        "[contenteditable='true'][data-placeholder*='标题']",
+        "[contenteditable='true'][aria-label*='标题']",
+        "input[aria-label*='标题']",
+        "textarea[aria-label*='标题']",
+        "[role='textbox'][aria-label*='标题']",
+    ]
     for sel in selectors:
         item = first_visible(page, sel)
         if item:
             return item
     return None
+
+
+def get_input_text(item):
+    try:
+        return item.evaluate("el => ('value' in el ? el.value : (el.innerText || el.textContent || ''))")
+    except Exception:
+        return ""
+
+
+def fill_title(cfg, page, title):
+    title = copy_cell_text(title)
+    if not title:
+        return False
+    editor = find_title_editor(page)
+    if not editor:
+        save_debug(cfg, page, "title_editor_not_found")
+        raise RuntimeError("Excel 已填写标题，但发布页没有找到标题输入框。")
+    editor.click(force=True)
+    page.keyboard.press("Control+A")
+    page.keyboard.press("Backspace")
+    page.keyboard.type(title, delay=0)
+    step_wait(cfg, "输入标题后等待")
+    return True
+
+
+def validate_title_filled(cfg, page, title):
+    title = copy_cell_text(title)
+    if not title:
+        return True
+    expected = normalize_text_for_check(title)
+    for attempt in range(1, 4):
+        editor = find_title_editor(page)
+        actual = normalize_text_for_check(get_input_text(editor)) if editor else ""
+        if expected and expected in actual:
+            wlog(f"校验通过：标题已写入，共 {len(expected)} 个有效字符。")
+            return True
+        wlog(f"第 {attempt}/3 次标题校验暂未通过，等待输入框状态稳定。")
+        time.sleep(0.8)
+    save_debug(cfg, page, "validate_title_filled_failed")
+    raise RuntimeError("标题校验失败：标题输入框中没有检测到对应内容。")
 
 
 def fill_copy(cfg, page, text):
@@ -2041,7 +2324,18 @@ def get_editor_text_for_check(page):
           ];
 
           const elements = [...document.querySelectorAll(selectors.join(","))]
-            .filter(visible);
+            .filter(visible)
+            .filter(el => {
+              const descriptor = [
+                el.getAttribute('placeholder') || '',
+                el.getAttribute('data-placeholder') || '',
+                el.getAttribute('aria-label') || '',
+                el.getAttribute('name') || '',
+                el.closest('label')?.innerText || '',
+                el.parentElement?.innerText?.slice(0, 80) || ''
+              ].join(' ');
+              return !descriptor.includes('标题');
+            });
 
           const texts = elements.map(el => {
             if (el.tagName === "TEXTAREA" || el.tagName === "INPUT") {
@@ -3215,7 +3509,7 @@ def account_worker(config_path):
     cfg["browser_accounts"] = [accounts[0]]
     accounts = [accounts[0]]
     ACTIVE_CFG = cfg
-    copies = read_copies(cfg)
+    records = read_publish_records(cfg)
     slots = build_slots(cfg) if cfg.get("use_schedule", True) else []
     state = read_state(cfg)
     primary_account = accounts[0]
@@ -3248,7 +3542,7 @@ def account_worker(config_path):
     stop_all = False
 
     wlog(f"本轮启用 {len(accounts)} 个浏览器账号；发布失败最多重试 {retry_times} 次。")
-    wlog(f"读取文案 {len(copies)} 条，当前文案序号：{ci + 1}")
+    wlog(f"读取发布记录 {len(records)} 条，当前记录序号：{ci + 1}")
     if cfg.get("use_schedule", True):
         _slot, current_cycle, current_offset = repeating_schedule_slot(slots, si)
         wlog(
@@ -3324,37 +3618,40 @@ def account_worker(config_path):
             emit_browser_status(account, "ready", "登录有效，已进入图文发布页", account_done, account_quota)
 
             while account_done < account_quota:
-                imgs = list_images(account_cfg)
-                if not imgs:
-                    alert_auto_pause("提醒：图片文件夹已没有可发布图片，全部任务结束。")
-                    append_log(account_cfg, {
-                        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "image": "", "copy_index": ci + 1, "schedule_time": "",
-                        "copy_preview": "", "status": f"paused_no_images[{account_name}]"
-                    })
-                    stop_all = True
-                    break
-
-                copies = read_copies(account_cfg)
+                records = read_publish_records(account_cfg)
                 if account_cfg.get("delete_copy_after_success", True):
-                    copies = filter_used_copies(copies, read_state(account_cfg))
+                    records = filter_used_publish_records(records, read_state(account_cfg))
                     ci = 0
-                if not copies:
+                if not records:
                     alert_auto_pause("提醒：Excel 中已没有可发布文案，全部任务结束。")
                     append_log(account_cfg, {
                         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "image": str(imgs[0]) if imgs else "", "copy_index": 0,
+                        "image": "", "copy_index": 0,
                         "schedule_time": "", "copy_preview": "",
                         "status": f"paused_no_copies[{account_name}]"
                     })
                     stop_all = True
                     break
-                if ci >= len(copies):
+                if ci >= len(records):
                     alert_auto_pause("提醒：文案序号超过当前文案数量，请重置发布进度。")
                     stop_all = True
                     break
-                img = random.choice(imgs) if account_cfg.get("random_image", False) else imgs[0]
-                copy_text = copies[ci]
+                publish_record = records[ci]
+                city = publish_record.get("city", "")
+                title = publish_record.get("title", "")
+                copy_text = publish_record["copy"]
+                try:
+                    img = choose_image_for_record(account_cfg, publish_record)
+                except Exception as exc:
+                    alert_auto_pause(f"自动暂停提醒：{account_name} 的图片匹配失败：{exc}")
+                    append_log(account_cfg, {
+                        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "image": "", "copy_index": ci + 1, "schedule_time": "",
+                        "copy_preview": copy_text[:80].replace("\n", " "),
+                        "status": f"paused_image_match[{account_name}]: {repr(exc)}"
+                    })
+                    stop_all = True
+                    break
                 schedule_cycle = 1
                 schedule_offset = 0
                 if account_cfg.get("use_schedule", True):
@@ -3375,7 +3672,7 @@ def account_worker(config_path):
                     wlog("-" * 60)
                     wlog(
                         f"{account_name} 第 {attempt}/{retry_times + 1} 次完整尝试："
-                        f"图片={img.name}；文案序号={ci + 1}；"
+                        f"城市={city or '旧格式根目录'}；图片={img.name}；文案序号={ci + 1}；"
                         f"定时={slot.strftime('%Y-%m-%d %H:%M') if account_cfg.get('use_schedule', True) else '立即发布'}"
                     )
                     try:
@@ -3384,6 +3681,8 @@ def account_worker(config_path):
                         upload_image(account_cfg, page, img)
                         step_wait(account_cfg, "已选择图片，等待进入图文编辑页")
                         wait_after_upload_to_editor(account_cfg, page)
+                        fill_title(account_cfg, page, title)
+                        validate_title_filled(account_cfg, page, title)
                         fill_copy(account_cfg, page, copy_text)
                         validate_copy_filled(account_cfg, page, copy_text)
 
@@ -3403,6 +3702,7 @@ def account_worker(config_path):
 
                         wait_uploaded_with_config(account_cfg, page)
                         validate_uploaded_image(account_cfg, page)
+                        validate_title_filled(account_cfg, page, title)
                         validate_copy_filled(account_cfg, page, copy_text)
                         if account_cfg.get("music_required", True):
                             validate_music_added(account_cfg, page)
@@ -3441,7 +3741,7 @@ def account_worker(config_path):
                     break
 
                 # 只有确认进入作品管理页后，才消费图片、文案和排期。
-                mark_copy_used_in_state(account_cfg, copy_text)
+                mark_publish_record_used_in_state(account_cfg, publish_record)
                 if account_cfg.get("delete_image_after_success", True):
                     try:
                         img.unlink()
@@ -3450,7 +3750,7 @@ def account_worker(config_path):
                         wlog(f"删除图片失败：{exc}")
                 if account_cfg.get("delete_copy_after_success", True):
                     try:
-                        delete_copy_from_excel(account_cfg, copy_text)
+                        delete_copy_from_excel(account_cfg, publish_record)
                     except Exception as exc:
                         wlog(f"删除已用文案失败：{repr(exc)}")
 
@@ -3747,7 +4047,6 @@ class BrowserAccountDialog:
             "browser_profile_directory": tk.StringVar(value=str(account.get("browser_profile_directory", ""))),
             "cdp_port": tk.StringVar(value=str(account.get("cdp_port", 9222))),
             "posts_per_run": tk.StringVar(value=str(account.get("posts_per_run", 1))),
-            "image_dir": tk.StringVar(value=str(account.get("image_dir", ""))),
             "excel_path": tk.StringVar(value=str(account.get("excel_path", ""))),
             "sheet_name": tk.StringVar(value=str(account.get("sheet_name", ""))),
             "publish_start_date": tk.StringVar(value=str(account.get("publish_start_date", ""))),
@@ -3799,7 +4098,6 @@ class BrowserAccountDialog:
         content = ttk.LabelFrame(account_tab, text="账号发布内容", padding=12)
         content.pack(fill="x", pady=(8, 8))
         content_rows = [
-            ("图片文件夹", "image_dir", "folder"),
             ("文案 Excel", "excel_path", "excel"),
             ("工作表名", "sheet_name", None),
         ]
@@ -3879,11 +4177,10 @@ class BrowserAccountDialog:
                 raise ValueError("CDP 调试端口必须在 1—65535 之间。")
             if posts < 1:
                 raise ValueError("每个浏览器本轮至少发布 1 条。")
-            image_dir = self.vars["image_dir"].get().strip()
             excel_path = self.vars["excel_path"].get().strip()
             sheet_name = self.vars["sheet_name"].get().strip()
-            if not image_dir or not excel_path or not sheet_name:
-                raise ValueError("图片文件夹、文案 Excel 和工作表名都必须填写。")
+            if not excel_path or not sheet_name:
+                raise ValueError("文案 Excel 和工作表名都必须填写。")
             validate_copy_file_path(excel_path)
             raw = {
                 "id": self.original_id,
@@ -3896,7 +4193,6 @@ class BrowserAccountDialog:
                 "posts_per_run": posts,
                 "close_after_finish": self.close_var.get(),
                 "independent_content": True,
-                "image_dir": image_dir,
                 "excel_path": excel_path,
                 "sheet_name": sheet_name,
                 "use_schedule": self.use_schedule_var.get(),
@@ -4190,7 +4486,7 @@ class App:
                 key,
                 width=widths[key],
                 minwidth=BROWSER_QUEUE_MIN_WIDTHS[key],
-                anchor="center" if key not in {"path", "image", "excel", "schedule"} else "w",
+                anchor="center" if key not in {"path", "excel", "schedule"} else "w",
                 stretch=False,
             )
         vertical_scroll = ttk.Scrollbar(tree_frame, orient="vertical", command=self.browser_tree.yview)
@@ -4259,8 +4555,12 @@ class App:
 
     def _build_settings_tab(self, parent):
         parent.grid_columnconfigure(0, weight=1)
+        image_card, image_body = self._card(parent, "共享城市图片池")
+        image_card.grid(row=0, column=0, sticky="ew", pady=(0, 10))
+        image_body.columnconfigure(1, weight=1)
+        self.add_row(image_body, 0, "图片总文件夹", "image_dir", "folder")
         queue_card = self._build_browser_queue_card(parent)
-        queue_card.grid(row=0, column=0, sticky="ew")
+        queue_card.grid(row=1, column=0, sticky="ew")
 
     def _build_field_grid(self, parent, fields, columns=4):
         for index, (label, key) in enumerate(fields):
@@ -4818,11 +5118,12 @@ class App:
                 raise ValueError(f"浏览器账号“{account.get('name')}”未设置快捷方式或 EXE。")
         for account in enabled:
             account_cfg = config_for_browser_account(cfg, account)
-            validate_copy_file_path(account_cfg.get("excel_path", ""))
-            if not Path(account_cfg.get("image_dir", "")).is_dir():
-                raise ValueError(f"队列项“{account['name']}”的图片文件夹不存在。")
             if not str(account_cfg.get("sheet_name") or "").strip():
                 raise ValueError(f"队列项“{account['name']}”的工作表名不能为空。")
+            try:
+                validate_publish_records_and_images(account_cfg)
+            except Exception as exc:
+                raise ValueError(f"队列项“{account['name']}”内容检查失败：{exc}") from exc
             if account_cfg.get("use_schedule", True):
                 build_slots(account_cfg, log_result=False)
         first = enabled[0]
@@ -4880,7 +5181,6 @@ class App:
                     index,
                     account["name"],
                     account["browser_path"],
-                    account.get("image_dir", ""),
                     account.get("excel_path", ""),
                     schedule_text,
                     account["cdp_port"],
@@ -5143,7 +5443,7 @@ class App:
                 for index, cell in enumerate(sheet[1])
                 if str(cell.value or "").strip()
             }
-            required = {"账号名称", "浏览器路径", "CDP端口", "发布条数", "图片文件夹", "文案Excel", "工作表名"}
+            required = {"账号名称", "浏览器路径", "CDP端口", "发布条数", "文案Excel", "工作表名"}
             missing = sorted(required - set(headers))
             if missing:
                 raise ValueError("队列表缺少列：" + "、".join(missing))
@@ -5412,12 +5712,7 @@ class App:
         try:
             for account in browser_accounts_from_config(self.cfg, enabled_only=True):
                 account_cfg = config_for_browser_account(self.cfg, account)
-                validate_copy_file_path(account_cfg.get("excel_path", ""))
-                image_dir = Path(account_cfg.get("image_dir", ""))
-                if not image_dir.is_dir():
-                    raise FileNotFoundError(
-                        f"浏览器账号“{account['name']}”的图片文件夹不存在：{image_dir}"
-                    )
+                validate_publish_records_and_images(account_cfg)
                 if not Path(account["browser_path"]).exists():
                     raise FileNotFoundError(f"浏览器账号“{account['name']}”路径不存在：{account['browser_path']}")
         except Exception as exc:
@@ -5588,7 +5883,7 @@ def run_gui():
 
 def run_self_test():
     """不连接浏览器、不发布内容的内置冒烟测试。"""
-    assert APP_VERSION == "2.5.2"
+    assert APP_VERSION == "3.0.0"
     assert APP_NAME.endswith(APP_VERSION)
     empty_release = platform_release_to_manifest({"version": {}})
     assert empty_release["latest_version"] == ""
@@ -5608,7 +5903,43 @@ def run_self_test():
     assert COPY_FILE_EXTS == {".xlsx", ".xls", ".xlsm"}
     assert extract_copy_texts(pd.DataFrame([["第一条文案"], ["第二条文案"]])) == ["第一条文案", "第二条文案"]
     assert extract_copy_texts(pd.DataFrame([["文案"], ["第一条文案"], ["第二条文案"]])) == ["第一条文案", "第二条文案"]
+    structured_records = extract_publish_records(pd.DataFrame([
+        ["城市", "标题", "文案"],
+        ["北京", "北京标题", "北京正文 #北京"],
+        ["上海", "", "上海正文"],
+    ]))
+    assert structured_records[0]["city"] == "北京"
+    assert structured_records[0]["title"] == "北京标题"
+    assert structured_records[0]["copy"] == "北京正文 #北京"
+    assert structured_records[0]["excel_row"] == 2
+    assert structured_records[0]["has_city_column"] is True
+    assert structured_records[1]["title"] == ""
+    assert extract_copy_texts(pd.DataFrame([["标题"], ["旧版第一条"], ["旧版第二条"]])) == ["旧版第一条", "旧版第二条"]
+    try:
+        extract_publish_records(pd.DataFrame([["城市", "标题"], ["北京", "标题一"]]))
+        raise AssertionError("有城市/标题表头时必须包含文案列")
+    except RuntimeError:
+        pass
     with tempfile.TemporaryDirectory(prefix="douyin_copy_selftest_") as temp_dir:
+        image_root = Path(temp_dir) / "images"
+        city_dir = image_root / "北京"
+        city_dir.mkdir(parents=True)
+        (city_dir / "b.jpg").write_bytes(b"b")
+        (city_dir / "A.png").write_bytes(b"a")
+        image_cfg = {"image_dir": str(image_root), "random_image": False}
+        assert choose_image_for_record(image_cfg, structured_records[0]).name == "A.png"
+        assert choose_image_for_record({**image_cfg, "random_image": True}, structured_records[0]).parent == city_dir
+        try:
+            list_images_for_record(image_cfg, {**structured_records[0], "city": "../北京"})
+            raise AssertionError("城市列不应允许路径跳转")
+        except RuntimeError:
+            pass
+        try:
+            list_images_for_record(image_cfg, {**structured_records[1], "city": ""})
+            raise AssertionError("存在城市列时城市不能为空")
+        except RuntimeError:
+            pass
+
         headerless_path = Path(temp_dir) / "headerless.xlsx"
         workbook = Workbook()
         sheet = workbook.active
@@ -5631,8 +5962,30 @@ def run_self_test():
         workbook.save(header_path)
         workbook.close()
         assert read_copies({"excel_path": str(header_path), "sheet_name": "sheet1"}) == ["第一条文案"]
+
+        structured_path = Path(temp_dir) / "city_title_copy.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "sheet1"
+        sheet.append(["城市", "标题", "文案"])
+        sheet.append(["北京", "标题一", "相同正文"])
+        sheet.append(["北京", "标题二", "相同正文"])
+        workbook.save(structured_path)
+        workbook.close()
+        structured_cfg = {
+            "excel_path": str(structured_path), "sheet_name": "sheet1",
+            "image_dir": str(image_root), "random_image": False,
+        }
+        records = read_publish_records(structured_cfg)
+        assert len(records) == 2 and records[0]["title"] == "标题一"
+        assert publish_record_key(records[0]) != publish_record_key(records[1])
+        assert filter_used_publish_records(records, {"used_copy_keys": [publish_record_key(records[0])]}) == [records[1]]
+        assert delete_copy_from_excel(structured_cfg, records[0]) is True
+        remaining = read_publish_records(structured_cfg)
+        assert len(remaining) == 1 and remaining[0]["title"] == "标题二"
     legacy = default_config()
     legacy["browser_path"] = r"D:\浏览器7.lnk"
+    legacy["image_dir"] = r"D:\共享城市图片"
     legacy["browser_account_suggestions"] = []
     accounts = browser_accounts_from_config(legacy)
     assert len(accounts) == 1 and accounts[0]["posts_per_run"] == 1
@@ -5650,7 +6003,8 @@ def run_self_test():
         legacy,
     )
     mapped = config_for_browser_account(legacy, custom)
-    assert mapped["image_dir"] == r"D:\账号9图片"
+    assert "image_dir" not in custom
+    assert mapped["image_dir"] == r"D:\共享城市图片"
     assert mapped["excel_path"] == r"D:\账号9文案.xlsx"
     assert "browser_custom" in mapped["state_path"]
     duplicate_a = normalize_browser_account(
@@ -5761,10 +6115,12 @@ def run_self_test():
             "发布中心", "账号与排期", "自动启动", "系统与日志"
         ]
         assert "retry_times" in gui.vars
-        assert not {"image_dir", "excel_path", "publish_start_date", "publish_end_date", "max_posts_this_run"} & set(gui.vars)
+        assert "image_dir" in gui.vars
+        assert not {"excel_path", "publish_start_date", "publish_end_date", "max_posts_this_run"} & set(gui.vars)
         assert "use_schedule" not in gui.bool_vars
         assert int(gui.browser_tree.cget("height")) == 8
         assert tuple(gui.browser_tree.cget("columns"))[0] == "publish"
+        assert "image" not in tuple(gui.browser_tree.cget("columns"))
         assert all(not bool(gui.browser_tree.column(key, "stretch")) for key in BROWSER_QUEUE_COLUMNS)
         saved_width_configs = []
         old_save_config = globals()["save_config"]

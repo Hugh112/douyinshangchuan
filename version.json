@@ -1,9 +1,9 @@
 {
-  "latest_version": "3.0.3",
+  "latest_version": "3.0.4",
   "minimum_supported_version": "2.3.0",
-  "download_url": "https://github.com/Hugh112/douyinshangchuan/releases/download/v3.0.3/DouyinPublisher_Update_v3.0.3.zip",
-  "sha256": "d708efc6787c3c65dc8eb75373780e48dae117010722ef036ea3f22bdb3fc5b2",
-  "package_size_bytes": 89868738,
+  "download_url": "https://github.com/Hugh112/douyinshangchuan/releases/download/v3.0.4/DouyinPublisher_Update_v3.0.4.zip",
+  "sha256": "be8a3b2c0e745ff826bd06876f1194f06bbf64e51a762144acf8a946005f4b21",
+  "package_size_bytes": 89869975,
   "force_update": false,
   "is_forced": false,
   "rollout_percentage": 100,
@@ -11,9 +11,9 @@
     "app/douyin_gui_config.json"
   ],
   "release_notes": [
-    "修复任务控制区按钮被右侧裁切，重置发布进度和清空日志现已完整显示。",
-    "修复选择定时发布后目标日期时间未实际写入；使用真实键盘输入完整时间并回读校验。",
-    "发布设置已在页面底部可见时跳过下滑、鼠标滚轮和等待，减少无效操作。",
-    "保留日期面板、DOM、真实鼠标与滚轮兜底；本次为可选更新，不强制升级。"
+    "修复新版抖音已选中定时发布却被误判为点击失败的问题。",
+    "等待发布时间框出现后，严格执行清空旧值、写入账号排期时间和回读确认。",
+    "受控日期组件优先使用 v3.0.1 已验证的 DOM 输入逻辑，并保留键盘和日期面板兜底。",
+    "点击底部发布前再次校验定时时间；不一致时禁止提交。本次为可选更新。"
   ]
 }

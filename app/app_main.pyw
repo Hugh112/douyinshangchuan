@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-抖音智能发布中心 v3.0.3 - 定时发布与界面稳定性修复版
+抖音智能发布中心 v3.0.4 - 定时时间输入修复版
 功能：
 1. GUI 前端配置浏览器、图片、Excel、定时、等待、上传检测、重试等。
 2. 自动打开抖音创作者平台图文发布页。
@@ -111,7 +111,7 @@ CONFIG_PATH = APP_DATA_DIR / "douyin_gui_config.json"
 AUTH_TOKEN_PATH = APP_DATA_DIR / "authorization.bin"
 AUTH_LOGIN_PREFERENCES_PATH = APP_DATA_DIR / "login_preferences.bin"
 DEBUG_SCREENSHOT_CLEANUP_STATE_PATH = APP_DATA_DIR / "debug_screenshot_cleanup.json"
-APP_VERSION = "3.0.3"
+APP_VERSION = "3.0.4"
 APP_NAME = f"抖音智能发布中心 v{APP_VERSION}"
 LOGO_ICO = RESOURCE_DIR / "assets" / "app_logo.ico"
 LOGO_PNG = RESOURCE_DIR / "assets" / "app_logo.png"
@@ -3997,6 +3997,55 @@ def get_text_rects(page, word):
     """, word) or []
 
 
+def visible_schedule_input_state(page):
+    """识别“发布时间”同一模块中已经显示的日期时间输入框。"""
+    try:
+        return page.evaluate(r"""
+        () => {
+          function visible(el){
+            const r=el.getBoundingClientRect(), s=getComputedStyle(el);
+            return r.width>0 && r.height>0 && s.display!=='none' &&
+              s.visibility!=='hidden' && Number(s.opacity||1)>0;
+          }
+          function txt(el){ return ((el.innerText||el.textContent||'')+'').replace(/\s+/g,' ').trim(); }
+          const labels=[...document.querySelectorAll('label,span,div,p')]
+            .filter(visible).filter(el => txt(el)==='发布时间')
+            .map(el => el.getBoundingClientRect());
+          const inputs=[...document.querySelectorAll('input')].filter(visible)
+            .filter(el => !['radio','checkbox','file','hidden','button','submit']
+              .includes(String(el.type||'').toLowerCase()));
+          const results=[];
+          for(const input of inputs){
+            const r=input.getBoundingClientRect();
+            if(r.width<90 || r.height<20) continue;
+            const value=String(input.value||'').trim();
+            const placeholder=String(input.getAttribute('placeholder')||'');
+            const dateLike=/\d{4}[-/]\d{1,2}[-/]\d{1,2}\s+\d{1,2}:\d{2}/.test(value);
+            const hintLike=/日期|时间|发布/.test(placeholder);
+            let nearLabel=false;
+            for(const lr of labels){
+              const dy=Math.abs((r.top+r.height/2)-(lr.top+lr.height/2));
+              if(dy<55 && r.left>lr.left-20 && r.left<lr.right+700){ nearLabel=true; break; }
+            }
+            let moduleText='';
+            for(let parent=input.parentElement, depth=0; parent && depth<6; parent=parent.parentElement, depth++){
+              const text=txt(parent);
+              if(text.length<500 && text.includes('发布时间') && text.includes('定时发布')){
+                moduleText=text;
+                break;
+              }
+            }
+            if((nearLabel || moduleText) && (dateLike || hintLike)){
+              results.push({value, placeholder, x:r.left, y:r.top, width:r.width, height:r.height});
+            }
+          }
+          return {visible:results.length>0, count:results.length, inputs:results.slice(0,4)};
+        }
+        """) or {"visible": False, "count": 0, "inputs": []}
+    except Exception as exc:
+        return {"visible": False, "count": 0, "inputs": [], "error": repr(exc)}
+
+
 def publish_mode_selected(page, mode):
     word = "定时发布" if mode == "schedule" else "立即发布"
     try:
@@ -4008,7 +4057,7 @@ def publish_mode_selected(page, mode):
     except Exception:
         pass
     try:
-        return bool(page.evaluate(r"""
+        selected = bool(page.evaluate(r"""
         word => {
           function visible(el){ const r=el.getBoundingClientRect(); const s=getComputedStyle(el); return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'; }
           function txt(el){ return ((el.innerText||el.textContent||'')+'').replace(/\s+/g,' ').trim(); }
@@ -4021,16 +4070,35 @@ def publish_mode_selected(page, mode):
             let input=label && label.querySelector('input[type="radio"]');
             if(!input && label && label.htmlFor) input=document.getElementById(label.htmlFor);
             if(input && input.checked) return true;
+            const er=el.getBoundingClientRect();
+            const nearbyChecked=[...document.querySelectorAll('input[type="radio"]:checked')]
+              .filter(visible).some(radio => {
+                const rr=radio.getBoundingClientRect();
+                return Math.abs((rr.top+rr.height/2)-(er.top+er.height/2))<45 &&
+                  rr.left>er.left-220 && rr.left<er.right+220;
+              });
+            if(nearbyChecked) return true;
             const control=el.closest('button,[aria-checked],[data-state]');
             if(control && (control.getAttribute('aria-checked')==='true' || control.getAttribute('data-state')==='checked')) return true;
-            const cls=String((label||control||el).className||'').toLowerCase();
+            const classRoot=label||roleRadio||control||el;
+            const cls=([classRoot, ...classRoot.querySelectorAll('*')]
+              .map(node => String(node.className||'')).join(' ')).toLowerCase();
             if(/checked|selected|active/.test(cls)) return true;
           }
           return false;
         }
         """, word))
+        if selected:
+            return True
     except Exception:
-        return False
+        pass
+
+    # 抖音新版定时单选控件可能不暴露 checked/aria-checked，但选中后会在
+    # “发布时间”同一行显示可编辑日期时间框。该输入框出现本身就是定时模式
+    # 已生效的可验证结果，不能再误报“没有成功点击定时发布”。
+    if mode == "schedule":
+        return bool(visible_schedule_input_state(page).get("visible"))
+    return False
 
 
 def click_publish_mode(page, mode):
@@ -4172,10 +4240,20 @@ def type_schedule_time_with_keyboard(page, input_locator, slot):
     """优先用真实键盘写入完整日期时间，并在失焦后读取同一输入框校验。"""
     target = slot.strftime("%Y-%m-%d %H:%M")
     try:
+        if input_locator.evaluate("el => Boolean(el.readOnly || el.disabled)", timeout=800):
+            wlog("定时时间框为只读控件，直接使用 v3.0.1 DOM 清空与输入逻辑。")
+            return False
         input_locator.scroll_into_view_if_needed(timeout=1500)
         input_locator.click(timeout=1800)
+        old_value = input_locator.evaluate("el => String(el.value || '')", timeout=1500)
         input_locator.press("Control+A", timeout=1200)
         page.keyboard.press("Backspace")
+        page.wait_for_timeout(120)
+        cleared_value = input_locator.evaluate("el => String(el.value || '')", timeout=1500)
+        wlog(f"清空定时时间框：原值={old_value}；清空后={cleared_value}")
+        if cleared_value:
+            wlog("键盘清空定时时间框未生效，将按 v3.0.1 的 DOM 原生输入方式兜底。")
+            return False
         page.keyboard.type(target, delay=35)
         page.keyboard.press("Tab")
         page.wait_for_timeout(450)
@@ -4184,6 +4262,52 @@ def type_schedule_time_with_keyboard(page, input_locator, slot):
         return schedule_value_matches(value, slot)
     except Exception as exc:
         wlog(f"键盘输入定时时间未完成，将使用日期面板兜底：{repr(exc)}")
+        return False
+
+
+def set_schedule_time_with_dom(page, input_locator, slot):
+    """按 v3.0.1 的稳定逻辑清空同一 input，再写入完整目标时间并回读。"""
+    target = slot.strftime("%Y-%m-%d %H:%M")
+    try:
+        result = input_locator.evaluate(r"""
+        (el, target) => {
+          const setter =
+            Object.getOwnPropertyDescriptor(el.__proto__, 'value')?.set ||
+            Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+          const emitInput = value => {
+            try {
+              el.dispatchEvent(new InputEvent('input', {
+                bubbles:true, inputType:value ? 'insertText' : 'deleteContentBackward', data:value
+              }));
+            } catch(e) {
+              el.dispatchEvent(new Event('input', {bubbles:true}));
+            }
+          };
+          const oldValue=String(el.value||'');
+          el.focus();
+          if(el._valueTracker) el._valueTracker.setValue(oldValue);
+          if(setter) setter.call(el, ''); else el.value='';
+          const clearedValue=String(el.value||'');
+          emitInput('');
+          el.dispatchEvent(new Event('change', {bubbles:true}));
+          const valueAfterClearEvents=String(el.value||'');
+          if(el._valueTracker) el._valueTracker.setValue(valueAfterClearEvents);
+          if(setter) setter.call(el, target); else el.value=target;
+          emitInput(target);
+          el.dispatchEvent(new Event('change', {bubbles:true}));
+          el.dispatchEvent(new KeyboardEvent('keydown', {bubbles:true,key:'Enter',code:'Enter'}));
+          el.dispatchEvent(new KeyboardEvent('keyup', {bubbles:true,key:'Enter',code:'Enter'}));
+          el.dispatchEvent(new FocusEvent('blur', {bubbles:true}));
+          return {oldValue, clearedValue, valueAfterClearEvents, finalValue:String(el.value||''), target};
+        }
+        """, target, timeout=1800)
+        page.wait_for_timeout(450)
+        value = input_locator.evaluate("el => String(el.value || '')", timeout=1500)
+        wlog("按 v3.0.1 逻辑清空并输入定时时间：" + json.dumps(result, ensure_ascii=False)[:500])
+        wlog(f"DOM 输入定时时间回读：目标={target}；回读={value}")
+        return schedule_value_matches(value, slot)
+    except Exception as exc:
+        wlog(f"v3.0.1 DOM 定时时间输入未完成，将使用日期面板兜底：{repr(exc)}")
         return False
 
 
@@ -4214,21 +4338,28 @@ def set_schedule_time(page, slot):
     try:
         input_locator = schedule_input_locator(page, cand)
         if input_locator is None or not click_locator_with_fallback(
-            page, input_locator, "打开发布时间输入模块", timeout=2000
+            page, input_locator, "打开发布时间输入模块", timeout=800
         ):
             raise RuntimeError("发布时间输入模块直接点击失败")
-        step_wait(reason="点击发布时间输入框，打开日期面板")
     except Exception as e:
         wlog(f"点击时间输入框失败：{repr(e)}")
         return False
 
-    # 新版抖音的日期时间组件允许直接编辑完整值。优先通过真实键盘清空并输入，
-    # 失焦后回读同一输入框；只有网页阻止键盘输入时才进入日期面板兜底。
+    # 先按 v3.0.1 已在真实页面验证的稳定方式，对同一个受控 input 依次执行
+    # 清空、写入完整目标值和回读；该方式能兼容新版日期控件的动画与只读外观。
+    if set_schedule_time_with_dom(page, input_locator, slot):
+        if verify_schedule_time(page, slot):
+            wlog("已按 v3.0.1 的输入逻辑清空、写入并确认定时时间。")
+            return True
+        wlog("v3.0.1 DOM 输入后的全局回读未匹配，继续使用键盘输入兜底。")
+
     if type_schedule_time_with_keyboard(page, input_locator, slot):
         if verify_schedule_time(page, slot):
             wlog("已通过键盘输入并确认定时时间。")
             return True
         wlog("键盘输入后的全局回读未匹配，继续使用日期面板兜底。")
+
+    step_wait(reason="直接输入定时时间未生效，等待日期面板兜底")
 
     # 点击日期，日期这一步当前已经稳定，保留
     try:
@@ -4414,7 +4545,15 @@ def set_schedule(cfg, page, slot):
     if not click_publish_mode(page, "schedule"):
         save_debug(cfg, page, "schedule_mode_failed")
         raise RuntimeError("没有成功点击定时发布。")
-    step_wait(cfg, "点击定时发布后等待")
+    deadline = time.time() + 4
+    mode_state = visible_schedule_input_state(page)
+    while not mode_state.get("visible") and time.time() < deadline:
+        page.wait_for_timeout(150)
+        mode_state = visible_schedule_input_state(page)
+    if not mode_state.get("visible"):
+        save_debug(cfg, page, "schedule_input_not_visible")
+        raise RuntimeError("定时发布已点击，但发布时间输入框没有出现。")
+    wlog("定时发布已选中，准备输入目标时间：" + json.dumps(mode_state, ensure_ascii=False)[:500])
     for _ in range(2):
         if set_schedule_time(page, slot):
             wlog("定时时间设置成功。")
@@ -4978,6 +5117,8 @@ def account_worker(config_path):
                         validate_copy_filled(account_cfg, page, copy_text)
                         if account_cfg.get("music_required", True):
                             validate_music_added(account_cfg, page)
+                        if account_cfg.get("use_schedule", True) and not verify_schedule_time(page, slot):
+                            raise RuntimeError("点击发布前定时时间回读不一致，禁止提交。")
                         return True
 
                     run_publish_step(account_cfg, page, "发布前最终校验", final_validation)
@@ -7764,7 +7905,7 @@ def run_gui():
 
 def run_self_test():
     """不连接浏览器、不发布内容的内置冒烟测试。"""
-    assert APP_VERSION == "3.0.3"
+    assert APP_VERSION == "3.0.4"
     assert APP_NAME.endswith(APP_VERSION)
     empty_release = platform_release_to_manifest({"version": {}})
     assert empty_release["latest_version"] == ""

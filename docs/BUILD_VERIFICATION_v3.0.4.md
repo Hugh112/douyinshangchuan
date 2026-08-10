@@ -28,3 +28,17 @@
 - 真实测试仅上传测试图片并修改定时时间，没有点击底部发布，没有消费图片、文案或任务进度。
 - 更新 ZIP 共 `1874` 项，顶层仅 `_internal`、`DouyinPublisher.exe`、`DouyinPublisherUpdater.exe` 和固定名 `Start_Douyin_Publisher.vbs`。
 - ZIP 中绝对路径、父目录穿越、`__pycache__`、`.pyc`、`.spec`、历史启动器、历史 README 和用户配置均为 `0` 项。
+
+## 2026-08-10 同版本热补丁验证
+
+- 热补丁：`release/DouyinPublisher_Hotfix_v3.0.4.exe`
+  - 大小：`12291406` 字节
+  - SHA256：`02ebf49f2145719819bcec75d9fb027fa8148e100e89bb5ac1ccbadfc6ab92d5`
+- 补丁内主程序：`DouyinPublisher.exe`
+  - 文件版本：`3.0.4.0`
+  - 大小：`10330021` 字节
+  - SHA256：`cee2a295bdfbf227968a8d602f66c15e4c8227e58f9e269665484c7582ab3f7b`
+- `app/app_main.py` 与 `app/app_main.pyw` 逐字节一致，热补丁源码 SHA256 均为 `693e35a761587ce56f748f71dcd95b39ac4fb70855b2e3dd03228bfd5e7ba1fc`；`py_compile` 和源码 `--self-test` 通过。
+- 未启用定时发布时，流程不再点击或校验“立即发布”单选控件，而是直接进入提交前校验并点击底部真正的发布按钮。
+- 隔离目录覆盖安装通过；补丁后主程序 `--self-test` 通过，`_internal/python312.dll` 哈希保持不变。
+- 热补丁只替换已安装的 `DouyinPublisher.exe`，不修改配置、授权、Excel、图片、日志、状态或调试截图。

@@ -5105,10 +5105,10 @@ def account_worker(config_path):
 
                         run_publish_step(account_cfg, page, "设置并校验定时发布", set_and_verify_schedule)
                     else:
-                        run_publish_step(
-                            account_cfg, page, "设置立即发布",
-                            lambda: set_publish_now(account_cfg, page),
-                        )
+                        # 未勾选定时发布时，抖音图文页默认就是立即发布。
+                        # 不再点击或校验“立即发布”单选框，直接进入发布前校验并
+                        # 点击底部真正的“发布”按钮，避免新版自定义单选控件误判。
+                        wlog("当前账号未启用定时发布：跳过发布模式设置，直接准备点击底部发布按钮。")
 
                     def final_validation():
                         wait_uploaded_with_config(account_cfg, page)

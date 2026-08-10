@@ -1,10 +1,19 @@
 #define MyAppName "抖音智能发布中心"
-#define MyAppVersion "3.0.2"
+#define MyAppVersion "3.0.3"
 #define MyAppPublisher "百业信息"
 #define MyAppExeName "DouyinPublisher.exe"
+#ifndef MyAppId
+#define MyAppId "{{6D54D2A3-4431-4F35-8D43-A3405BC99F56}"
+#endif
+#ifndef MyOutputDir
+#define MyOutputDir "..\release"
+#endif
+#ifndef MyOutputBaseFilename
+#define MyOutputBaseFilename "DouyinPublisher_Setup_v" + MyAppVersion
+#endif
 
 [Setup]
-AppId={{6D54D2A3-4431-4F35-8D43-A3405BC99F56}
+AppId={#MyAppId}
 AppName={#MyAppName}
 AppVersion={#MyAppVersion}
 AppPublisher={#MyAppPublisher}
@@ -12,8 +21,8 @@ DefaultDirName={localappdata}\Programs\DouyinPublisher
 DefaultGroupName={#MyAppName}
 DisableDirPage=no
 DisableProgramGroupPage=yes
-OutputDir=..\release
-OutputBaseFilename=DouyinPublisher_Setup_v{#MyAppVersion}
+OutputDir={#MyOutputDir}
+OutputBaseFilename={#MyOutputBaseFilename}
 SetupIconFile=..\app\assets\app_logo.ico
 UninstallDisplayIcon={app}\{#MyAppExeName}
 Compression=lzma2/normal

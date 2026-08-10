@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-抖音智能发布中心 v3.0.2 - 多账号轮换与分层重试版
+抖音智能发布中心 v3.0.3 - 定时发布与界面稳定性修复版
 功能：
 1. GUI 前端配置浏览器、图片、Excel、定时、等待、上传检测、重试等。
 2. 自动打开抖音创作者平台图文发布页。
@@ -111,7 +111,7 @@ CONFIG_PATH = APP_DATA_DIR / "douyin_gui_config.json"
 AUTH_TOKEN_PATH = APP_DATA_DIR / "authorization.bin"
 AUTH_LOGIN_PREFERENCES_PATH = APP_DATA_DIR / "login_preferences.bin"
 DEBUG_SCREENSHOT_CLEANUP_STATE_PATH = APP_DATA_DIR / "debug_screenshot_cleanup.json"
-APP_VERSION = "3.0.2"
+APP_VERSION = "3.0.3"
 APP_NAME = f"抖音智能发布中心 v{APP_VERSION}"
 LOGO_ICO = RESOURCE_DIR / "assets" / "app_logo.ico"
 LOGO_PNG = RESOURCE_DIR / "assets" / "app_logo.png"
@@ -3890,7 +3890,13 @@ def scroll_to_publish_settings(cfg, page):
     抖音页面常见内部容器滚动，不是 window 滚动，所以同时滚动所有可滚动容器。
     只有发布设置和底部发布按钮都进入可视区后，才算成功。
     """
-    wlog("强制下滑到发布页最底部/发布设置区域。")
+    # 发布设置和底部发布按钮已经在当前视口时，说明页面已经到达需要的
+    # 操作位置。此时不要再滚动或等待，避免页面抖动和重复耗时。
+    if validate_publish_settings_visible(cfg, page, raise_error=False):
+        wlog("当前已经位于发布页底部，跳过下滑和鼠标滚轮步骤。")
+        return True
+
+    wlog("发布页尚未到底部，开始下滑到发布设置区域。")
 
     scroll_js = """
     () => {
@@ -3941,15 +3947,26 @@ def scroll_to_publish_settings(cfg, page):
         except Exception as e:
             wlog(f"第 {i} 次滚动发布设置失败：{repr(e)}")
 
-        step_wait(cfg, f"下滑发布页到底部 第{i}次")
+        # DOM 滚动通常会立即生效，先短轮询校验；已经到达底部就不再执行
+        # 鼠标滚轮和随机长等待。
+        try:
+            page.wait_for_timeout(250)
+        except Exception:
+            pass
+        if validate_publish_settings_visible(cfg, page, raise_error=False):
+            wlog("DOM 下滑后已到达发布页底部，跳过鼠标滚轮步骤。")
+            return True
 
-        # 再用鼠标滚轮补充，确保是真实页面滚动
+        # DOM 滚动未把目标区域带入视口时，才使用真实鼠标滚轮兜底。
         try:
             page.mouse.wheel(0, 1200)
         except Exception:
             pass
 
-        step_wait(cfg, f"鼠标滚轮下滑 第{i}次")
+        try:
+            page.wait_for_timeout(450)
+        except Exception:
+            pass
 
         if validate_publish_settings_visible(cfg, page, raise_error=False):
             wlog("已成功下滑到发布设置区域，底部发布按钮可见。")
@@ -4134,6 +4151,42 @@ def schedule_input_locator(page, candidate):
     return best
 
 
+def normalize_schedule_input_value(value):
+    """把网页时间框常见格式统一为 YYYY-MM-DD HH:MM，便于可靠回读。"""
+    raw = str(value or "").strip().replace("/", "-").replace("T", " ")
+    match = re.search(
+        r"(\d{4})-(\d{1,2})-(\d{1,2})\s+(\d{1,2}):(\d{1,2})",
+        raw,
+    )
+    if not match:
+        return raw
+    year, month, day, hour, minute = (int(part) for part in match.groups())
+    return f"{year:04d}-{month:02d}-{day:02d} {hour:02d}:{minute:02d}"
+
+
+def schedule_value_matches(value, slot):
+    return normalize_schedule_input_value(value) == slot.strftime("%Y-%m-%d %H:%M")
+
+
+def type_schedule_time_with_keyboard(page, input_locator, slot):
+    """优先用真实键盘写入完整日期时间，并在失焦后读取同一输入框校验。"""
+    target = slot.strftime("%Y-%m-%d %H:%M")
+    try:
+        input_locator.scroll_into_view_if_needed(timeout=1500)
+        input_locator.click(timeout=1800)
+        input_locator.press("Control+A", timeout=1200)
+        page.keyboard.press("Backspace")
+        page.keyboard.type(target, delay=35)
+        page.keyboard.press("Tab")
+        page.wait_for_timeout(450)
+        value = input_locator.evaluate("el => String(el.value || '')", timeout=1500)
+        wlog(f"键盘输入定时时间：目标={target}；回读={value}")
+        return schedule_value_matches(value, slot)
+    except Exception as exc:
+        wlog(f"键盘输入定时时间未完成，将使用日期面板兜底：{repr(exc)}")
+        return False
+
+
 def set_schedule_time(page, slot):
     """
     V27：优化定时时间输入。
@@ -4168,6 +4221,14 @@ def set_schedule_time(page, slot):
     except Exception as e:
         wlog(f"点击时间输入框失败：{repr(e)}")
         return False
+
+    # 新版抖音的日期时间组件允许直接编辑完整值。优先通过真实键盘清空并输入，
+    # 失焦后回读同一输入框；只有网页阻止键盘输入时才进入日期面板兜底。
+    if type_schedule_time_with_keyboard(page, input_locator, slot):
+        if verify_schedule_time(page, slot):
+            wlog("已通过键盘输入并确认定时时间。")
+            return True
+        wlog("键盘输入后的全局回读未匹配，继续使用日期面板兜底。")
 
     # 点击日期，日期这一步当前已经稳定，保留
     try:
@@ -4262,6 +4323,7 @@ def set_schedule_time(page, slot):
             Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
 
           // 模拟"删除原时分，再输入新时分"：最终只改这个 input 的值，不动页面其他文字
+          if (best._valueTracker) best._valueTracker.setValue(current);
           if (setter) setter.call(best, finalValue);
           else best.value = finalValue;
 
@@ -4275,6 +4337,7 @@ def set_schedule_time(page, slot):
 
           best.dispatchEvent(new KeyboardEvent('keydown', {bubbles:true, key:'Enter', code:'Enter'}));
           best.dispatchEvent(new KeyboardEvent('keyup', {bubbles:true, key:'Enter', code:'Enter'}));
+          best.dispatchEvent(new FocusEvent('blur', {bubbles:true}));
 
           return {ok:true, oldValue:current, value:best.value || '', finalValue};
         }
@@ -4343,7 +4406,7 @@ def verify_schedule_time(page, slot):
     target = slot.strftime("%Y-%m-%d %H:%M")
     vals = [str(x.get("value","")).strip() for x in schedule_input_candidates(page)]
     wlog(f"定时校验：目标={target}；输入框值={vals}")
-    return any(v == target or v == target + ":00" or v.replace("/", "-") == target for v in vals)
+    return any(schedule_value_matches(value, slot) for value in vals)
 
 
 def set_schedule(cfg, page, slot):
@@ -6234,25 +6297,38 @@ class App:
         self.task_controls_frame = controls
         controls.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 10))
         ttk.Label(controls, text="任务控制", style="Title.TLabel").pack(side="left", padx=(0, 14))
-        ttk.Button(controls, text="保存配置", command=lambda: self.save_from_ui(show_message=True)).pack(side="left", padx=(0, 7))
-        ttk.Button(controls, text="打开选中浏览器", style="Success.TButton", command=self.open_browser_window).pack(side="left", padx=7)
-        ttk.Button(controls, text="检查全部账号", command=self.probe_all_browsers).pack(side="left", padx=7)
+        ttk.Button(controls, text="保存配置", command=lambda: self.save_from_ui(show_message=True)).pack(side="left", padx=(0, 6))
+        ttk.Button(controls, text="打开选中浏览器", style="Success.TButton", command=self.open_browser_window).pack(side="left", padx=(0, 6))
+        ttk.Button(controls, text="检查全部账号", command=self.probe_all_browsers).pack(side="left", padx=(0, 6))
         self.start_button = ttk.Button(controls, text="开始本轮发布", style="Accent.TButton", command=self.start)
-        self.start_button.pack(side="left", padx=7)
+        self.start_button.pack(side="left", padx=(0, 6))
         self.start_button.configure(state="disabled")
         self.retry_failed_button = ttk.Button(
             controls, text="重试勾选失败账号", command=self.retry_selected_failed_accounts,
         )
-        self.retry_failed_button.pack(side="left", padx=7)
+        self.retry_failed_button.pack(side="left", padx=(0, 6))
         self.retry_failed_button.configure(state="disabled")
         self.pause_button = ttk.Button(controls, text="暂停 / 继续", command=self.toggle_pause)
-        self.pause_button.pack(side="left", padx=7)
-        ttk.Button(controls, text="停止任务", style="Danger.TButton", command=self.stop).pack(side="left", padx=7)
-        ttk.Button(controls, text="重置发布进度", command=self.reset_state).pack(side="left", padx=7)
+        self.pause_button.pack(side="left", padx=(0, 6))
+        self.stop_button = ttk.Button(
+            controls, text="停止任务", style="Danger.TButton", command=self.stop,
+        )
+        self.stop_button.pack(side="left")
 
         ttk.Label(runtime, textvariable=self.countdown_var, font=("Microsoft YaHei UI", 16, "bold"), foreground="#D4380D").grid(row=1, column=0, padx=(0, 18), pady=(0, 8), sticky="w")
         ttk.Label(runtime, textvariable=self.countdown_reason_var, style="Muted.TLabel").grid(row=1, column=1, pady=(0, 8), sticky="w")
-        ttk.Button(runtime, text="清空日志", command=lambda: self.logbox.delete("1.0", "end")).grid(row=1, column=2, pady=(0, 8), sticky="e")
+        runtime_actions = ttk.Frame(runtime)
+        runtime_actions.grid(row=1, column=2, pady=(0, 8), sticky="e")
+        self.reset_progress_button = ttk.Button(
+            runtime_actions, text="重置发布进度", command=self.reset_state,
+        )
+        self.reset_progress_button.pack(side="left", padx=(0, 6))
+        self.clear_log_button = ttk.Button(
+            runtime_actions,
+            text="清空日志",
+            command=lambda: self.logbox.delete("1.0", "end"),
+        )
+        self.clear_log_button.pack(side="left")
         self.logbox = ScrolledText(runtime, height=7, font=("Consolas", 10), bg="#0F172A", fg="#D1FAE5", insertbackground="#FFFFFF", relief="flat", padx=10, pady=8)
         self.logbox.grid(row=2, column=0, columnspan=3, sticky="nsew")
 
@@ -7688,7 +7764,7 @@ def run_gui():
 
 def run_self_test():
     """不连接浏览器、不发布内容的内置冒烟测试。"""
-    assert APP_VERSION == "3.0.2"
+    assert APP_VERSION == "3.0.3"
     assert APP_NAME.endswith(APP_VERSION)
     empty_release = platform_release_to_manifest({"version": {}})
     assert empty_release["latest_version"] == ""
@@ -8037,6 +8113,39 @@ def run_self_test():
     assert weekly_trigger_key(schedule_cfg, monday + timedelta(minutes=1)) == ""
     next_run = next_weekly_trigger(schedule_cfg, datetime(2026, 8, 3, 9, 29, 59))
     assert next_run == datetime(2026, 8, 3, 9, 30)
+    schedule_slot = datetime(2026, 8, 11, 8, 5)
+    assert normalize_schedule_input_value("2026/8/11 8:05:00") == "2026-08-11 08:05"
+    assert schedule_value_matches("2026-08-11T08:05:00", schedule_slot)
+    assert not schedule_value_matches("2026-08-11 17:05", schedule_slot)
+
+    class _AlreadyAtBottomMouse:
+        def __init__(self):
+            self.wheel_calls = 0
+
+        def wheel(self, _x, _y):
+            self.wheel_calls += 1
+
+    class _AlreadyAtBottomPage:
+        def __init__(self):
+            self.mouse = _AlreadyAtBottomMouse()
+            self.wait_calls = 0
+
+        def evaluate(self, _script, *_args):
+            return {
+                "publishSettingVisible": True,
+                "publishTimeVisible": True,
+                "publishButtonVisible": True,
+                "scrollY": 1000,
+                "innerHeight": 700,
+                "bodyHeight": 1700,
+            }
+
+        def wait_for_timeout(self, _milliseconds):
+            self.wait_calls += 1
+
+    bottom_page = _AlreadyAtBottomPage()
+    assert scroll_to_publish_settings({"step_wait_min": 0, "step_wait_max": 0}, bottom_page)
+    assert bottom_page.mouse.wheel_calls == 0 and bottom_page.wait_calls == 0
     if tk is not None:
         root = tk.Tk()
         root.withdraw()
@@ -8049,6 +8158,9 @@ def run_self_test():
         assert not root.bind_all("<MouseWheel>")
         assert gui.start_button.master is gui.task_controls_frame
         assert gui.retry_failed_button.master is gui.task_controls_frame
+        assert gui.stop_button.master is gui.task_controls_frame
+        assert gui.reset_progress_button.master is not gui.task_controls_frame
+        assert gui.clear_log_button.master is gui.reset_progress_button.master
         assert [gui.notebook.tab(index, "text") for index in range(gui.notebook.index("end"))] == [
             "发布中心", "账号与排期", "自动启动", "系统与日志"
         ]

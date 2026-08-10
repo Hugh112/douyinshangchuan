@@ -1,9 +1,9 @@
 {
-  "latest_version": "3.0.0",
+  "latest_version": "3.0.1",
   "minimum_supported_version": "2.3.0",
-  "download_url": "https://github.com/Hugh112/douyinshangchuan/releases/download/v3.0.0/DouyinPublisher_Update_v3.0.0.zip",
-  "sha256": "b5203682233d7d00e782ebd351d1c70568f31a89c693952ee5a55af0b58ea195",
-  "package_size_bytes": 89822023,
+  "download_url": "https://github.com/Hugh112/douyinshangchuan/releases/download/v3.0.1/DouyinPublisher_Update_v3.0.1.zip",
+  "sha256": "d7971a0cbd2651c63b22830c275f2190584562c1f00660c60f25e2deae32a7fe",
+  "package_size_bytes": 89822872,
   "force_update": false,
   "is_forced": false,
   "rollout_percentage": 100,
@@ -11,10 +11,9 @@
     "app/douyin_gui_config.json"
   ],
   "release_notes": [
-    "Excel 支持城市、标题、文案三列绑定；标题为空时保持原正文发布方式。",
-    "所有浏览器队列项共享一个图片总文件夹，并按城市匹配同名子文件夹；每个队列项继续使用自己的 Excel 和工作表。",
-    "兼容旧无表头单列和旧标题单列表头，第一条文案不会遗漏；图片只从文件系统读取。",
-    "保留 v2.5.2 的队列勾选、排期循环、任务续跑、列宽保存、失败重试和自动暂停弹窗。",
-    "本次为可选更新，不强制升级；统一管理后台版本策略应登记相同下载地址与 SHA256。"
+    "修复 Excel 城市列未识别时只检查图片总目录根层、无法进入城市子文件夹的问题。",
+    "兼容城市栏、城市列、城市名称、地市等常见表头，以及无表头的城市/文案和城市/标题/文案格式。",
+    "允许 Excel 中的济南市匹配名为济南的直接子文件夹；保留旧无表头单列和第一条文案。",
+    "本次为可选修复，不强制升级；统一管理后台版本策略发布时应登记相同下载地址与 SHA256。"
   ]
 }

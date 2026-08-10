@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-抖音智能发布中心 v3.0.0 - 城市图片与独立标题版
+抖音智能发布中心 v3.0.1 - 城市图片识别修复版
 功能：
 1. GUI 前端配置浏览器、图片、Excel、定时、等待、上传检测、重试等。
 2. 自动打开抖音创作者平台图文发布页。
@@ -91,7 +91,7 @@ APP_DATA_DIR = (
 CONFIG_PATH = APP_DATA_DIR / "douyin_gui_config.json"
 AUTH_TOKEN_PATH = APP_DATA_DIR / "authorization.bin"
 AUTH_LOGIN_PREFERENCES_PATH = APP_DATA_DIR / "login_preferences.bin"
-APP_VERSION = "3.0.0"
+APP_VERSION = "3.0.1"
 APP_NAME = f"抖音智能发布中心 v{APP_VERSION}"
 LOGO_ICO = RESOURCE_DIR / "assets" / "app_logo.ico"
 LOGO_PNG = RESOURCE_DIR / "assets" / "app_logo.png"
@@ -1237,10 +1237,18 @@ def list_images(cfg, image_dir=None):
 COPY_FILE_EXTS = {".xlsx", ".xls", ".xlsm"}
 COPY_HEADER_NAMES = {
     "文案", "正文", "内容", "发布文案", "抖音文案", "作品文案",
-    "文案内容", "正文内容", "发布内容",
+    "文案内容", "正文内容", "发布内容", "内容文案", "作品内容",
+    "发布正文", "文案正文", "文案栏", "正文栏", "内容栏",
+    "文案列", "正文列", "内容列",
 }
-TITLE_HEADER_NAMES = {"标题", "作品标题", "发布标题", "抖音标题"}
-CITY_HEADER_NAMES = {"城市", "地区", "所在城市", "发布城市"}
+TITLE_HEADER_NAMES = {
+    "标题", "作品标题", "发布标题", "抖音标题", "标题栏", "标题列", "标题内容",
+}
+CITY_HEADER_NAMES = {
+    "城市", "地区", "所在城市", "发布城市", "城市栏", "城市名称",
+    "城市名", "城市列", "素材城市", "图片城市", "地市", "所属城市",
+    "城市地区", "城市区域", "省市",
+}
 
 BROWSER_QUEUE_TABLE_COLUMNS = [
     ("顺序", "_order"), ("队列ID", "id"), ("账号名称", "name"),
@@ -1315,13 +1323,59 @@ def is_city_header(value):
     return normalized_header_name(value) in CITY_HEADER_NAMES
 
 
-def extract_publish_records(df):
+def normalized_city_name(value):
+    """用于匹配 Excel 城市和图片子文件夹；兼容“济南”与“济南市”。"""
+    name = re.sub(r"\s+", "", copy_cell_text(value)).casefold()
+    if len(name) > 1 and name.endswith("市"):
+        name = name[:-1]
+    return name
+
+
+def image_city_folder_names(cfg):
+    """只读取图片总目录的直接子文件夹，不递归扫描用户的其他文件。"""
+    root = Path(str(cfg.get("image_dir", "")).strip().strip('"'))
+    if not root.is_dir():
+        return []
+    try:
+        return [child.name for child in root.iterdir() if child.is_dir()]
+    except OSError:
+        return []
+
+
+def infer_city_column(frame, known_city_names, excluded_columns=()):
+    """依据图片子文件夹名称识别无表头/非常用表头中的城市列。"""
+    known_keys = {normalized_city_name(name) for name in (known_city_names or [])}
+    known_keys.discard("")
+    if not known_keys or frame is None or frame.empty:
+        return None
+
+    excluded = set(excluded_columns)
+    candidates = []
+    for column in frame.columns:
+        if column in excluded:
+            continue
+        values = [copy_cell_text(value) for value in frame[column].tolist()]
+        values = [value for value in values if value]
+        if not values:
+            continue
+        matched = sum(normalized_city_name(value) in known_keys for value in values)
+        # 至少六成非空值应当是现有城市文件夹；错误项随后会给出具体城市提示。
+        if matched and matched * 5 >= len(values) * 3:
+            candidates.append((matched / len(values), matched, column))
+    if not candidates:
+        return None
+    candidates.sort(key=lambda item: (item[0], item[1]), reverse=True)
+    return candidates[0][2]
+
+
+def extract_publish_records(df, known_city_names=None):
     """
     读取发布记录。
 
     新格式使用“城市 / 标题 / 文案”表头；标题可以为空。存在城市列时，
     每条记录必须填写城市，并从图片总目录下的同名子文件夹选择图片。
-    旧版无表头单列继续把第一行当作第一条文案；旧版仅以“标题”作为
+    旧版无表头单列继续把第一行当作第一条文案；无表头多列可按
+    “城市 / 文案”或“城市 / 标题 / 文案”读取；旧版仅以“标题”作为
     文案列表头的单列表格也继续兼容。
     """
     if df is None:
@@ -1347,6 +1401,12 @@ def extract_publish_records(df):
 
     if structured:
         data_frame = frame.iloc[1:]
+        if city_column is None:
+            city_column = infer_city_column(
+                data_frame,
+                known_city_names,
+                excluded_columns=(copy_column, title_column),
+            )
         data_format = "structured"
     elif legacy_title_header:
         # 兼容历史上把单列文案表头命名为“标题”的文件。
@@ -1357,17 +1417,23 @@ def extract_publish_records(df):
     elif title_column is not None or city_column is not None:
         raise RuntimeError("Excel 已识别到“城市/标题”表头，但缺少“文案”列。请增加文案表头。")
     else:
-        copy_column = next(
-            (
-                column for column in frame.columns
-                if any(copy_cell_text(value) for value in frame[column].tolist())
-            ),
-            frame.columns[0],
-        )
-        title_column = None
+        active_columns = [
+            column for column in frame.columns
+            if any(copy_cell_text(value) for value in frame[column].tolist())
+        ]
         city_column = None
+        if len(active_columns) >= 2:
+            city_column = infer_city_column(frame, known_city_names)
+        if city_column is None:
+            # 未识别到城市时保持旧版行为：始终读取第一列，不能因旁边有备注列而改变文案。
+            copy_column = active_columns[0] if active_columns else frame.columns[0]
+            title_column = None
+        else:
+            content_columns = [column for column in active_columns if column != city_column]
+            copy_column = content_columns[-1] if content_columns else frame.columns[0]
+            title_column = content_columns[-2] if len(content_columns) >= 2 else None
         data_frame = frame
-        data_format = "legacy_headerless"
+        data_format = "headerless_city" if city_column is not None else "legacy_headerless"
 
     records = []
     for row_index, row in data_frame.iterrows():
@@ -1431,7 +1497,7 @@ def read_publish_records(cfg):
     finally:
         xls.close()
 
-    return extract_publish_records(df)
+    return extract_publish_records(df, known_city_names=image_city_folder_names(cfg))
 
 
 def read_copies(cfg):
@@ -1525,7 +1591,11 @@ def resolve_image_dir_for_record(cfg, record):
         return root
 
     city = validate_city_folder_name(record.get("city", ""))
-    matches = [child for child in root.iterdir() if child.is_dir() and child.name.casefold() == city.casefold()]
+    city_key = normalized_city_name(city)
+    matches = [
+        child for child in root.iterdir()
+        if child.is_dir() and normalized_city_name(child.name) == city_key
+    ]
     if not matches:
         raise FileNotFoundError(f"找不到城市“{city}”对应的图片子文件夹：{root / city}")
     exact = next((child for child in matches if child.name == city), matches[0])
@@ -1542,6 +1612,12 @@ def list_images_for_record(cfg, record):
     if not images:
         city = copy_cell_text(record.get("city", ""))
         scope = f"城市“{city}”" if record.get("has_city_column", False) else "图片根目录"
+        if not record.get("has_city_column", False) and image_city_folder_names(cfg):
+            raise RuntimeError(
+                "图片总目录中已找到城市子文件夹，但 Excel 未识别到城市列。\n"
+                "请使用表头“城市｜标题｜文案”（标题可不填），或无表头按相同列顺序填写。\n"
+                f"图片总目录：{image_dir}"
+            )
         raise RuntimeError(f"{scope}没有可发布图片：{image_dir}")
     return images
 
@@ -5883,7 +5959,7 @@ def run_gui():
 
 def run_self_test():
     """不连接浏览器、不发布内容的内置冒烟测试。"""
-    assert APP_VERSION == "3.0.0"
+    assert APP_VERSION == "3.0.1"
     assert APP_NAME.endswith(APP_VERSION)
     empty_release = platform_release_to_manifest({"version": {}})
     assert empty_release["latest_version"] == ""
@@ -5902,6 +5978,7 @@ def run_self_test():
     assert "#" not in body and topics == ["话题一", "话题二"]
     assert COPY_FILE_EXTS == {".xlsx", ".xls", ".xlsm"}
     assert extract_copy_texts(pd.DataFrame([["第一条文案"], ["第二条文案"]])) == ["第一条文案", "第二条文案"]
+    assert extract_copy_texts(pd.DataFrame([["第一条文案", "备注一"], ["第二条文案", "备注二"]])) == ["第一条文案", "第二条文案"]
     assert extract_copy_texts(pd.DataFrame([["文案"], ["第一条文案"], ["第二条文案"]])) == ["第一条文案", "第二条文案"]
     structured_records = extract_publish_records(pd.DataFrame([
         ["城市", "标题", "文案"],
@@ -5914,6 +5991,30 @@ def run_self_test():
     assert structured_records[0]["excel_row"] == 2
     assert structured_records[0]["has_city_column"] is True
     assert structured_records[1]["title"] == ""
+    alias_records = extract_publish_records(pd.DataFrame([
+        ["城市名称", "标题内容", "内容文案"],
+        ["北京市", "北京标题", "北京正文"],
+    ]))
+    assert alias_records[0]["city"] == "北京市"
+    assert alias_records[0]["title"] == "北京标题"
+    assert alias_records[0]["copy"] == "北京正文"
+    headerless_city_records = extract_publish_records(
+        pd.DataFrame([
+            ["济南", "标题一", "正文一"],
+            ["青岛", "标题二", "正文二"],
+        ]),
+        known_city_names=["济南", "青岛"],
+    )
+    assert headerless_city_records[0]["city"] == "济南"
+    assert headerless_city_records[0]["title"] == "标题一"
+    assert headerless_city_records[0]["copy"] == "正文一"
+    assert headerless_city_records[0]["format"] == "headerless_city"
+    headerless_city_copy_records = extract_publish_records(
+        pd.DataFrame([["济南", "正文一"], ["青岛", "正文二"]]),
+        known_city_names=["济南", "青岛"],
+    )
+    assert headerless_city_copy_records[0]["title"] == ""
+    assert headerless_city_copy_records[0]["copy"] == "正文一"
     assert extract_copy_texts(pd.DataFrame([["标题"], ["旧版第一条"], ["旧版第二条"]])) == ["旧版第一条", "旧版第二条"]
     try:
         extract_publish_records(pd.DataFrame([["城市", "标题"], ["北京", "标题一"]]))
@@ -5929,6 +6030,7 @@ def run_self_test():
         image_cfg = {"image_dir": str(image_root), "random_image": False}
         assert choose_image_for_record(image_cfg, structured_records[0]).name == "A.png"
         assert choose_image_for_record({**image_cfg, "random_image": True}, structured_records[0]).parent == city_dir
+        assert resolve_image_dir_for_record(image_cfg, alias_records[0]) == city_dir
         try:
             list_images_for_record(image_cfg, {**structured_records[0], "city": "../北京"})
             raise AssertionError("城市列不应允许路径跳转")
@@ -5952,6 +6054,24 @@ def run_self_test():
         assert read_copies(copy_cfg) == ["第一条文案", "第二条文案"]
         assert delete_copy_from_excel(copy_cfg, "第一条文案") is True
         assert read_copies(copy_cfg) == ["第二条文案"]
+
+        headerless_city_path = Path(temp_dir) / "headerless_city.xlsx"
+        workbook = Workbook()
+        sheet = workbook.active
+        sheet.title = "sheet1"
+        sheet.append(["北京", "标题一", "正文一"])
+        sheet.append(["北京市", "", "正文二"])
+        workbook.save(headerless_city_path)
+        workbook.close()
+        headerless_city_cfg = {
+            "excel_path": str(headerless_city_path), "sheet_name": "sheet1",
+            "image_dir": str(image_root), "random_image": False,
+        }
+        loaded_headerless_city = validate_publish_records_and_images(headerless_city_cfg)
+        assert len(loaded_headerless_city) == 2
+        assert loaded_headerless_city[0]["city"] == "北京"
+        assert loaded_headerless_city[0]["title"] == "标题一"
+        assert loaded_headerless_city[1]["city"] == "北京市"
 
         header_path = Path(temp_dir) / "with_header.xlsx"
         workbook = Workbook()

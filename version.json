@@ -1,9 +1,9 @@
 {
-  "latest_version": "3.0.1",
+  "latest_version": "3.0.2",
   "minimum_supported_version": "2.3.0",
-  "download_url": "https://github.com/Hugh112/douyinshangchuan/releases/download/v3.0.1/DouyinPublisher_Update_v3.0.1.zip",
-  "sha256": "d7971a0cbd2651c63b22830c275f2190584562c1f00660c60f25e2deae32a7fe",
-  "package_size_bytes": 89822872,
+  "download_url": "https://github.com/Hugh112/douyinshangchuan/releases/download/v3.0.2/DouyinPublisher_Update_v3.0.2.zip",
+  "sha256": "93da74acfe89bfdeb52f91521b06e8dc350c0cfb9b1d83680f035d50f597da33",
+  "package_size_bytes": 89864742,
   "force_update": false,
   "is_forced": false,
   "rollout_percentage": 100,
@@ -11,9 +11,12 @@
     "app/douyin_gui_config.json"
   ],
   "release_notes": [
-    "修复 Excel 城市列未识别时只检查图片总目录根层、无法进入城市子文件夹的问题。",
-    "兼容城市栏、城市列、城市名称、地市等常见表头，以及无表头的城市/文案和城市/标题/文案格式。",
-    "允许 Excel 中的济南市匹配名为济南的直接子文件夹；保留旧无表头单列和第一条文案。",
-    "本次为可选修复，不强制升级；统一管理后台版本策略发布时应登记相同下载地址与 SHA256。"
+    "新增可选账号轮换发布，可设置每个账号连续成功发布几条后切换，按账号剩余配额精确收尾。",
+    "发布失败先只重试当前步骤，步骤耗尽后再总体重跑当前作品；两个次数均可在前端设置。",
+    "账号队列显示最后失败步骤、具体原因和已保留进度；失败、停止或重启后继续未完成轮次。",
+    "新增今日投稿上限自动切换，以及每三次正常启动清理本软件调试截图。",
+    "发布网页操作改为语义定位和 DOM 模块直控优先，音乐选择按实际页面状态短轮询校验。",
+    "发布成功必须确认进入作品管理页；可重试勾选的失败账号并继续保留进度。",
+    "暂停后可编辑、重排和勾选队列；本次为可选更新，不强制升级。"
   ]
 }

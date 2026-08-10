@@ -98,7 +98,7 @@ def download_with_retry(url, dst, retry=3, timeout=60):
     parsed = urllib.parse.urlparse(str(url or ""))
     if parsed.scheme.lower() != "https":
         raise RuntimeError("更新包下载地址必须使用 HTTPS。")
-    headers = {"User-Agent": "DouyinPublisherUpdater/3.0.1", "Cache-Control": "no-cache", "Pragma": "no-cache", "Connection": "close"}
+    headers = {"User-Agent": "DouyinPublisherUpdater/3.0.2", "Cache-Control": "no-cache", "Pragma": "no-cache", "Connection": "close"}
     last_err = None
     sep = "&" if "?" in url else "?"
     url2 = f"{url}{sep}_t={int(time.time())}"

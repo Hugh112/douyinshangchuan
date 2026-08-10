@@ -12,6 +12,7 @@ packages/*.zip
 app/douyin_gui_config.json
 app/authorization.bin
 app/login_preferences.bin
+app/debug_screenshot_cleanup.json
 *.pause
 *_publish_state.json
 *_publish_log.csv

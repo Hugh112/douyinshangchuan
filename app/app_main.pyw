@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-抖音智能发布中心 v3.0.1 - 城市图片识别修复版
+抖音智能发布中心 v3.0.2 - 多账号轮换与分层重试版
 功能：
 1. GUI 前端配置浏览器、图片、Excel、定时、等待、上传检测、重试等。
 2. 自动打开抖音创作者平台图文发布页。
@@ -11,7 +11,7 @@
 7. 支持定时发布 / 立即发布开关。
 8. 点击发布前再次校验图片、文案、音乐、发布设置。
 9. 支持随机使用图片（运行选项中勾选即可）。
-10. 支持多个浏览器账号按配额顺序发布、掉号跳过和独立进程隔离。
+10. 支持多个浏览器账号按配额顺序发布，也可勾选轮换发布并自定义“每个账号连续发布多少条后切换”。
 11. 支持按星期和时间自动启动任务。
 12. 保留在线更新、无黑框普通启动和完整调试启动。
 13. 支持 Excel 城市、标题、文案三列绑定；兼容旧无表头单列文案。
@@ -31,6 +31,7 @@ import sys
 import tempfile
 import threading
 import time
+import urllib.parse
 import urllib.request
 import ctypes
 import shutil
@@ -38,16 +39,34 @@ import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 
+def _windowed_standard_stream(fd):
+    """仅在 Windows 标准句柄真实有效时恢复管道；普通无黑框启动使用 NUL。"""
+    duplicate = None
+    try:
+        if os.name == "nt":
+            import msvcrt
+            handle = msvcrt.get_osfhandle(fd)
+            if handle in (-1, 0):
+                raise OSError("invalid Windows standard handle")
+            ctypes.set_last_error(0)
+            file_type = ctypes.windll.kernel32.GetFileType(ctypes.c_void_p(handle))
+            if file_type == 0 and ctypes.get_last_error() != 0:
+                raise OSError("unavailable Windows standard handle")
+        duplicate = os.dup(fd)
+        return os.fdopen(duplicate, "w", encoding="utf-8", errors="replace", buffering=1)
+    except Exception:
+        if duplicate is not None:
+            try:
+                os.close(duplicate)
+            except Exception:
+                pass
+        return open(os.devnull, "w", encoding="utf-8")
+
+
 if sys.stdout is None:
-    try:
-        sys.stdout = os.fdopen(os.dup(1), "w", encoding="utf-8", errors="replace", buffering=1)
-    except Exception:
-        sys.stdout = open(os.devnull, "w", encoding="utf-8")
+    sys.stdout = _windowed_standard_stream(1)
 if sys.stderr is None:
-    try:
-        sys.stderr = os.fdopen(os.dup(2), "w", encoding="utf-8", errors="replace", buffering=1)
-    except Exception:
-        sys.stderr = open(os.devnull, "w", encoding="utf-8")
+    sys.stderr = _windowed_standard_stream(2)
 
 try:
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
@@ -91,7 +110,8 @@ APP_DATA_DIR = (
 CONFIG_PATH = APP_DATA_DIR / "douyin_gui_config.json"
 AUTH_TOKEN_PATH = APP_DATA_DIR / "authorization.bin"
 AUTH_LOGIN_PREFERENCES_PATH = APP_DATA_DIR / "login_preferences.bin"
-APP_VERSION = "3.0.1"
+DEBUG_SCREENSHOT_CLEANUP_STATE_PATH = APP_DATA_DIR / "debug_screenshot_cleanup.json"
+APP_VERSION = "3.0.2"
 APP_NAME = f"抖音智能发布中心 v{APP_VERSION}"
 LOGO_ICO = RESOURCE_DIR / "assets" / "app_logo.ico"
 LOGO_PNG = RESOURCE_DIR / "assets" / "app_logo.png"
@@ -232,20 +252,20 @@ def format_release_notes(manifest):
 
 
 BROWSER_QUEUE_COLUMNS = (
-    "publish", "order", "name", "path", "excel", "schedule", "port", "quota", "status",
+    "publish", "order", "name", "path", "excel", "schedule", "port", "quota", "published", "status",
 )
 BROWSER_QUEUE_COLUMN_HEADINGS = {
     "publish": "发布", "order": "顺序", "name": "账号名称", "path": "浏览器快捷方式 / EXE",
     "excel": "文案 Excel", "schedule": "独立发布时间",
-    "port": "端口", "quota": "发布条数", "status": "运行状态",
+    "port": "端口", "quota": "发布条数", "published": "已发布", "status": "运行状态",
 }
 BROWSER_QUEUE_DEFAULT_WIDTHS = {
     "publish": 58, "order": 48, "name": 105, "path": 250,
-    "excel": 190, "schedule": 230, "port": 66, "quota": 76, "status": 145,
+    "excel": 190, "schedule": 230, "port": 66, "quota": 82, "published": 76, "status": 155,
 }
 BROWSER_QUEUE_MIN_WIDTHS = {
     "publish": 46, "order": 42, "name": 72, "path": 120,
-    "excel": 100, "schedule": 130, "port": 52, "quota": 62, "status": 90,
+    "excel": 100, "schedule": 130, "port": 52, "quota": 68, "published": 68, "status": 100,
 }
 
 
@@ -292,12 +312,16 @@ def default_config():
         "upload_max_wait_seconds": 180,
         "topic_wait_seconds": 3,
         "creator_center_wait_seconds": 8,
-        "retry_times": 2,
+        "retry_times": 3,
+        "overall_retry_times": 1,
         "cdp_port": 9222,
         "browser_user_data_dir": "",
         "browser_profile_directory": "",
         "browser_accounts": [],
         "browser_queue_column_widths": dict(BROWSER_QUEUE_DEFAULT_WIDTHS),
+        "rotate_accounts_each_post": False,
+        "rotate_batch_size": 1,
+        "daily_limit_switch_wait_seconds": 10,
         "browser_account_suggestions": [
             {
                 "name": "浏览器9",
@@ -527,6 +551,48 @@ def load_config():
 def save_config(cfg):
     CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
     CONFIG_PATH.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+DEBUG_SCREENSHOT_NAME_RE = re.compile(r"^\d{8}_\d{6}_.+\.png$", re.IGNORECASE)
+
+
+def maintain_debug_screenshots(cfg, state_path=None):
+    """每启动 GUI 三次清理一次本软件生成的调试截图；不递归、不删除其他图片。"""
+    state_path = Path(state_path or DEBUG_SCREENSHOT_CLEANUP_STATE_PATH)
+    result = {"launch_count": 0, "cleaned": False, "removed": 0, "error": ""}
+    try:
+        try:
+            state = json.loads(state_path.read_text(encoding="utf-8")) if state_path.is_file() else {}
+        except Exception:
+            state = {}
+        launch_count = _nonnegative_state_int(state.get("launch_count"), 0) + 1
+        if launch_count >= 3:
+            debug_dir = Path(str(cfg.get("debug_dir", "")).strip().strip('"'))
+            if debug_dir.is_dir():
+                for path in debug_dir.iterdir():
+                    if not path.is_file() or not DEBUG_SCREENSHOT_NAME_RE.match(path.name):
+                        continue
+                    try:
+                        path.unlink()
+                        result["removed"] += 1
+                    except OSError:
+                        pass
+            launch_count = 0
+            result["cleaned"] = True
+        result["launch_count"] = launch_count
+        state_path.parent.mkdir(parents=True, exist_ok=True)
+        temp_path = state_path.with_name(state_path.name + f".{os.getpid()}.tmp")
+        temp_path.write_text(
+            json.dumps({
+                "launch_count": launch_count,
+                "last_launch_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            }, ensure_ascii=False, indent=2),
+            encoding="utf-8",
+        )
+        os.replace(temp_path, state_path)
+    except Exception as exc:
+        result["error"] = repr(exc)
+    return result
 
 
 LEGACY_INSTALL_FILES = [
@@ -943,12 +1009,23 @@ def kill_chrome_residue(cfg):
         except Exception:
             pass
 
+def build_browser_launch_command(target, args, port, target_url, headless=False):
+    """构造浏览器启动命令；轮换子任务可使用真正无窗口的 Chromium Headless 模式。"""
+    args = str(args or "").strip()
+    if headless:
+        # Chromium/Chrome/Edge 的新版无头模式：不会创建桌面浏览器窗口，
+        # 但仍保留完整页面渲染、上传文件、CDP 控制和持久化用户目录能力。
+        args = (args + ' --headless=new --window-size=1440,1100 --disable-gpu').strip()
+    return f'"{target}" {args} --remote-debugging-port={int(port)} "{target_url}"'.strip()
+
+
 def open_browser_with_cdp(cfg, force_new=False):
     """
     v2.1：稳定 CDP 后台版。
     - 用户不用改现有浏览器快捷方式目标；脚本会在启动时临时追加 --remote-debugging-port。
     - 可在前端填写 browser_user_data_dir / browser_profile_directory，脚本会临时追加，不修改 .lnk 文件本身。
     - 自动清理重复的 --remote-debugging-port，避免快捷方式和脚本重复写端口。
+    - 当运行时配置 _headless_browser=True 时，使用 Chromium 新版 Headless，桌面不弹出浏览器窗口。
     """
     port = int(cfg.get("cdp_port", 9222))
     kill_chrome_residue(cfg)
@@ -990,9 +1067,13 @@ def open_browser_with_cdp(cfg, force_new=False):
             args = (args + f' --user-data-dir="{default_profile}"').strip()
             wlog(f"快捷方式未带 user-data-dir，已临时使用脚本专用目录：{default_profile}")
 
-    cmd = f'"{target}" {args} --remote-debugging-port={port} "{target_url}"'
-    wlog("启动浏览器命令已生成：不会修改你的浏览器快捷方式目标，只临时追加参数。")
-    wlog(f"打开浏览器：{target}")
+    headless = parse_bool(cfg.get("_headless_browser"), False)
+    cmd = build_browser_launch_command(target, args, port, target_url, headless=headless)
+    if headless:
+        wlog("轮换后台模式：浏览器以 Headless 方式启动，不会在桌面弹出窗口。")
+    else:
+        wlog("启动浏览器命令已生成：不会修改你的浏览器快捷方式目标，只临时追加参数。")
+        wlog(f"打开浏览器：{target}")
     proc = subprocess.Popen(cmd, shell=True, **hidden_subprocess_kwargs())
     if not wait_cdp(port, 45):
         raise RuntimeError("浏览器已尝试启动，但无法连接调试端口。请检查用户目录是否被其它 Chrome 占用，或勾选启动前关闭Chrome残留。")
@@ -1842,6 +1923,120 @@ class AccountLoggedOutError(RuntimeError):
     """浏览器账号已明确进入登录或安全验证页面。"""
 
 
+class DailyPublishLimitError(RuntimeError):
+    """抖音明确提示今天投稿次数已达到上限。"""
+
+
+DAILY_PUBLISH_LIMIT_MARKERS = (
+    "抱歉，今天投稿次数已达到上限，请明天再试",
+    "今天投稿次数已达到上限，请明天再试",
+    "今天投稿次数已达到上限",
+    "今日投稿次数已达到上限",
+    "投稿次数已达到上限",
+)
+
+
+def text_indicates_daily_publish_limit(text):
+    """兼容弹窗中的换行/空格差异，识别今日投稿次数上限提示。"""
+    compact = re.sub(r"\s+", "", str(text or ""))
+    return any(re.sub(r"\s+", "", marker) in compact for marker in DAILY_PUBLISH_LIMIT_MARKERS)
+
+
+def daily_publish_limit_visible(page):
+    try:
+        body = page.locator("body").inner_text(timeout=1200)
+    except Exception:
+        body = ""
+    return text_indicates_daily_publish_limit(body)
+
+
+def normalize_retry_count(value, default=0):
+    try:
+        return max(0, min(99, int(value)))
+    except Exception:
+        return max(0, min(99, int(default or 0)))
+
+
+class PublishStepFailedError(RuntimeError):
+    """某个发布步骤耗尽前端配置的单步骤重试次数。"""
+
+    def __init__(self, step_name, attempts, cause):
+        self.step_name = str(step_name or "未知步骤")
+        self.attempts = max(1, int(attempts or 1))
+        self.cause = cause
+        super().__init__(f"步骤“{self.step_name}”连续 {self.attempts} 次未完成：{cause}")
+
+
+class PublishWorkflowFailedError(RuntimeError):
+    """当前作品耗尽前端配置的总体流程重试次数。"""
+
+    def __init__(self, attempts, cause):
+        self.attempts = max(1, int(attempts or 1))
+        self.cause = cause
+        self.step_name = getattr(cause, "step_name", "未知步骤")
+        super().__init__(f"当前作品总体流程连续 {self.attempts} 次未完成，最后失败步骤为“{self.step_name}”：{cause}")
+
+
+def concise_publish_failure(exc, limit=240):
+    """提取最后失败步骤和最底层原因，供账号队列运行状态与状态文件共同使用。"""
+    step_name = str(getattr(exc, "step_name", "未知步骤") or "未知步骤")
+    cause = exc
+    visited = set()
+    while getattr(cause, "cause", None) is not None and id(cause) not in visited:
+        visited.add(id(cause))
+        cause = cause.cause
+    reason = str(cause or exc).strip() or repr(exc)
+    text = f"{step_name}失败：{reason}"
+    return text if len(text) <= limit else text[: max(1, limit - 1)] + "…"
+
+
+def run_publish_step(cfg, page, step_name, action):
+    """只重试当前失败步骤，不回到图片上传或重新输入之前已完成的步骤。"""
+    retry_count = normalize_retry_count(cfg.get("retry_times", 3), 3)
+    total_attempts = retry_count + 1
+    for attempt in range(1, total_attempts + 1):
+        try:
+            result = action()
+            if attempt > 1:
+                wlog(f"步骤“{step_name}”第 {attempt}/{total_attempts} 次执行成功。")
+            return result
+        except (AccountLoggedOutError, DailyPublishLimitError):
+            raise
+        except Exception as exc:
+            wlog(f"步骤“{step_name}”第 {attempt}/{total_attempts} 次失败：{repr(exc)}")
+            if page is not None:
+                safe_name = re.sub(r"[^0-9A-Za-z_-]+", "_", str(step_name)).strip("_") or "publish_step"
+                save_debug(cfg, page, f"step_{safe_name}_{attempt}_failed")
+            if attempt >= total_attempts:
+                raise PublishStepFailedError(step_name, total_attempts, exc) from exc
+            step_wait(cfg, f"步骤“{step_name}”失败，准备只重试本步骤")
+    raise AssertionError("单步骤重试循环异常结束")
+
+
+def run_publish_workflow(cfg, workflow, before_overall_retry=None):
+    """单步骤重试耗尽后，按前端配置从上传开始总体重跑当前作品。"""
+    overall_retry_count = normalize_retry_count(cfg.get("overall_retry_times", 1), 1)
+    total_attempts = overall_retry_count + 1
+    last_error = None
+    for attempt in range(1, total_attempts + 1):
+        try:
+            return workflow(attempt, total_attempts)
+        except (AccountLoggedOutError, DailyPublishLimitError):
+            raise
+        except PublishStepFailedError as exc:
+            last_error = exc
+            if attempt >= total_attempts:
+                raise PublishWorkflowFailedError(total_attempts, exc) from exc
+            wlog(
+                f"总体流程第 {attempt}/{total_attempts} 次在步骤“{exc.step_name}”耗尽单步骤重试；"
+                "准备重新进入发布页并从图片上传开始重跑当前作品。"
+            )
+            if before_overall_retry is not None:
+                before_overall_retry(attempt, exc)
+            step_wait(cfg, "当前作品总体重试：准备重新上传")
+    raise PublishWorkflowFailedError(total_attempts, last_error or RuntimeError("未知发布错误"))
+
+
 def creator_login_required(page):
     """只在强登录标识成立时判定掉号，普通网络失败不误判为掉号。"""
     try:
@@ -2106,11 +2301,51 @@ def click_creator_publish_entry(cfg, page):
 
     wait_login(page)
 
-    wlog(f"进入创作者中心后等待 {wait_sec:.1f} 秒，再在当前标签进入发布图文页。")
-    countdown_sleep(cfg, wait_sec, "创作者中心页面加载", "creator_center")
-
     upload_url = "https://creator.douyin.com/creator-micro/content/upload?default-tab=3"
-    page.goto(upload_url, wait_until="domcontentloaded", timeout=60000)
+    target_url = ""
+    deadline = time.time() + max(1.0, wait_sec)
+    while time.time() < deadline and not target_url:
+        candidates = [
+            page.locator('a[href*="/content/upload"],a[href*="/content/post"]').filter(
+                has_text=re.compile(r"发布|图文")
+            ),
+            page.get_by_role("link", name=re.compile(r"发布作品|发布图文|高清发布|发布")),
+            page.locator('[data-e2e*="publish" i],[data-testid*="publish" i]').filter(
+                has_text=re.compile(r"发布|图文")
+            ),
+        ]
+        for locator in candidates:
+            try:
+                for index in range(min(locator.count(), 12)):
+                    item = locator.nth(index)
+                    if not item.is_visible(timeout=200):
+                        continue
+                    href = str(item.get_attribute("href", timeout=500) or "").strip()
+                    if not href or "javascript:" in href.lower():
+                        continue
+                    resolved = urllib.parse.urljoin(page.url, href)
+                    if "/content/upload" in resolved or "/content/post" in resolved:
+                        target_url = resolved
+                        break
+                if target_url:
+                    break
+            except Exception:
+                pass
+        if not target_url:
+            page.wait_for_timeout(300)
+
+    if target_url:
+        wlog("已通过发布入口的 href/role/data 属性定位图文发布模块，并在当前标签打开。")
+        if "/content/post" in target_url and not any(marker in target_url for marker in ("/image", "media_type=image", "type=image")):
+            target_url = upload_url
+        if "/content/upload" in target_url and "default-tab=" not in target_url:
+            separator = "&" if "?" in target_url else "?"
+            target_url += separator + "default-tab=3"
+    else:
+        target_url = upload_url
+        wlog("未读到可用发布入口 href，使用图文上传页地址作为无坐标兜底。")
+
+    page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
     step_wait(cfg, "当前标签打开发布图文上传页后等待")
 
     if platform_image_publish_page_ready(page):
@@ -2490,7 +2725,7 @@ def validate_copy_filled(cfg, page, text):
     raise RuntimeError("文案校验失败：输入框中没有检测到对应文案内容。")
 
 
-def verify_music_selected(page):
+def _legacy_verify_music_selected(page):
     """
     V20：严格判断音乐是否真的使用成功。
     只看"选择音乐"这一行/扩展信息区域，不能用页面其他地方的 00:xx 时长误判。
@@ -2572,14 +2807,126 @@ def verify_music_selected(page):
     return False
 
 
-def validate_music_added(cfg, page):
+def _legacy_validate_music_added(cfg, page):
     if not verify_music_selected(page):
         save_debug(cfg, page, "validate_music_failed")
         raise RuntimeError("音乐未使用成功：选择音乐区域仍未显示已使用音乐。")
     wlog("校验通过：音乐已选择。")
 
 
-def platform_music_panel_opened(page):
+def music_selection_state(page):
+    """读取主编辑区的音乐模块，返回 selected / unselected / unknown 三态。"""
+    try:
+        return page.evaluate(r"""
+        () => {
+          function visible(el){
+            const r = el.getBoundingClientRect();
+            const s = getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.display !== 'none' &&
+                   s.visibility !== 'hidden' && Number(s.opacity || 1) > 0;
+          }
+          function txt(el){ return ((el.innerText || el.textContent || '') + '').replace(/\s+/g, ' ').trim(); }
+          function insideMusicPopup(el){
+            const popup = el.closest('[role="dialog"],[aria-modal="true"],[data-e2e*="music" i],[data-testid*="music" i]');
+            if (!popup) return false;
+            const t = txt(popup);
+            return t.includes('选择音乐') && (t.includes('使用') || t.includes('热门') || t.includes('推荐'));
+          }
+
+          const anchors = [...document.querySelectorAll('div,section,li,label,span,button')]
+            .filter(visible)
+            .filter(el => {
+              const t = txt(el);
+              return t === '选择音乐' || t.includes('点击添加合适作品风格音乐') ||
+                     t.includes('修改音乐') || t.includes('更换音乐') || t.includes('删除音乐');
+            });
+          const candidates = [];
+          for (const anchor of anchors) {
+            if (insideMusicPopup(anchor)) continue;
+            let el = anchor;
+            for (let depth = 0; el && depth < 6; depth++, el = el.parentElement) {
+              if (!visible(el)) continue;
+              const text = txt(el);
+              const r = el.getBoundingClientRect();
+              const area = r.width * r.height;
+              if (!text || text.length > 500 || area < 1200 || area > 500000) continue;
+              if (!(text.includes('选择音乐') || text.includes('点击添加合适作品风格音乐') ||
+                    text.includes('修改音乐') || text.includes('更换音乐') || text.includes('删除音乐'))) continue;
+              if (text.includes('热门榜') || text.includes('搜索音乐') || text.includes('推荐音乐')) continue;
+              const explicitEmpty = text.includes('点击添加合适作品风格音乐');
+              const hasAction = /修改音乐|更换音乐|删除音乐|已选择|已使用/.test(text);
+              const hasDuration = /\d{1,2}:\d{2}/.test(text);
+              const hasImage = !!el.querySelector('img');
+              let score = 0;
+              if (explicitEmpty) score += 500;
+              if (hasAction) score += 600;
+              if (hasDuration) score += 250;
+              if (hasImage) score += 80;
+              if (text.includes('选择音乐')) score += 80;
+              score -= Math.abs(area - 50000) / 3000;
+              candidates.push({text, explicitEmpty, hasAction, hasDuration, hasImage, score});
+            }
+          }
+          candidates.sort((a,b) => b.score - a.score);
+          const block = candidates[0] || null;
+          if (!block) return {state:'unknown', selected:false, explicitEmpty:false, text:'', candidates:0};
+          if (block.explicitEmpty) {
+            return {state:'unselected', selected:false, explicitEmpty:true, text:block.text.slice(0,300), candidates:candidates.length};
+          }
+          const selected = block.hasAction || block.hasDuration ||
+            (block.hasImage && block.text.replace(/选择音乐|扩展信息|音乐/g, '').trim().length >= 2);
+          return {
+            state: selected ? 'selected' : 'unknown', selected,
+            explicitEmpty:false, text:block.text.slice(0,300), candidates:candidates.length
+          };
+        }
+        """)
+    except Exception as exc:
+        return {"state": "unknown", "selected": False, "explicitEmpty": False, "text": "", "error": repr(exc)}
+
+
+def verify_music_selected(page, log_detail=True):
+    state = music_selection_state(page)
+    if log_detail:
+        wlog("音乐校验详情：" + json.dumps(state, ensure_ascii=False)[:600])
+    if state.get("selected"):
+        if log_detail:
+            wlog("音乐校验通过：音乐模块已显示歌曲信息或修改入口。")
+        return True
+    if state.get("explicitEmpty") and log_detail:
+        wlog("音乐尚未选择：音乐模块仍显示添加音乐提示。")
+    return False
+
+
+def wait_music_selection_applied(page, timeout_seconds=10):
+    """点击使用后短轮询音乐模块；页面响应慢时不立即误判失败。"""
+    deadline = time.time() + max(1.0, float(timeout_seconds or 10))
+    last_state = {"state": "unknown", "selected": False, "explicitEmpty": False}
+    panel_closed_observations = 0
+    while time.time() < deadline:
+        last_state = music_selection_state(page)
+        if last_state.get("selected"):
+            wlog("点击使用后已检测到音乐生效。")
+            return True, last_state
+        if not platform_music_panel_opened(page):
+            panel_closed_observations += 1
+            if panel_closed_observations == 1:
+                wlog("音乐面板已关闭，继续等待主音乐模块刷新。")
+        page.wait_for_timeout(400)
+    return False, last_state
+
+
+def validate_music_added(cfg, page):
+    ok, state = wait_music_selection_applied(page, timeout_seconds=6)
+    if not ok:
+        save_debug(cfg, page, "music_click_state_not_applied")
+        if state.get("explicitEmpty"):
+            raise RuntimeError("点击使用后音乐未生效：音乐模块仍明确显示未选择。")
+        raise RuntimeError("点击使用后无法确认音乐状态：音乐模块未显示歌曲信息或修改入口。")
+    wlog("校验通过：音乐已选择。")
+
+
+def _legacy_platform_music_panel_opened(page):
     """
     严格判断右侧平台音乐面板是否打开。
     不能因为页面本身有"选择音乐"字段就误判。
@@ -2610,6 +2957,69 @@ def platform_music_panel_opened(page):
         """))
     except Exception:
         return False
+
+
+def music_panel_info(page):
+    """按 role、aria/data 属性和模块内容识别音乐面板，不把屏幕坐标作为唯一条件。"""
+    try:
+        return page.evaluate(r"""
+        () => {
+          function visible(el){
+            const r = el.getBoundingClientRect();
+            const s = getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.display !== 'none' &&
+                   s.visibility !== 'hidden' && Number(s.opacity || 1) > 0;
+          }
+          function txt(el){ return ((el.innerText || el.textContent || '') + '').replace(/\s+/g, ' ').trim(); }
+          const selectors = [
+            '[role="dialog"]','[aria-modal="true"]','[data-e2e*="music" i]',
+            '[data-testid*="music" i]','aside','section','div'
+          ];
+          const vw = window.innerWidth, vh = window.innerHeight;
+          const nodes = [...new Set(selectors.flatMap(sel => [...document.querySelectorAll(sel)]))].filter(visible);
+          const candidates = [];
+          for (const el of nodes) {
+            const text = txt(el);
+            if (!text.includes('选择音乐') || text.length > 3000) continue;
+            if (!(text.includes('使用') || text.includes('热门') || text.includes('推荐') || text.includes('搜索音乐'))) continue;
+            const r = el.getBoundingClientRect();
+            if (r.width < 260 || r.height < 180) continue;
+            const role = el.getAttribute('role') || '';
+            const data = (el.getAttribute('data-e2e') || '') + (el.getAttribute('data-testid') || '');
+            const position = getComputedStyle(el).position;
+            const semanticPanel = role === 'dialog' || el.getAttribute('aria-modal') === 'true' || /music/i.test(data);
+            if (!semanticPanel && !['fixed','absolute','sticky'].includes(position) && r.width > vw * 0.65) continue;
+            if (!semanticPanel && (r.width > vw * 0.82 || r.height > vh * 1.35 || r.top < -50)) continue;
+            if (text.includes('基础信息') && text.includes('发布设置')) continue;
+            let score = 0;
+            if (role === 'dialog') score += 1000;
+            if (el.getAttribute('aria-modal') === 'true') score += 800;
+            if (/music/i.test(data)) score += 700;
+            if (position === 'fixed') score += 300;
+            if (r.left > vw * 0.35) score += 100;
+            if (text.includes('使用')) score += 200;
+            if (el.querySelector('button,[role="button"]')) score += 100;
+            score += Math.min(300, el.querySelectorAll('li,[role="listitem"],img').length * 10);
+            score -= Math.abs(r.width * r.height - 350000) / 10000;
+            candidates.push({el, score, text, r});
+          }
+          candidates.sort((a,b) => b.score - a.score);
+          const panel = candidates[0];
+          if (!panel) return {opened:false, text:'', candidates:0};
+          return {
+            opened:true, text:panel.text.slice(0,500), candidates:candidates.length,
+            role:panel.el.getAttribute('role') || '',
+            data:(panel.el.getAttribute('data-e2e') || panel.el.getAttribute('data-testid') || ''),
+            x:panel.r.left, y:panel.r.top, width:panel.r.width, height:panel.r.height
+          };
+        }
+        """)
+    except Exception as exc:
+        return {"opened": False, "error": repr(exc)}
+
+
+def platform_music_panel_opened(page):
+    return bool(music_panel_info(page).get("opened"))
 
 
 def scroll_to_music_area(cfg, page):
@@ -2646,7 +3056,7 @@ def scroll_to_music_area(cfg, page):
     return False
 
 
-def open_music_panel(cfg, page):
+def _legacy_open_music_panel(cfg, page):
     if verify_music_selected(page):
         return True
     if platform_music_panel_opened(page):
@@ -2756,7 +3166,119 @@ def open_music_panel(cfg, page):
     raise RuntimeError("没有打开平台音乐面板。")
 
 
-def choose_music(cfg, page):
+def click_locator_with_fallback(page, locator, label, timeout=2500):
+    """Playwright 语义点击 → DOM 原生 click → 真实鼠标；坐标只使用元素实际边界。"""
+    try:
+        locator.scroll_into_view_if_needed(timeout=timeout)
+    except Exception:
+        pass
+    try:
+        locator.click(timeout=timeout)
+        wlog(f"{label}：Playwright 语义点击成功。")
+        return True
+    except Exception:
+        pass
+    try:
+        locator.evaluate("el => el.click()", timeout=timeout)
+        wlog(f"{label}：DOM 原生 click 成功。")
+        return True
+    except Exception:
+        pass
+    try:
+        box = locator.bounding_box(timeout=timeout)
+        if box:
+            page.mouse.click(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+            wlog(f"{label}：真实鼠标点击元素边界中心成功。")
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def wait_music_panel_open(page, timeout_seconds=4):
+    deadline = time.time() + max(0.5, float(timeout_seconds or 4))
+    while time.time() < deadline:
+        if platform_music_panel_opened(page):
+            return True
+        page.wait_for_timeout(250)
+    return False
+
+
+def open_music_panel(cfg, page):
+    if verify_music_selected(page, log_detail=False):
+        return True
+    if platform_music_panel_opened(page):
+        wlog("平台音乐面板已经打开。")
+        return True
+
+    semantic_candidates = []
+    for getter in (
+        lambda: page.get_by_role("button", name=re.compile(r"选择音乐|添加音乐")),
+        lambda: page.get_by_text("点击添加合适作品风格音乐", exact=False),
+        lambda: page.get_by_text("选择音乐", exact=True),
+        lambda: page.locator('[data-e2e*="music" i],[data-testid*="music" i]').filter(has_text="选择音乐"),
+    ):
+        try:
+            locator = getter()
+            for index in range(min(locator.count(), 8)):
+                item = locator.nth(index)
+                if item.is_visible(timeout=300):
+                    semantic_candidates.append(item)
+        except Exception:
+            pass
+
+    for item in semantic_candidates:
+        if click_locator_with_fallback(page, item, "打开音乐面板") and wait_music_panel_open(page, 3):
+            wlog("平台音乐面板已打开。")
+            return True
+
+    # DOM 模块兜底：定位含添加提示的最小音乐行，使用原生 click。
+    try:
+        result = page.evaluate("""
+        () => {
+          function visible(el){
+            const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+          }
+          function txt(el){ return ((el.innerText || el.textContent || '') + '').trim(); }
+          const nodes = [...document.querySelectorAll('button,[role="button"],div,section,li')].filter(visible);
+          const rows = nodes.filter(el => {
+            const t = txt(el); const r = el.getBoundingClientRect();
+            return t && t.length < 500 && r.width > 220 && r.height > 28 && r.height < 220 &&
+              (t.includes('点击添加合适作品风格音乐') || t === '选择音乐');
+          }).sort((a,b) => (a.getBoundingClientRect().width*a.getBoundingClientRect().height) -
+                            (b.getBoundingClientRect().width*b.getBoundingClientRect().height));
+          const row = rows[0];
+          if (!row) return {ok:false};
+          row.scrollIntoView({block:'center', inline:'nearest'});
+          const clickable = [...row.querySelectorAll('button,[role="button"],a,span,div')].filter(visible)
+            .find(el => txt(el).includes('选择音乐'));
+          (clickable || row).click();
+          return {ok:true, text:txt(row).slice(0,120)};
+        }
+        """)
+        if result and result.get("ok") and wait_music_panel_open(page, 3):
+            wlog("通过音乐模块 DOM 原生 click 打开面板。")
+            return True
+    except Exception as exc:
+        wlog(f"音乐模块 DOM click 兜底失败：{repr(exc)}")
+
+    # 最后兜底：只点击页面实际“选择音乐”文字的可见矩形，不使用固定屏幕坐标。
+    try:
+        rects = get_text_rects(page, "选择音乐")
+        for rect in rects:
+            page.mouse.click(float(rect["cx"]), float(rect["cy"]))
+            if wait_music_panel_open(page, 2):
+                wlog("通过选择音乐文字矩形打开面板。")
+                return True
+    except Exception:
+        pass
+
+    save_debug(cfg, page, "music_panel_not_opened")
+    raise RuntimeError("音乐面板未打开：语义定位、DOM click 和真实鼠标兜底均未生效。")
+
+
+def _legacy_choose_music(cfg, page):
     """
     V28：强制使用平台音乐面板里的"热门榜"。
     只在右侧音乐抽屉中点击热门榜，并只从右侧音乐列表里悬停歌曲、点击"使用"。
@@ -2891,7 +3413,8 @@ def choose_music(cfg, page):
             if btn:
                 page.mouse.click(float(btn["x"]), float(btn["y"]))
                 step_wait(cfg, "点击使用热门榜音乐后等待")
-                click_text(page, ["确认使用", "确定", "确认", "完成"], timeout=2500)
+                # 历史兜底也只能确认明确的音乐弹窗，禁止点击整页通用确认按钮。
+                confirm_music_dialog_if_present(page)
                 step_wait(cfg, "等待热门榜音乐使用生效")
                 if verify_music_selected(page):
                     wlog("热门榜音乐已使用成功。")
@@ -2907,22 +3430,393 @@ def choose_music(cfg, page):
     raise RuntimeError("热门榜音乐面板已打开，但未能点击使用音乐。")
 
 
+def music_control_belongs_to_panel(locator):
+    try:
+        return bool(locator.evaluate(r"""
+        el => {
+          function txt(node){ return ((node.innerText || node.textContent || '') + '').replace(/\s+/g, ' ').trim(); }
+          for (let node = el; node && node !== document.body; node = node.parentElement) {
+            const text = txt(node);
+            const role = node.getAttribute && node.getAttribute('role');
+            const data = node.getAttribute && ((node.getAttribute('data-e2e') || '') + (node.getAttribute('data-testid') || ''));
+            const r = node.getBoundingClientRect();
+            const position = getComputedStyle(node).position;
+            const semanticPanel = role === 'dialog' || (node.getAttribute && node.getAttribute('aria-modal') === 'true') || /music/i.test(data);
+            const boundedDrawer = r.width < window.innerWidth * 0.72 && r.height < window.innerHeight * 1.35 && r.top >= -50;
+            if (text.includes('选择音乐') && (text.includes('使用') || text.includes('热门') || text.includes('推荐')) &&
+                (semanticPanel || (boundedDrawer && ['fixed','absolute','sticky'].includes(position))) &&
+                !(text.includes('基础信息') && text.includes('发布设置'))) {
+              return true;
+            }
+          }
+          return false;
+        }
+        """))
+    except Exception:
+        return False
+
+
+def visible_music_use_buttons(page):
+    """返回音乐面板内当前可见的使用按钮，优先语义 role，再兼容原生按钮结构。"""
+    candidates = []
+    locators = [
+        page.get_by_role("button", name=re.compile(r"^使用(?:音乐)?$")),
+        page.locator('button,[role="button"]').filter(has_text=re.compile(r"^\s*使用(?:音乐)?\s*$")),
+        page.get_by_text("使用", exact=True),
+        page.get_by_text("使用音乐", exact=True),
+    ]
+    seen = set()
+    for locator in locators:
+        try:
+            for index in range(min(locator.count(), 30)):
+                item = locator.nth(index)
+                if not item.is_visible(timeout=200) or not music_control_belongs_to_panel(item):
+                    continue
+                box = item.bounding_box(timeout=500)
+                key = tuple(round(float(box.get(part, 0)), 1) for part in ("x", "y", "width", "height")) if box else (id(item),)
+                if key in seen:
+                    continue
+                seen.add(key)
+                candidates.append(item)
+        except Exception:
+            pass
+    return candidates
+
+
+def mark_music_song_rows(page):
+    """标记音乐面板内可能的歌曲行；不要求“万使用”或固定时长文本。"""
+    try:
+        return page.evaluate(r"""
+        () => {
+          function visible(el){
+            const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.display !== 'none' &&
+                   s.visibility !== 'hidden' && Number(s.opacity || 1) > 0;
+          }
+          function txt(el){ return ((el.innerText || el.textContent || '') + '').replace(/\s+/g, ' ').trim(); }
+          document.querySelectorAll('[data-douyin-music-row-candidate]').forEach(el => el.removeAttribute('data-douyin-music-row-candidate'));
+
+          const panels = [...document.querySelectorAll('[role="dialog"],[aria-modal="true"],[data-e2e*="music" i],[data-testid*="music" i],aside,section,div')]
+            .filter(visible).map(el => {
+              const text = txt(el); const r = el.getBoundingClientRect();
+              const role = el.getAttribute('role') || '';
+              const data = (el.getAttribute('data-e2e') || '') + (el.getAttribute('data-testid') || '');
+              const position = getComputedStyle(el).position;
+              const semanticPanel = role === 'dialog' || el.getAttribute('aria-modal') === 'true' || /music/i.test(data);
+              let score = 0;
+              if (role === 'dialog') score += 1000;
+              if (el.getAttribute('aria-modal') === 'true') score += 800;
+              if (/music/i.test(data)) score += 700;
+              if (position === 'fixed') score += 300;
+              score += Math.min(250, el.querySelectorAll('li,[role="listitem"],img').length * 10);
+              return {el,text,r,score,semanticPanel,position};
+            }).filter(x => x.text.includes('选择音乐') &&
+              (x.text.includes('使用') || x.text.includes('热门') || x.text.includes('推荐') || x.text.includes('搜索音乐')) &&
+              x.r.width >= 260 && x.r.height >= 180 && x.text.length < 3000 &&
+              !(x.text.includes('基础信息') && x.text.includes('发布设置')) &&
+              (x.semanticPanel || (['fixed','absolute','sticky'].includes(x.position) &&
+                x.r.width < window.innerWidth * 0.72 && x.r.height < window.innerHeight * 1.35 && x.r.top >= -50)))
+            .sort((a,b) => b.score - a.score);
+          const panel = panels[0] && panels[0].el;
+          if (!panel) return {panel:false, rowCount:0, text:''};
+
+          const excluded = /^(选择音乐|热门榜|热门音乐|推荐|推荐音乐|搜索音乐|原创榜|取消|关闭|确定|确认|完成|使用)$/;
+          const raw = [...panel.querySelectorAll('li,[role="listitem"],article,div')].filter(visible).map(el => {
+            const r = el.getBoundingClientRect(); const text = txt(el);
+            const hasImage = !!el.querySelector('img');
+            const hasButton = !!el.querySelector('button,[role="button"]');
+            let score = 0;
+            if ((el.getAttribute('role') || '') === 'listitem') score += 100;
+            if (el.tagName === 'LI' || el.tagName === 'ARTICLE') score += 80;
+            if (hasImage) score += 70;
+            if (hasButton) score += 30;
+            if (r.height >= 44 && r.height <= 120) score += 50;
+            score -= Math.abs(r.height - 72) / 3;
+            return {el,r,text,hasImage,hasButton,score,area:r.width*r.height};
+          }).filter(x => x.r.width >= 150 && x.r.height >= 32 && x.r.height <= 180 &&
+              x.text.length >= 2 && x.text.length <= 320 && !excluded.test(x.text) &&
+              !x.text.startsWith('选择音乐 热门榜') && !x.text.includes('点击添加合适作品风格音乐'));
+
+          raw.sort((a,b) => b.score - a.score || a.area - b.area);
+          const chosen = [];
+          for (const item of raw) {
+            if (chosen.some(existing => Math.abs(existing.r.top - item.r.top) < 8)) continue;
+            chosen.push(item);
+            if (chosen.length >= 20) break;
+          }
+          chosen.forEach((item,index) => item.el.setAttribute('data-douyin-music-row-candidate', String(index)));
+          return {panel:true, rowCount:chosen.length, text:txt(panel).slice(0,500)};
+        }
+        """)
+    except Exception as exc:
+        return {"panel": False, "rowCount": 0, "text": "", "error": repr(exc)}
+
+
+def scroll_music_panel_list(page, amount=420):
+    """只滚动音乐面板内部列表；DOM 滚动失败后才在面板实际边界内使用鼠标滚轮。"""
+    try:
+        result = page.evaluate("""
+        amount => {
+          function visible(el){
+            const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
+          }
+          function txt(el){ return ((el.innerText || el.textContent || '') + '').trim(); }
+          const panels = [...document.querySelectorAll('[role="dialog"],[aria-modal="true"],[data-e2e*="music" i],[data-testid*="music" i],aside,section,div')]
+            .filter(visible).filter(el => {
+              const t = txt(el); const r = el.getBoundingClientRect();
+              const role = el.getAttribute('role') || '';
+              const data = (el.getAttribute('data-e2e') || '') + (el.getAttribute('data-testid') || '');
+              const position = getComputedStyle(el).position;
+              const semanticPanel = role === 'dialog' || el.getAttribute('aria-modal') === 'true' || /music/i.test(data);
+              return t.includes('选择音乐') && (t.includes('使用') || t.includes('热门') || t.includes('推荐')) &&
+                !(t.includes('基础信息') && t.includes('发布设置')) &&
+                (semanticPanel || (['fixed','absolute','sticky'].includes(position) && r.width < window.innerWidth * 0.72));
+            });
+          for (const panel of panels) {
+            const scrollables = [panel, ...panel.querySelectorAll('div,ul,ol,section')].filter(visible)
+              .filter(el => el.scrollHeight > el.clientHeight + 20)
+              .sort((a,b) => (b.scrollHeight-b.clientHeight) - (a.scrollHeight-a.clientHeight));
+            if (!scrollables.length) continue;
+            const target = scrollables[0];
+            const before = target.scrollTop;
+            target.scrollBy({top:Number(amount || 420), behavior:'auto'});
+            const r = target.getBoundingClientRect();
+            return {ok:true, moved:target.scrollTop !== before, x:r.left, y:r.top, width:r.width, height:r.height};
+          }
+          return {ok:false};
+        }
+        """, int(amount))
+        if result and result.get("ok"):
+            return True
+    except Exception:
+        result = None
+    try:
+        info = music_panel_info(page)
+        if info.get("opened"):
+            page.mouse.move(
+                float(info.get("x", 0)) + float(info.get("width", 0)) / 2,
+                float(info.get("y", 0)) + float(info.get("height", 0)) / 2,
+            )
+            page.mouse.wheel(0, int(amount))
+            return True
+    except Exception:
+        pass
+    return False
+
+
+def activate_music_category(page):
+    """列表为空时才切换推荐/热门分类；分类按钮也限定在音乐面板内。"""
+    for role in ("tab", "button"):
+        for label in ("推荐音乐", "推荐", "热门榜", "热门音乐"):
+            try:
+                locator = page.get_by_role(role, name=re.compile(rf"^{re.escape(label)}$"))
+                for index in range(min(locator.count(), 6)):
+                    item = locator.nth(index)
+                    if item.is_visible(timeout=200) and music_control_belongs_to_panel(item):
+                        if click_locator_with_fallback(page, item, f"切换音乐分类“{label}”", timeout=1500):
+                            page.wait_for_timeout(500)
+                            return True
+            except Exception:
+                pass
+    return False
+
+
+def confirm_music_dialog_if_present(page):
+    """只在明确属于音乐的确认弹窗中点击确认，绝不全局点击“确定/完成”。"""
+    try:
+        dialogs = page.get_by_role("dialog")
+        for index in range(min(dialogs.count(), 8)):
+            dialog = dialogs.nth(index)
+            if not dialog.is_visible(timeout=200):
+                continue
+            text = dialog.inner_text(timeout=800)
+            if "音乐" not in text or not any(word in text for word in ("确认", "使用", "替换")):
+                continue
+            buttons = dialog.get_by_role("button", name=re.compile(r"^(确认使用|使用|确定|确认)$"))
+            for button_index in range(min(buttons.count(), 6)):
+                button = buttons.nth(button_index)
+                if button.is_visible(timeout=200) and click_locator_with_fallback(page, button, "音乐确认弹窗"):
+                    return True
+    except Exception:
+        pass
+    return False
+
+
+def try_apply_music_use(cfg, page, use_button):
+    if not click_locator_with_fallback(page, use_button, "使用音乐"):
+        return False
+    page.wait_for_timeout(300)
+    confirm_music_dialog_if_present(page)
+    ok, state = wait_music_selection_applied(page, timeout_seconds=10)
+    if ok:
+        return True
+    save_debug(cfg, page, "music_click_state_not_applied")
+    wlog("已点击使用，但音乐状态未在限定时间内生效：" + json.dumps(state, ensure_ascii=False)[:500])
+    return False
+
+
+def choose_music(cfg, page):
+    """按网页模块直控音乐：可见使用按钮 → 歌曲行内按钮 → 悬停歌曲行 → 鼠标兜底。"""
+    if verify_music_selected(page, log_detail=False):
+        return True
+
+    last_row_info = {"panel": False, "rowCount": 0, "text": ""}
+    clicked_use = False
+    saw_rows = False
+    for panel_cycle in range(1, 3):
+        open_music_panel(cfg, page)
+        if verify_music_selected(page, log_detail=False):
+            return True
+
+        # 推荐音乐、新版列表可能默认已有可见“使用”按钮，优先直接点击，不强制切热门榜。
+        for use_button in visible_music_use_buttons(page):
+            clicked_use = True
+            if try_apply_music_use(cfg, page, use_button):
+                return True
+
+        # 短轮询等待列表加载；只在确实未加载时做一次面板内滚动。
+        deadline = time.time() + 4.0
+        while time.time() < deadline:
+            last_row_info = mark_music_song_rows(page)
+            if int(last_row_info.get("rowCount", 0) or 0) > 0 or visible_music_use_buttons(page):
+                break
+            page.wait_for_timeout(300)
+
+        for use_button in visible_music_use_buttons(page):
+            clicked_use = True
+            if try_apply_music_use(cfg, page, use_button):
+                return True
+
+        rows = page.locator('[data-douyin-music-row-candidate]')
+        try:
+            row_count = min(rows.count(), 20)
+        except Exception:
+            row_count = 0
+        saw_rows = saw_rows or row_count > 0
+
+        if row_count == 0:
+            try:
+                activate_music_category(page)
+                last_row_info = mark_music_song_rows(page)
+                rows = page.locator('[data-douyin-music-row-candidate]')
+                row_count = min(rows.count(), 20)
+                saw_rows = saw_rows or row_count > 0
+            except Exception:
+                pass
+
+        if row_count == 0:
+            try:
+                scroll_music_panel_list(page, 420)
+                page.wait_for_timeout(600)
+                wlog("音乐列表尚未加载，已在音乐面板内滚动一次后重新检测。")
+                last_row_info = mark_music_song_rows(page)
+                rows = page.locator('[data-douyin-music-row-candidate]')
+                row_count = min(rows.count(), 20)
+                saw_rows = saw_rows or row_count > 0
+            except Exception:
+                pass
+
+        if row_count == 0:
+            save_debug(cfg, page, "music_list_not_loaded")
+
+        for row_index in range(row_count):
+            row = rows.nth(row_index)
+            try:
+                if not row.is_visible(timeout=300):
+                    continue
+            except Exception:
+                continue
+
+            # 先找歌曲行内部已存在的“使用”按钮。
+            try:
+                row_buttons = row.locator('button,[role="button"]').filter(
+                    has_text=re.compile(r"^\s*使用(?:音乐)?\s*$")
+                )
+                for button_index in range(min(row_buttons.count(), 6)):
+                    button = row_buttons.nth(button_index)
+                    if button.is_visible(timeout=200):
+                        clicked_use = True
+                        if try_apply_music_use(cfg, page, button):
+                            return True
+            except Exception:
+                pass
+
+            # 按钮只有悬停才显示时，优先 Playwright hover，再用真实鼠标移动兜底。
+            hovered = False
+            try:
+                row.hover(timeout=1500)
+                hovered = True
+            except Exception:
+                try:
+                    box = row.bounding_box(timeout=800)
+                    if box:
+                        page.mouse.move(box["x"] + box["width"] / 2, box["y"] + box["height"] / 2)
+                        hovered = True
+                except Exception:
+                    pass
+            if not hovered:
+                continue
+            page.wait_for_timeout(250)
+            for use_button in visible_music_use_buttons(page):
+                clicked_use = True
+                if try_apply_music_use(cfg, page, use_button):
+                    return True
+
+        if verify_music_selected(page, log_detail=False):
+            return True
+        if not platform_music_panel_opened(page):
+            wlog(f"音乐面板在第 {panel_cycle} 次选择中意外关闭且音乐未生效，重新打开后只重试音乐步骤。")
+            continue
+        break
+
+    if clicked_use:
+        save_debug(cfg, page, "music_click_state_not_applied")
+        raise RuntimeError("已点击音乐使用按钮，但音乐模块仍未显示歌曲信息或修改入口。")
+    if not last_row_info.get("panel"):
+        save_debug(cfg, page, "music_panel_not_opened")
+        raise RuntimeError("音乐面板未保持打开，无法读取音乐列表。")
+    if not saw_rows:
+        panel_text = str(last_row_info.get("text") or "")
+        debug_name = "music_list_not_loaded" if any(word in panel_text for word in ("加载", "暂无", "重试")) else "music_song_row_not_found"
+        save_debug(cfg, page, debug_name)
+        raise RuntimeError("音乐面板已打开，但未识别到可用歌曲行；新版列表不要求‘万使用’或固定时长。")
+    save_debug(cfg, page, "music_use_button_not_found")
+    raise RuntimeError("已识别歌曲行，但行内及悬停后均未找到可用的‘使用’按钮。")
+
+
 def close_music_panel_if_open(cfg, page):
-    if verify_music_selected(page):
-        wlog("音乐已使用成功，直接继续。")
+    if not platform_music_panel_opened(page):
         return
+    if not verify_music_selected(page, log_detail=False):
+        wlog("音乐尚未确认生效，保留音乐面板供当前音乐步骤继续处理。")
+        return
+    # 先点音乐面板自己的关闭按钮；只把 Escape 作为最后兜底。
+    try:
+        buttons = page.get_by_role("button", name=re.compile(r"^(关闭|收起)$"))
+        for index in range(min(buttons.count(), 8)):
+            button = buttons.nth(index)
+            if button.is_visible(timeout=200) and music_control_belongs_to_panel(button):
+                if click_locator_with_fallback(page, button, "关闭音乐面板", timeout=1500):
+                    page.wait_for_timeout(250)
+                    if not platform_music_panel_opened(page):
+                        return
+    except Exception:
+        pass
     try:
         page.keyboard.press("Escape")
-        step_wait(cfg, "关闭音乐面板后等待")
+        page.wait_for_timeout(250)
     except Exception:
         pass
 
 
 def select_music(cfg, page):
-    if verify_music_selected(page):
+    if verify_music_selected(page, log_detail=False):
+        wlog("音乐已经生效，跳过打开面板和重复选择。")
         return True
     choose_music(cfg, page)
-    validate_music_added(cfg, page)
+    if not verify_music_selected(page, log_detail=False):
+        validate_music_added(cfg, page)
     return True
 
 
@@ -3086,24 +3980,98 @@ def get_text_rects(page, word):
     """, word) or []
 
 
+def publish_mode_selected(page, mode):
+    word = "定时发布" if mode == "schedule" else "立即发布"
+    try:
+        radios = page.get_by_role("radio", name=re.compile(rf"^{re.escape(word)}$"))
+        for index in range(min(radios.count(), 8)):
+            radio = radios.nth(index)
+            if radio.is_visible(timeout=200) and radio.is_checked(timeout=300):
+                return True
+    except Exception:
+        pass
+    try:
+        return bool(page.evaluate(r"""
+        word => {
+          function visible(el){ const r=el.getBoundingClientRect(); const s=getComputedStyle(el); return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'; }
+          function txt(el){ return ((el.innerText||el.textContent||'')+'').replace(/\s+/g,' ').trim(); }
+          const labels=[...document.querySelectorAll('label,[role="radio"],button,div,span')].filter(visible)
+            .filter(el => { const t=txt(el); return t===word || (t.includes(word) && t.length<80); });
+          for(const el of labels){
+            const roleRadio=el.closest('[role="radio"]');
+            if(roleRadio && (roleRadio.getAttribute('aria-checked')==='true' || roleRadio.getAttribute('data-state')==='checked')) return true;
+            const label=el.closest('label');
+            let input=label && label.querySelector('input[type="radio"]');
+            if(!input && label && label.htmlFor) input=document.getElementById(label.htmlFor);
+            if(input && input.checked) return true;
+            const control=el.closest('button,[aria-checked],[data-state]');
+            if(control && (control.getAttribute('aria-checked')==='true' || control.getAttribute('data-state')==='checked')) return true;
+            const cls=String((label||control||el).className||'').toLowerCase();
+            if(/checked|selected|active/.test(cls)) return true;
+          }
+          return false;
+        }
+        """, word))
+    except Exception:
+        return False
+
+
 def click_publish_mode(page, mode):
     word = "定时发布" if mode == "schedule" else "立即发布"
     alt = "定时" if mode == "schedule" else "直接发布"
-    for attempt in range(1, 6):
-        rects = get_text_rects(page, word) or get_text_rects(page, alt)
-        if not rects:
-            step_wait(reason=f"等待 {word} 出现")
-            continue
-        r = rects[0]
-        points = [(r["x"]-18, r["cy"]), (r["x"]-30, r["cy"]), (r["cx"], r["cy"])]
-        for x,y in points:
-            if x < 0: continue
-            page.mouse.click(float(x), float(y))
-            step_wait(reason=f"点击 {word} 后等待")
-            if mode == "schedule":
-                if has_any(page, ["定时发布"], 500) and schedule_input_candidates(page):
+    if publish_mode_selected(page, mode):
+        return True
+
+    semantic_locators = [
+        page.get_by_role("radio", name=re.compile(rf"^{re.escape(word)}$")),
+        page.get_by_text(word, exact=True),
+        page.get_by_text(alt, exact=True),
+    ]
+    for locator in semantic_locators:
+        try:
+            for index in range(min(locator.count(), 10)):
+                item = locator.nth(index)
+                if not item.is_visible(timeout=200):
+                    continue
+                if click_locator_with_fallback(page, item, f"选择{word}", timeout=1800):
+                    deadline = time.time() + 3
+                    while time.time() < deadline:
+                        if publish_mode_selected(page, mode):
+                            return True
+                        page.wait_for_timeout(200)
+        except Exception:
+            pass
+
+    # DOM 原生 click 兜底，仍按模块文本/role/label 定位。
+    try:
+        clicked = page.evaluate("""
+        ({word,alt}) => {
+          function visible(el){ const r=el.getBoundingClientRect(); const s=getComputedStyle(el); return r.width>0&&r.height>0&&s.display!=='none'&&s.visibility!=='hidden'; }
+          function txt(el){ return ((el.innerText||el.textContent||'')+'').trim(); }
+          const nodes=[...document.querySelectorAll('label,[role="radio"],button,span,div')].filter(visible)
+            .filter(el => { const t=txt(el); return (t===word||t===alt) && t.length<30; });
+          const el=nodes[0]; if(!el) return false;
+          (el.closest('label')||el.closest('[role="radio"]')||el.closest('button')||el).click();
+          return true;
+        }
+        """, {"word": word, "alt": alt})
+        if clicked:
+            deadline = time.time() + 2
+            while time.time() < deadline:
+                if publish_mode_selected(page, mode):
                     return True
-            else:
+                page.wait_for_timeout(200)
+    except Exception:
+        pass
+
+    # 最后才使用文字实际矩形附近的真实鼠标，不使用固定屏幕坐标。
+    for rect in get_text_rects(page, word) or get_text_rects(page, alt):
+        for x, y in ((rect["cx"], rect["cy"]), (rect["x"] - 18, rect["cy"])):
+            if x < 0:
+                continue
+            page.mouse.click(float(x), float(y))
+            page.wait_for_timeout(250)
+            if publish_mode_selected(page, mode):
                 return True
     return False
 
@@ -3140,6 +4108,32 @@ def schedule_input_candidates(page):
         return []
 
 
+def schedule_input_locator(page, candidate):
+    best = None
+    best_distance = float("inf")
+    try:
+        inputs = page.locator("input")
+        target_x = float(candidate.get("x", 0)) + float(candidate.get("w", 0)) / 2
+        target_y = float(candidate.get("y", 0)) + float(candidate.get("h", 0)) / 2
+        for index in range(min(inputs.count(), 80)):
+            item = inputs.nth(index)
+            if not item.is_visible(timeout=150):
+                continue
+            input_type = str(item.get_attribute("type", timeout=300) or "text").lower()
+            if input_type in {"radio", "checkbox", "file", "hidden", "button", "submit"}:
+                continue
+            box = item.bounding_box(timeout=300)
+            if not box or box["width"] < 90 or box["height"] < 20:
+                continue
+            distance = abs(box["x"] + box["width"] / 2 - target_x) + abs(box["y"] + box["height"] / 2 - target_y)
+            if distance < best_distance:
+                best = item
+                best_distance = distance
+    except Exception:
+        return None
+    return best
+
+
 def set_schedule_time(page, slot):
     """
     V27：优化定时时间输入。
@@ -3165,7 +4159,11 @@ def set_schedule_time(page, slot):
 
     # 点击发布时间输入框，打开日期时间面板
     try:
-        page.mouse.click(float(cand["x"] + cand["w"] / 2), float(cand["y"] + cand["h"] / 2))
+        input_locator = schedule_input_locator(page, cand)
+        if input_locator is None or not click_locator_with_fallback(
+            page, input_locator, "打开发布时间输入模块", timeout=2000
+        ):
+            raise RuntimeError("发布时间输入模块直接点击失败")
         step_wait(reason="点击发布时间输入框，打开日期面板")
     except Exception as e:
         wlog(f"点击时间输入框失败：{repr(e)}")
@@ -3294,8 +4292,49 @@ def set_schedule_time(page, slot):
 
     step_wait(reason="输入目标时分后等待")
 
-    click_text(page, ["确定", "确认", "完成"], timeout=2500)
-    step_wait(reason="点击确认后等待")
+    # 只在明确属于日期/时间选择器的浮层内点击确认，禁止扫描整页的
+    # “确定/确认/完成”，避免误触音乐、封面或其他设置模块。
+    try:
+        confirm_result = page.evaluate(r"""
+        ({targetDate, targetTime}) => {
+          function visible(el){
+            const r = el.getBoundingClientRect();
+            const s = getComputedStyle(el);
+            return r.width > 0 && r.height > 0 && s.display !== 'none' &&
+                   s.visibility !== 'hidden' && Number(s.opacity || 1) > 0;
+          }
+          function txt(el){ return ((el.innerText || el.textContent || '') + '').replace(/\s+/g, ' ').trim(); }
+          const buttons = [...document.querySelectorAll('button,[role="button"]')]
+            .filter(visible)
+            .filter(el => /^(确定|确认)$/.test(txt(el)));
+          const candidates = [];
+          for (const button of buttons) {
+            let parent = button.parentElement;
+            for (let depth = 0; parent && depth < 8; depth++, parent = parent.parentElement) {
+              if (!visible(parent)) continue;
+              const text = txt(parent);
+              const r = parent.getBoundingClientRect();
+              if (text.length > 3000 || r.width < 180 || r.height < 100) continue;
+              const looksLikeTimePicker = /发布时间|选择日期|选择时间|时|分/.test(text) ||
+                text.includes(targetDate) || text.includes(targetTime) ||
+                !!parent.querySelector('input[value*="'+targetDate+'"]');
+              const wrongModule = /选择音乐|封面设置|作品描述/.test(text);
+              if (looksLikeTimePicker && !wrongModule) {
+                candidates.push({button, area:r.width*r.height});
+                break;
+              }
+            }
+          }
+          candidates.sort((a,b) => a.area-b.area);
+          if (!candidates.length) return {clicked:false, reason:'schedule confirmation not found'};
+          candidates[0].button.click();
+          return {clicked:true};
+        }
+        """, {"targetDate": target_date, "targetTime": target_time})
+        if confirm_result and confirm_result.get("clicked"):
+            step_wait(reason="确认定时时间后等待")
+    except Exception as exc:
+        wlog(f"定时时间选择器确认按钮处理失败，将直接读取输入值校验：{repr(exc)}")
 
     return verify_schedule_time(page, slot)
 
@@ -3395,7 +4434,7 @@ def find_bottom_publish_button(page):
     不找"立即发布"按钮，因为不定时发布也是点击底部"发布"。
     """
     try:
-        buttons = page.locator("button").filter(has_text="发布")
+        buttons = page.get_by_role("button").filter(has_text="发布")
         arr = []
         for i in range(min(buttons.count(), 30)):
             try:
@@ -3406,10 +4445,25 @@ def find_bottom_publish_button(page):
                 if not box:
                     continue
                 txt = (b.inner_text(timeout=500) or "").strip()
-                if "发布" not in txt:
+                normalized = re.sub(r"\s+", "", txt)
+                if normalized in {"立即发布", "定时发布", "重新发布", "发布设置"}:
                     continue
-                # 底部发布按钮通常在页面下方，优先取最后一个可见按钮
-                arr.append((box.get("y", 0), b, txt))
+                if normalized not in {"发布", "发布作品", "确认发布"}:
+                    continue
+                button_type = str(b.get_attribute("type", timeout=300) or "").lower()
+                data_hint = " ".join(filter(None, (
+                    b.get_attribute("data-e2e", timeout=300),
+                    b.get_attribute("data-testid", timeout=300),
+                    b.get_attribute("aria-label", timeout=300),
+                ))).lower()
+                score = float(box.get("y", 0))
+                if button_type == "submit":
+                    score += 2000
+                if "publish" in data_hint or "submit" in data_hint:
+                    score += 1500
+                if normalized == "发布":
+                    score += 300
+                arr.append((score, b, txt))
             except Exception:
                 pass
         if not arr:
@@ -3426,7 +4480,14 @@ def click_bottom_publish_button(cfg, page):
     if btn is None:
         save_debug(cfg, page, "publish_button_not_found")
         raise RuntimeError("没有找到底部发布按钮。")
-    btn.click(force=True, timeout=8000)
+    try:
+        if btn.is_disabled(timeout=500) or btn.get_attribute("aria-disabled", timeout=500) == "true":
+            raise RuntimeError("底部发布按钮当前不可用。")
+    except PlaywrightTimeoutError:
+        pass
+    if not click_locator_with_fallback(page, btn, "底部发布按钮", timeout=8000):
+        save_debug(cfg, page, "publish_button_click_failed")
+        raise RuntimeError("底部发布按钮语义点击、DOM click 和真实鼠标兜底均失败。")
     step_wait(cfg, "点击发布后等待")
     return True
 
@@ -3435,22 +4496,29 @@ def wait_publish_result_once(cfg, page, wait_seconds=35):
     """
     点击发布后等待一次结果。
     返回：
-    success：进入作品管理页或出现成功提示
+    success：已经确认进入作品管理页
     still_publish：仍停留在发布页，需要再次点击发布
     error：检测到失败提示
     unknown：未确定状态
     """
     end = time.time() + wait_seconds
     last_state_log = 0
+    success_notice_seen = False
 
     while time.time() < end:
+        if daily_publish_limit_visible(page):
+            save_debug(cfg, page, "daily_publish_limit")
+            wlog("发布结果判断：检测到‘今天投稿次数已达到上限，请明天再试’。")
+            return "daily_limit"
+
         if manage_page_visible(page):
             wlog("发布结果判断：已进入作品管理页面，发布成功。")
             return "success"
 
         if has_any(page, ["发布成功", "定时发布成功", "提交成功", "作品已进入定时发布", "发布任务已提交"], 600):
-            wlog("发布结果判断：检测到成功提示。")
-            return "success"
+            if not success_notice_seen:
+                wlog("发布结果判断：检测到成功提示，继续等待并确认进入作品管理页。")
+                success_notice_seen = True
 
         if has_any(page, ["发布失败", "错误", "请完善", "不能为空", "违规", "过于频繁", "稍后再试"], 600):
             save_debug(cfg, page, "publish_error")
@@ -3471,12 +4539,18 @@ def wait_publish_result_once(cfg, page, wait_seconds=35):
 
         time.sleep(2)
 
+    if daily_publish_limit_visible(page):
+        save_debug(cfg, page, "daily_publish_limit")
+        return "daily_limit"
+
     if manage_page_visible(page):
         return "success"
 
     if publish_page_still_visible(page):
         return "still_publish"
 
+    if success_notice_seen:
+        wlog("发布结果判断：虽出现成功提示，但未确认进入作品管理页，因此不计为成功。")
     return "unknown"
 
 
@@ -3490,6 +4564,8 @@ def submit(cfg, page):
     result = wait_publish_result_once(cfg, page, wait_seconds=35)
     if result == "success" or manage_page_visible(page):
         return True
+    if result == "daily_limit":
+        raise DailyPublishLimitError("抱歉，今天投稿次数已达到上限，请明天再试")
     if result == "still_publish":
         save_debug(cfg, page, "publish_still_on_publish_page")
         wlog("发布结果判断：仍停留在发布页面，本次完整作品尝试失败。")
@@ -3590,6 +4666,12 @@ def account_worker(config_path):
     state = read_state(cfg)
     primary_account = accounts[0]
     primary_quota = max(1, int(primary_account.get("posts_per_run", 1) or 1))
+    # 轮换发布模式下，父进程仍保留账号完整配额，但每次只允许当前账号成功发布指定条数。
+    # 默认值 0 表示沿用原模式：一次处理完当前账号的全部配额。
+    try:
+        queue_pass_limit = max(0, int(cfg.get("_queue_pass_limit", 0) or 0))
+    except Exception:
+        queue_pass_limit = 0
     queue_run_id = str(cfg.get("_queue_run_id") or f"direct_{uuid.uuid4().hex}")
     resume_progress = account_run_resume_progress(state, queue_run_id, primary_quota)
     current_schedule_signature = schedule_signature(cfg)
@@ -3608,16 +4690,25 @@ def account_worker(config_path):
         "run_progress": resume_progress,
         "run_quota": primary_quota,
         "run_active": resume_progress < primary_quota,
+        "last_account_outcome": "",
+        "last_account_message": "",
     })
     write_state(cfg, state)
 
     ci = 0 if cfg.get("delete_copy_after_success", True) else int(state.get("copy_index", 0) or 0)
     si = int(state.get("slot_index", 0) or 0)
-    retry_times = max(0, int(cfg.get("retry_times", 2) or 0))
+    retry_times = normalize_retry_count(cfg.get("retry_times", 3), 3)
+    overall_retry_times = normalize_retry_count(cfg.get("overall_retry_times", 1), 1)
     total_done = 0
+    pass_done = 0
     stop_all = False
 
-    wlog(f"本轮启用 {len(accounts)} 个浏览器账号；发布失败最多重试 {retry_times} 次。")
+    wlog(
+        f"本轮启用 {len(accounts)} 个浏览器账号；单步骤失败后最多重试 {retry_times} 次，"
+        f"单步骤仍失败时总体流程最多重试 {overall_retry_times} 次。"
+    )
+    if queue_pass_limit > 0:
+        wlog(f"账号轮换子任务：本次最多成功发布 {queue_pass_limit} 条，完成后立即切换下一个账号。")
     wlog(f"读取发布记录 {len(records)} 条，当前记录序号：{ci + 1}")
     if cfg.get("use_schedule", True):
         _slot, current_cycle, current_offset = repeating_schedule_slot(slots, si)
@@ -3640,6 +4731,8 @@ def account_worker(config_path):
         launch_info = None
         browser = None
         playwright_manager = None
+        daily_limit_hit = False
+        daily_limit_message = ""
 
         wlog("=" * 60)
         wlog(f"切换到 {account_name}（{account_index}/{len(accounts)}），本账号计划发布 {account_quota} 条。")
@@ -3689,11 +4782,12 @@ def account_worker(config_path):
             page = keep_single_browser_tab(context, page)
             safe_bring_to_front(account_cfg, page)
 
-            emit_browser_status(account, "checking", "正在检查登录状态和发布页", account_done, account_quota)
-            enter_publish_page(account_cfg, page)
-            emit_browser_status(account, "ready", "登录有效，已进入图文发布页", account_done, account_quota)
+            emit_browser_status(
+                account, "checking", "浏览器已连接；发布当前作品时检查登录状态和发布页",
+                account_done, account_quota,
+            )
 
-            while account_done < account_quota:
+            while account_done < account_quota and (queue_pass_limit <= 0 or pass_done < queue_pass_limit):
                 records = read_publish_records(account_cfg)
                 if account_cfg.get("delete_copy_after_success", True):
                     records = filter_used_publish_records(records, read_state(account_cfg))
@@ -3744,74 +4838,200 @@ def account_worker(config_path):
                     account_done, account_quota
                 )
 
-                for attempt in range(1, retry_times + 2):
+                def publish_current_record(workflow_attempt, workflow_total):
+                    """执行当前作品；每个 run_publish_step 只重试自己尚未完成的步骤。"""
+                    nonlocal page
                     wlog("-" * 60)
                     wlog(
-                        f"{account_name} 第 {attempt}/{retry_times + 1} 次完整尝试："
+                        f"{account_name} 当前作品总体流程 {workflow_attempt}/{workflow_total}："
                         f"城市={city or '旧格式根目录'}；图片={img.name}；文案序号={ci + 1}；"
                         f"定时={slot.strftime('%Y-%m-%d %H:%M') if account_cfg.get('use_schedule', True) else '立即发布'}"
                     )
-                    try:
-                        page = keep_single_browser_tab(context, page)
-                        enter_publish_page(account_cfg, page)
-                        upload_image(account_cfg, page, img)
-                        step_wait(account_cfg, "已选择图片，等待进入图文编辑页")
-                        wait_after_upload_to_editor(account_cfg, page)
-                        fill_title(account_cfg, page, title)
-                        validate_title_filled(account_cfg, page, title)
-                        fill_copy(account_cfg, page, copy_text)
-                        validate_copy_filled(account_cfg, page, copy_text)
 
-                        if account_cfg.get("music_required", True):
+                    page = run_publish_step(
+                        account_cfg, page, "整理浏览器标签",
+                        lambda: keep_single_browser_tab(context, page),
+                    )
+                    run_publish_step(
+                        account_cfg, page, "进入图文发布页",
+                        lambda: enter_publish_page(account_cfg, page),
+                    )
+                    run_publish_step(
+                        account_cfg, page, "上传图片",
+                        lambda: upload_image(account_cfg, page, img),
+                    )
+
+                    def wait_for_editor():
+                        step_wait(account_cfg, "已选择图片，等待进入图文编辑页")
+                        return wait_after_upload_to_editor(account_cfg, page)
+
+                    run_publish_step(account_cfg, page, "等待进入图文编辑页", wait_for_editor)
+
+                    def input_and_validate_title():
+                        fill_title(account_cfg, page, title)
+                        return validate_title_filled(account_cfg, page, title)
+
+                    def input_and_validate_copy():
+                        fill_copy(account_cfg, page, copy_text)
+                        return validate_copy_filled(account_cfg, page, copy_text)
+
+                    run_publish_step(account_cfg, page, "输入并校验标题", input_and_validate_title)
+                    run_publish_step(account_cfg, page, "输入并校验正文话题", input_and_validate_copy)
+
+                    if account_cfg.get("music_required", True):
+                        def select_and_validate_music():
+                            # 若页面仍显示未选择音乐，本步骤会重新拉起音乐面板并选择；
+                            # 只有本步骤连续失败后才进入总体重试并重新上传当前作品。
                             select_music(account_cfg, page)
-                            validate_music_added(account_cfg, page)
+                            return validate_music_added(account_cfg, page)
+
+                        run_publish_step(account_cfg, page, "选择并校验音乐", select_and_validate_music)
+
+                    def locate_publish_settings():
                         close_music_panel_if_open(account_cfg, page)
                         scroll_to_publish_settings(account_cfg, page)
-                        validate_publish_settings_visible(account_cfg, page)
+                        return validate_publish_settings_visible(account_cfg, page)
 
-                        if account_cfg.get("use_schedule", True):
+                    run_publish_step(account_cfg, page, "定位发布设置", locate_publish_settings)
+
+                    if account_cfg.get("use_schedule", True):
+                        def set_and_verify_schedule():
                             set_schedule(account_cfg, page, slot)
                             if not verify_schedule_time(page, slot):
                                 raise RuntimeError("发布前定时时间校验失败。")
-                        else:
-                            set_publish_now(account_cfg, page)
+                            return True
 
+                        run_publish_step(account_cfg, page, "设置并校验定时发布", set_and_verify_schedule)
+                    else:
+                        run_publish_step(
+                            account_cfg, page, "设置立即发布",
+                            lambda: set_publish_now(account_cfg, page),
+                        )
+
+                    def final_validation():
                         wait_uploaded_with_config(account_cfg, page)
                         validate_uploaded_image(account_cfg, page)
                         validate_title_filled(account_cfg, page, title)
                         validate_copy_filled(account_cfg, page, copy_text)
                         if account_cfg.get("music_required", True):
                             validate_music_added(account_cfg, page)
+                        return True
 
+                    run_publish_step(account_cfg, page, "发布前最终校验", final_validation)
+
+                    def submit_and_confirm():
+                        # 上一次点击已成功但页面响应较慢时，不重复点击发布。
+                        if manage_page_visible(page):
+                            return True
                         if not submit(account_cfg, page):
                             raise RuntimeError("提交发布后未确认进入作品管理页。")
-                        ok = True
-                        break
-                    except AccountLoggedOutError:
-                        raise
-                    except Exception as exc:
-                        last_error = exc
-                        wlog(f"{account_name} 第 {attempt} 次失败：{repr(exc)}")
-                        save_debug(account_cfg, page, f"{account.get('id', 'browser')}_attempt_{attempt}_failed")
-                        if attempt <= retry_times:
-                            try:
-                                page.goto(account_cfg["creator_url"], wait_until="domcontentloaded", timeout=30000)
-                            except Exception:
-                                pass
-                            step_wait(account_cfg, "准备重试当前作品")
+                        return True
 
-                if not ok:
+                    return run_publish_step(account_cfg, page, "提交并确认作品管理页", submit_and_confirm)
+
+                def prepare_overall_retry(failed_attempt, failed_step_error):
+                    nonlocal page
+                    save_debug(
+                        account_cfg, page,
+                        f"{account.get('id', 'browser')}_workflow_{failed_attempt}_{failed_step_error.step_name}_failed",
+                    )
+                    try:
+                        page = keep_single_browser_tab(context, page)
+                        page.goto(account_cfg["creator_url"], wait_until="domcontentloaded", timeout=30000)
+                    except Exception as exc:
+                        wlog(f"总体重试前返回创作者中心失败，将由‘进入图文发布页’步骤继续处理：{repr(exc)}")
+
+                try:
+                    ok = bool(run_publish_workflow(account_cfg, publish_current_record, prepare_overall_retry))
+                except DailyPublishLimitError as exc:
+                    daily_limit_hit = True
+                    daily_limit_message = str(exc) or "今天投稿次数已达到上限，请明天再试"
+                    last_error = exc
+                    wlog(f"{account_name} 检测到今日投稿次数上限：{daily_limit_message}；不进入普通重试。")
+                    save_debug(account_cfg, page, f"{account.get('id', 'browser')}_daily_limit")
+                except PublishWorkflowFailedError as exc:
+                    last_error = exc
+                    wlog(f"{account_name} 当前作品两级重试均已耗尽：{exc}")
+
+                if daily_limit_hit:
+                    wait_seconds = normalize_daily_limit_switch_wait_seconds(
+                        account_cfg.get("daily_limit_switch_wait_seconds", 10)
+                    )
+                    state_now = read_state(account_cfg)
+                    state_now.update({
+                        "copy_index": ci,
+                        "slot_index": si,
+                        "queue_run_id": queue_run_id,
+                        "run_progress": account_done,
+                        "run_quota": account_quota,
+                        "run_active": True,
+                        "last_account_outcome": "daily_limit",
+                        "last_account_message": daily_limit_message,
+                        "daily_limit_detected_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                    write_state(account_cfg, state_now)
                     append_log(account_cfg, {
                         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "image": str(img), "copy_index": ci + 1,
                         "schedule_time": slot.strftime("%Y-%m-%d %H:%M") if account_cfg.get("use_schedule", True) else "立即发布",
                         "copy_preview": copy_text[:80].replace("\n", " "),
-                        "status": f"error_after_retries[{account_name}]: {repr(last_error)}"
+                        "status": f"daily_publish_limit[{account_name}]: {daily_limit_message}"
                     })
-                    emit_browser_status(account, "error", "本账号发布失败，切换下一个浏览器", account_done, account_quota)
-                    wlog(f"{account_name} 已用完配置的重试次数，保留当前内容并切换下一个浏览器。")
+                    emit_browser_status(
+                        account, "daily_limit",
+                        f"检测到今日投稿上限，{wait_seconds} 秒后切换下一个账号",
+                        account_done, account_quota,
+                    )
+                    wlog(
+                        f"{account_name} 今日投稿次数已达到上限；当前内容未消费、已发布数不增加。"
+                        f"等待 {wait_seconds} 秒后自动切换下一个账号。"
+                    )
+                    if wait_seconds > 0:
+                        countdown_sleep(
+                            account_cfg, wait_seconds,
+                            f"{account_name} 今日投稿上限：准备切换下一个账号",
+                            "daily_limit_switch",
+                        )
+                    emit_browser_status(
+                        account, "daily_limit", "今日投稿上限，已跳过本账号",
+                        account_done, account_quota,
+                    )
+                    break
+
+                if not ok:
+                    failure_reason = concise_publish_failure(last_error)
+                    failure_state = read_state(account_cfg)
+                    failure_state.update({
+                        "copy_index": ci,
+                        "slot_index": si,
+                        "queue_run_id": queue_run_id,
+                        "run_progress": account_done,
+                        "run_quota": account_quota,
+                        "run_active": True,
+                        "last_account_outcome": "error",
+                        "last_account_message": failure_reason,
+                        "last_account_failed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    })
+                    write_state(account_cfg, failure_state)
+                    append_log(account_cfg, {
+                        "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "image": str(img), "copy_index": ci + 1,
+                        "schedule_time": slot.strftime("%Y-%m-%d %H:%M") if account_cfg.get("use_schedule", True) else "立即发布",
+                        "copy_preview": copy_text[:80].replace("\n", " "),
+                        "status": f"error_after_step_and_workflow_retries[{account_name}]: {repr(last_error)}"
+                    })
+                    emit_browser_status(
+                        account, "error",
+                        f"{failure_reason}；进度 {account_done}/{account_quota} 已保留",
+                        account_done, account_quota,
+                    )
+                    wlog(
+                        f"{account_name} 已用完单步骤重试 {retry_times} 次和总体流程重试 "
+                        f"{overall_retry_times} 次；保留当前内容并切换下一个浏览器。"
+                    )
                     alert_auto_pause(
-                        f"自动暂停提醒：{account_name} 已连续失败 {retry_times + 1} 次，"
+                        f"自动暂停提醒：{account_name} 的失败步骤已重试 {retry_times} 次，"
+                        f"总体流程又重试 {overall_retry_times} 次后仍未完成，"
                         "当前内容未消费；请查看固定运行日志和调试截图。"
                     )
                     break
@@ -3841,6 +5061,7 @@ def account_worker(config_path):
                 ci = 0 if account_cfg.get("delete_copy_after_success", True) else ci + 1
                 si += 1
                 account_done += 1
+                pass_done += 1
                 total_done += 1
                 state_now = read_state(account_cfg)
                 state_now.update({
@@ -3852,6 +5073,8 @@ def account_worker(config_path):
                     "run_progress": account_done,
                     "run_quota": account_quota,
                     "run_active": account_done < account_quota,
+                    "last_account_outcome": "success",
+                    "last_account_message": "",
                 })
                 write_state(account_cfg, state_now)
                 emit_browser_status(
@@ -3860,17 +5083,42 @@ def account_worker(config_path):
                     account_done, account_quota
                 )
 
-                more_needed = account_done < account_quota or account_index < len(accounts)
+                # 普通顺序模式继续在账号内部等待下一条；轮换模式由父进程切换账号后统一控制发布间隔。
+                pass_limit_reached = queue_pass_limit > 0 and pass_done >= queue_pass_limit
+                more_needed = (account_done < account_quota or account_index < len(accounts)) and not pass_limit_reached
                 if more_needed:
                     wait_publish_interval(account_cfg, total_done)
 
-            if account_done >= account_quota:
+            if daily_limit_hit:
+                wlog(f"{account_name} 因今日投稿次数上限结束本次账号任务，等待父调度器切换。")
+            elif account_done >= account_quota:
                 wlog(f"{account_name} 已完成本账号配额：{account_done}/{account_quota}。")
                 emit_browser_status(account, "done", "本账号配额完成", account_done, account_quota)
+            elif queue_pass_limit > 0 and pass_done > 0:
+                wlog(f"{account_name} 本次轮换已完成 {pass_done} 条，累计 {account_done}/{account_quota}，切换下一个账号。")
+                emit_browser_status(account, "waiting", f"本轮已发 {pass_done} 条，准备切换下一个账号", account_done, account_quota)
 
         except AccountLoggedOutError as exc:
             wlog(f"{account_name} 掉号或需要验证：{exc} 已跳过并切换下一个浏览器。")
-            emit_browser_status(account, "logged_out", "检测到登录/验证页，已跳过", account_done, account_quota)
+            logout_reason = f"账号掉线/需要验证：{exc}"
+            logout_state = read_state(account_cfg)
+            logout_state.update({
+                "copy_index": ci,
+                "slot_index": si,
+                "queue_run_id": queue_run_id,
+                "run_progress": account_done,
+                "run_quota": account_quota,
+                "run_active": True,
+                "last_account_outcome": "logged_out",
+                "last_account_message": logout_reason,
+                "last_account_failed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            write_state(account_cfg, logout_state)
+            emit_browser_status(
+                account, "logged_out",
+                f"{logout_reason}；进度 {account_done}/{account_quota} 已保留",
+                account_done, account_quota,
+            )
             try:
                 append_log(account_cfg, {
                     "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
@@ -3880,8 +5128,26 @@ def account_worker(config_path):
             except Exception:
                 pass
         except Exception as exc:
-            wlog(f"{account_name} 启动或页面检查失败：{repr(exc)} 已切换下一个浏览器。")
-            emit_browser_status(account, "error", f"{exc}", account_done, account_quota)
+            startup_reason = f"启动或页面检查失败：{exc}"
+            startup_state = read_state(account_cfg)
+            startup_state.update({
+                "copy_index": ci,
+                "slot_index": si,
+                "queue_run_id": queue_run_id,
+                "run_progress": account_done,
+                "run_quota": account_quota,
+                "run_active": True,
+                "last_account_outcome": "error",
+                "last_account_message": startup_reason,
+                "last_account_failed_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            })
+            write_state(account_cfg, startup_state)
+            wlog(f"{account_name} {startup_reason} 已切换下一个浏览器，进度已保留。")
+            emit_browser_status(
+                account, "error",
+                f"{startup_reason}；进度 {account_done}/{account_quota} 已保留",
+                account_done, account_quota,
+            )
         finally:
             if launch_info and launch_info.get("launched") and account.get("close_after_finish", True):
                 close_browser_launched_by_app(browser, launch_info, account_name)
@@ -3897,8 +5163,40 @@ def account_worker(config_path):
     wlog(f"全部浏览器处理完成。本轮成功发布 {total_done} 条。")
 
 
+def normalize_rotate_batch_size(value):
+    """轮换模式每个账号连续成功发布多少条后切换；最少 1 条。"""
+    try:
+        return max(1, int(value or 1))
+    except Exception:
+        return 1
+
+
+def normalize_daily_limit_switch_wait_seconds(value):
+    """检测到今日投稿上限后，等待多少秒再切换下一个账号；允许 0 秒立即切换。"""
+    try:
+        return max(0, min(86400, int(float(value or 0))))
+    except Exception:
+        return 10
+
+
+def rotation_batch_target(quota, before_progress, batch_size):
+    """计算当前账号这一轮实际最多发布多少条。"""
+    quota = max(1, _nonnegative_state_int(quota, 1))
+    before_progress = min(quota, _nonnegative_state_int(before_progress, 0))
+    remaining = max(0, quota - before_progress)
+    if remaining <= 0:
+        return 0
+    return min(remaining, normalize_rotate_batch_size(batch_size))
+
+
 def run_isolated_browser_sequence(config_path, child_switch, publish_mode=False):
-    """每个浏览器使用独立 Python/Playwright 进程，单号驱动崩溃不会影响后续账号。"""
+    """
+    每个浏览器使用独立 Python/Playwright 进程，单号驱动崩溃不会影响后续账号。
+
+    普通模式：按队列顺序，一次完成当前账号的全部配额后再切换。
+    轮换模式：每个账号每轮最多成功发布 rotate_batch_size 条，然后立即切换下一个账号；
+    循环执行，直到所有账号达到各自 posts_per_run 配额。
+    """
     cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
     accounts = browser_accounts_from_config(cfg, enabled_only=True)
     if not accounts:
@@ -3907,6 +5205,11 @@ def run_isolated_browser_sequence(config_path, child_switch, publish_mode=False)
     total_done = 0
     queue_run_id = ""
     completed_account_ids = set()
+    daily_limit_account_ids = set()
+    failed_account_ids = set()
+    rotate_each_post = bool(publish_mode and parse_bool(cfg.get("rotate_accounts_each_post"), False))
+    # 未勾选轮换发布时不读取、不使用连续发布条数。
+    rotate_batch_size = normalize_rotate_batch_size(cfg.get("rotate_batch_size", 1)) if rotate_each_post else 0
     if publish_mode:
         queue_run_id, completed_account_ids, resumed = prepare_queue_run(cfg, accounts)
         if resumed:
@@ -3916,69 +5219,277 @@ def run_isolated_browser_sequence(config_path, child_switch, publish_mode=False)
             )
         else:
             wlog(f"开始新的队列轮次：共 {len(accounts)} 个已勾选账号。")
+        if rotate_each_post:
+            wlog(f"已启用账号轮换发布：每个账号连续成功发布 {rotate_batch_size} 条后切换下一个，直至各账号设定条数全部完成。")
     temp_root = Path(tempfile.mkdtemp(prefix="douyin_browser_sequence_"))
-    try:
-        for index, account in enumerate(accounts, start=1):
-            account_id = str(account.get("id") or "")
-            quota = max(1, int(account.get("posts_per_run", 1) or 1))
-            if publish_mode and account_id in completed_account_ids:
-                wlog(f"独立进程 {index}/{len(accounts)}：{account['name']} 在上一轮已经处理，跳过重复发布。")
-                emit_browser_status(account, "done", "上一轮已经处理，继续下一个账号", quota, quota)
-                continue
-            child_cfg = copy.deepcopy(cfg)
-            child_account = copy.deepcopy(account)
-            child_account["posts_per_run"] = quota
-            child_cfg["browser_accounts"] = [child_account]
-            if publish_mode:
-                child_cfg["_queue_run_id"] = queue_run_id
-            child_path = temp_root / f"account_{index}.json"
-            child_path.write_text(json.dumps(child_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-            resolved_child_cfg = config_for_browser_account(child_cfg, child_account)
-            before_state = read_state(resolved_child_cfg) if publish_mode else {}
-            before_slot = (
-                int(before_state.get("slot_index", 0) or 0)
-                if before_state.get("schedule_signature") == schedule_signature(resolved_child_cfg)
-                else 0
-            ) if publish_mode else 0
-            wlog(f"独立进程 {index}/{len(accounts)}：{account['name']}")
-            command = application_command(child_switch, child_path)
-            env = os.environ.copy()
-            env["PYTHONIOENCODING"] = "utf-8"
-            env["PYTHONUTF8"] = "1"
-            child = subprocess.Popen(
-                command,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.STDOUT,
-                text=True,
-                encoding="utf-8",
-                errors="replace",
-                bufsize=1,
-                cwd=str(APP_DIR),
-                env=env,
-                **hidden_subprocess_kwargs(),
+    live_queue_fingerprint = json.dumps(accounts, ensure_ascii=False, sort_keys=True)
+
+    def reload_live_queue():
+        """在账号子进程边界重新读取主配置，使暂停期间的队列修改可在继续后生效。"""
+        nonlocal cfg, accounts, live_queue_fingerprint, rotate_batch_size
+        try:
+            latest_cfg = json.loads(Path(config_path).read_text(encoding="utf-8"))
+            latest_accounts = browser_accounts_from_config(latest_cfg, enabled_only=True)
+            if latest_accounts:
+                validate_browser_queue_ports(latest_accounts)
+            latest_fingerprint = json.dumps(latest_accounts, ensure_ascii=False, sort_keys=True)
+            changed = latest_fingerprint != live_queue_fingerprint
+            old_batch_size = rotate_batch_size
+            cfg = latest_cfg
+            accounts = latest_accounts
+            live_queue_fingerprint = latest_fingerprint
+            rotate_batch_size = (
+                normalize_rotate_batch_size(cfg.get("rotate_batch_size", rotate_batch_size or 1))
+                if rotate_each_post else 0
             )
-            for line in child.stdout:
-                print(line, end="", flush=True)
-            code = child.wait()
-            if code != 0:
-                emit_browser_status(account, "error", f"独立控制进程退出码 {code}，继续下一个浏览器", 0, quota)
-                wlog(f"{account['name']} 独立控制进程异常退出（{code}），继续下一个浏览器。")
-            if publish_mode:
-                after_slot = int(read_state(resolved_child_cfg).get("slot_index", 0) or 0)
-                total_done += max(0, after_slot - before_slot)
-                if code == 0:
-                    completed_account_ids.add(account_id)
-                    update_queue_run_state(cfg, queue_run_id, accounts, completed_account_ids, active=True)
-            try:
-                child_path.unlink()
-            except Exception:
-                pass
+            if changed or rotate_batch_size != old_batch_size:
+                detail = ""
+                if rotate_batch_size != old_batch_size:
+                    detail = f" 连续发布条数已从 {old_batch_size} 更新为 {rotate_batch_size}。"
+                wlog("已读取暂停期间保存的最新浏览器队列；后续未启动账号将按新顺序/新配置执行。" + detail)
+            return changed
+        except Exception as exc:
+            wlog(f"读取运行中的最新浏览器队列失败，暂时继续使用原队列：{exc}")
+            return False
+
+    def current_account_progress(base_cfg, account, quota):
+        resolved_cfg = config_for_browser_account(base_cfg, account)
+        state = read_state(resolved_cfg)
+        if not publish_mode:
+            return 0, resolved_cfg, state
+        return account_run_resume_progress(state, queue_run_id, quota), resolved_cfg, state
+
+    def run_one_account(index, account, round_no=1):
+        nonlocal total_done
+        account_id = str(account.get("id") or "")
+        quota = max(1, int(account.get("posts_per_run", 1) or 1))
+        before_progress, resolved_child_cfg, _before_state = current_account_progress(cfg, account, quota)
+        if publish_mode and before_progress >= quota:
+            completed_account_ids.add(account_id)
+            emit_browser_status(account, "done", "本账号配额已经完成", quota, quota)
+            return 0, True
+
+        child_cfg = copy.deepcopy(cfg)
+        child_account = copy.deepcopy(account)
+        # 保留完整配额，以便账号 worker 的 run_progress 能跨轮次累计。
+        child_account["posts_per_run"] = quota
+        child_cfg["browser_accounts"] = [child_account]
+        if publish_mode:
+            child_cfg["_queue_run_id"] = queue_run_id
+            if rotate_each_post:
+                # 每个账号连续成功发布指定条数后，子进程必须结束并把控制权交还父进程，
+                # 由父进程明确切换到队列中的下一个账号。
+                # 本轮上限取“用户设置的连续条数”和“当前账号剩余配额”的较小值。
+                # 这样即使总配额不足一个完整批次，也会在完成剩余条数后立刻交棒/完成。
+                batch_target = rotation_batch_target(quota, before_progress, rotate_batch_size)
+                child_cfg["_queue_pass_limit"] = batch_target
+                child_cfg["_rotation_batch_target"] = batch_target
+                # 轮换模式下，每个账号第一次轮到时正常打开可见浏览器；
+                # 本轮结束后不主动关闭，下一轮直接复用同一 CDP 端口，因此不会反复弹窗。
+                # 浏览器窗口由用户在整轮任务结束后自行关闭。
+                child_account["close_after_finish"] = False
+                child_cfg["browser_accounts"] = [child_account]
+                child_cfg["_headless_browser"] = False
+                child_cfg["reuse_existing_cdp"] = True
+                child_cfg["close_chrome_before_start"] = False
+                child_cfg["no_raise_browser"] = True
+        child_path = temp_root / f"account_{index}_round_{round_no}.json"
+        child_path.write_text(json.dumps(child_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+
+        if rotate_each_post:
+            wlog(
+                f"轮换第 {round_no} 轮 · 账号 {index}/{len(accounts)}：{account['name']} "
+                f"（当前 {before_progress}/{quota}，本次最多 {rotation_batch_target(quota, before_progress, rotate_batch_size)} 条）"
+            )
+        else:
+            wlog(f"独立进程 {index}/{len(accounts)}：{account['name']}")
+
+        command = application_command(child_switch, child_path)
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        env["PYTHONUTF8"] = "1"
+        child = subprocess.Popen(
+            command,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            bufsize=1,
+            cwd=str(APP_DIR),
+            env=env,
+            **hidden_subprocess_kwargs(),
+        )
+        for line in child.stdout:
+            print(line, end="", flush=True)
+        code = child.wait()
+        try:
+            child_path.unlink()
+        except Exception:
+            pass
+
+        # 如果用户在暂停期间编辑了浏览器队列，当前账号安全结束后立即读取最新配置。
+        # 当前正在执行的这个账号仍使用启动它时的参数；尚未启动的账号使用最新参数。
+        reload_live_queue()
+
+        if code != 0:
+            failed_account_ids.add(account_id)
+            emit_browser_status(account, "error", f"独立控制进程退出码 {code}，继续下一个浏览器", before_progress, quota)
+            wlog(f"{account['name']} 独立控制进程异常退出（{code}），继续下一个浏览器。")
+
+        if not publish_mode:
+            return 0, code == 0
+
+        after_progress, _resolved_cfg, _after_state = current_account_progress(cfg, account, quota)
+        gained = max(0, after_progress - before_progress)
+        total_done += gained
+        if str(_after_state.get("last_account_outcome") or "") == "daily_limit":
+            daily_limit_account_ids.add(account_id)
+            emit_browser_status(
+                account, "daily_limit", "今日投稿上限，已在本轮跳过",
+                after_progress, quota,
+            )
+            wlog(f"{account['name']} 已标记为‘今日投稿上限’，本轮后续不再重新进入该账号。")
+            update_queue_run_state(cfg, queue_run_id, accounts, completed_account_ids, active=True)
+            return gained, False
+
+        last_outcome = str(_after_state.get("last_account_outcome") or "")
+        last_message = str(_after_state.get("last_account_message") or "").strip()
+        if last_outcome in {"error", "logged_out"}:
+            failed_account_ids.add(account_id)
+            status_code = "logged_out" if last_outcome == "logged_out" else "error"
+            emit_browser_status(
+                account, status_code,
+                (last_message or "本账号未完成") + f"；进度 {after_progress}/{quota} 已保留",
+                after_progress, quota,
+            )
+            update_queue_run_state(cfg, queue_run_id, accounts, completed_account_ids, active=True)
+            return gained, False
+
+        completed = after_progress >= quota
+
+        if completed:
+            completed_account_ids.add(account_id)
+            emit_browser_status(account, "done", "本账号配额完成", after_progress, quota)
+        update_queue_run_state(cfg, queue_run_id, accounts, completed_account_ids, active=True)
+        return gained, completed
+
+    try:
+        if rotate_each_post and publish_mode:
+            round_no = 0
+            while True:
+                reload_live_queue()
+                pending_now = [
+                    account for account in accounts
+                    if str(account.get("id") or "") not in completed_account_ids
+                    and str(account.get("id") or "") not in daily_limit_account_ids
+                    and str(account.get("id") or "") not in failed_account_ids
+                ]
+                if not pending_now:
+                    break
+
+                round_no += 1
+                round_progress = 0
+                visited_this_round = set()
+                while True:
+                    reload_live_queue()
+                    candidates = [
+                        account for account in accounts
+                        if str(account.get("id") or "") not in completed_account_ids
+                        and str(account.get("id") or "") not in daily_limit_account_ids
+                        and str(account.get("id") or "") not in failed_account_ids
+                        and str(account.get("id") or "") not in visited_this_round
+                    ]
+                    if not candidates:
+                        break
+                    account = candidates[0]
+                    account_id = str(account.get("id") or "")
+                    visited_this_round.add(account_id)
+                    index = next(
+                        (i for i, item in enumerate(accounts, start=1)
+                         if str(item.get("id") or "") == account_id),
+                        1,
+                    )
+                    gained, account_completed = run_one_account(index, account, round_no)
+                    round_progress += gained
+                    reload_live_queue()
+                    still_pending = any(
+                        str(item.get("id") or "") not in completed_account_ids
+                        and str(item.get("id") or "") not in daily_limit_account_ids
+                        and str(item.get("id") or "") not in failed_account_ids
+                        for item in accounts
+                    )
+                    if gained > 0 and still_pending:
+                        # 轮换模式达到“每账号连续发布 N 条”后必须立即交棒。
+                        # 条与条之间的发布间隔已经在账号 worker 内部处理；账号边界不再追加等待。
+                        wlog(
+                            f"{account.get('name') or '当前账号'} 本轮新增 {gained} 条，"
+                            "已释放当前账号控制权，立即切换下一个账号。"
+                        )
+                        if not account_completed:
+                            quota_now = max(1, int(account.get("posts_per_run", 1) or 1))
+                            progress_now = current_account_progress(cfg, account, quota_now)[0]
+                            emit_browser_status(
+                                account, "waiting",
+                                f"本轮已发 {gained} 条，正在切换下一个账号",
+                                progress_now, quota_now,
+                            )
+
+                reload_live_queue()
+                remaining = [
+                    account for account in accounts
+                    if str(account.get("id") or "") not in completed_account_ids
+                    and str(account.get("id") or "") not in daily_limit_account_ids
+                    and str(account.get("id") or "") not in failed_account_ids
+                ]
+                if not remaining:
+                    break
+                if round_progress <= 0:
+                    wlog(
+                        f"轮换第 {round_no} 轮没有任何账号新增成功发布；"
+                        "为避免无限循环，已停止本轮并保留各账号进度。"
+                    )
+                    break
+                wlog(
+                    f"轮换第 {round_no} 轮结束：本轮新增 {round_progress} 条，"
+                    f"还有 {len(remaining)}/{len(accounts)} 个账号未达到设定条数。"
+                )
+        else:
+            attempted_ids = set()
+            while True:
+                reload_live_queue()
+                candidates = [
+                    account for account in accounts
+                    if str(account.get("id") or "") not in completed_account_ids
+                    and str(account.get("id") or "") not in daily_limit_account_ids
+                    and str(account.get("id") or "") not in failed_account_ids
+                    and str(account.get("id") or "") not in attempted_ids
+                ]
+                if not candidates:
+                    break
+                account = candidates[0]
+                account_id = str(account.get("id") or "")
+                attempted_ids.add(account_id)
+                quota = max(1, int(account.get("posts_per_run", 1) or 1))
+                index = next(
+                    (i for i, item in enumerate(accounts, start=1)
+                     if str(item.get("id") or "") == account_id),
+                    1,
+                )
+                if publish_mode and account_id in completed_account_ids:
+                    wlog(f"独立进程 {index}/{len(accounts)}：{account['name']} 在上一轮已经处理，跳过重复发布。")
+                    emit_browser_status(account, "done", "上一轮已经处理，继续下一个账号", quota, quota)
+                    continue
+                run_one_account(index, account, 1)
+
     finally:
         try:
             temp_root.rmdir()
         except Exception:
             pass
+
     if publish_mode:
+        reload_live_queue()
         remaining_ids = {
             str(account.get("id") or "") for account in accounts
             if str(account.get("id") or "") not in completed_account_ids
@@ -3986,11 +5497,22 @@ def run_isolated_browser_sequence(config_path, child_switch, publish_mode=False)
         update_queue_run_state(
             cfg, queue_run_id, accounts, completed_account_ids, active=bool(remaining_ids)
         )
-        if remaining_ids:
+        runnable_remaining_ids = remaining_ids - daily_limit_account_ids
+        if runnable_remaining_ids:
             raise RuntimeError(
-                f"本轮仍有 {len(remaining_ids)} 个账号未处理完成，进度已保留；下次启动将继续。"
+                f"本轮仍有 {len(runnable_remaining_ids)} 个账号未处理完成，进度已保留；下次启动将继续。"
             )
-        wlog(f"多浏览器独立进程编排结束，本次新增确认成功 {total_done} 条，本轮队列已完成。")
+        if daily_limit_account_ids:
+            wlog(
+                f"本轮有 {len(daily_limit_account_ids)} 个账号检测到今日投稿次数上限，"
+                "已保留未消费内容和发布进度；下次启动可再次尝试。"
+            )
+        if remaining_ids:
+            wlog(f"本次队列处理结束，新增确认成功 {total_done} 条；未完成账号进度继续保留。")
+        elif rotate_each_post:
+            wlog(f"账号轮换发布结束，本次新增确认成功 {total_done} 条；所有账号配额均已完成。")
+        else:
+            wlog(f"多浏览器独立进程编排结束，本次新增确认成功 {total_done} 条，本轮队列已完成。")
     else:
         wlog("多浏览器独立登录检查结束。")
 
@@ -4143,7 +5665,7 @@ class BrowserAccountDialog:
     def _build(self):
         outer = ttk.Frame(self.window, padding=20)
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="浏览器队列项配置", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor="w")
+        ttk.Label(outer, text="浏览器队列项配置", font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w")
         notebook = ttk.Notebook(outer)
         notebook.pack(fill="both", expand=True, pady=(14, 10))
         account_tab = ttk.Frame(notebook, padding=16)
@@ -4304,16 +5826,26 @@ class App:
             pass
         self.root.configure(bg="#EEF2F7")
         self.cfg = load_config()
+        self.debug_cleanup_result = (
+            {"launch_count": 0, "cleaned": False, "removed": 0, "error": ""}
+            if "--self-test" in sys.argv
+            else maintain_debug_screenshots(self.cfg)
+        )
         cleanup_legacy_install_after_migration()
         self.browser_accounts = browser_accounts_from_config(self.cfg)
         self.vars = {}
         self.bool_vars = {}
         self.weekly_day_vars = []
         self.browser_statuses = {}
+        self.browser_success_counts = {}
+        self.restore_browser_runtime_state()
         self.proc = None
         self.proc_mode = ""
         self.q = queue.Queue()
         self.is_paused = False
+        # 暂停期间允许编辑队列。保存暂停时实际创建的 flag 路径，避免删除/改动队列后
+        # “继续”只清理新队列 flag，导致旧 worker 仍卡在暂停状态。
+        self.active_pause_flags = []
         self.status_var = tk.StringVar(value="状态：空闲")
         self.auth_status_var = tk.StringVar(value="授权状态：正在检查")
         self.auth_button_text_var = tk.StringVar(value="登录授权")
@@ -4345,18 +5877,63 @@ class App:
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
         self.root.after(250, self.start_authorization_restore)
 
+    def restore_browser_runtime_state(self):
+        """软件重启后恢复未完成队列中每个账号的累计进度与最后失败原因。"""
+        queue_state = read_state(self.cfg)
+        if not parse_bool(queue_state.get("queue_run_active"), False):
+            return
+        queue_run_id = str(queue_state.get("queue_run_id") or "").strip()
+        if not queue_run_id:
+            return
+        completed_ids = {
+            str(item) for item in (queue_state.get("queue_completed_account_ids") or []) if str(item)
+        }
+        labels = {
+            "error": "失败",
+            "logged_out": "掉号已跳过",
+            "daily_limit": "今日上限已跳过",
+        }
+        for account in self.browser_accounts:
+            account_id = str(account.get("id") or "")
+            quota = max(1, _nonnegative_state_int(account.get("posts_per_run"), 1))
+            account_cfg = config_for_browser_account(self.cfg, account)
+            account_state = read_state(account_cfg)
+            progress = account_run_resume_progress(account_state, queue_run_id, quota)
+            self.browser_success_counts[account_id] = progress
+            if account_id in completed_ids or progress >= quota:
+                self.browser_statuses[account_id] = f"配额完成 {progress}/{quota}"
+                continue
+            outcome = str(account_state.get("last_account_outcome") or "")
+            message = str(account_state.get("last_account_message") or "").strip()
+            if outcome in labels:
+                status = labels[outcome]
+                if message:
+                    status += f" · {message}"
+                self.browser_statuses[account_id] = f"{status} · 进度 {progress}/{quota} 已保留"
+            elif progress:
+                self.browser_statuses[account_id] = f"进度已恢复 {progress}/{quota}"
+
     def _configure_style(self):
         style = ttk.Style(self.root)
         try:
-            style.theme_use("clam")
+            themes = set(style.theme_names())
+            # Windows 的 vista 主题复选框使用标准“打勾”指示器；clam 在部分 Tk 版本中
+            # 会显示成 X，容易让“已勾选”看起来像“取消/错误”。
+            preferred_theme = "vista" if os.name == "nt" and "vista" in themes else "clam"
+            if preferred_theme in themes:
+                style.theme_use(preferred_theme)
         except Exception:
             pass
         style.configure("TFrame", background="#FFFFFF")
         style.configure("Card.TFrame", background="#FFFFFF")
-        style.configure("TLabel", background="#FFFFFF", foreground="#344054", font=("Microsoft YaHei UI", 9))
-        style.configure("Title.TLabel", background="#FFFFFF", foreground="#172033", font=("Microsoft YaHei UI", 12, "bold"))
-        style.configure("Muted.TLabel", background="#FFFFFF", foreground="#667085", font=("Microsoft YaHei UI", 9))
-        style.configure("TButton", font=("Microsoft YaHei UI", 9), padding=(12, 7))
+        style.configure("TLabel", background="#FFFFFF", foreground="#101828", font=("Microsoft YaHei UI", 11))
+        style.configure("Title.TLabel", background="#FFFFFF", foreground="#101828", font=("Microsoft YaHei UI", 14, "bold"))
+        style.configure("Muted.TLabel", background="#FFFFFF", foreground="#475467", font=("Microsoft YaHei UI", 11))
+        style.configure("TButton", foreground="#101828", font=("Microsoft YaHei UI", 11, "bold"), padding=(13, 8))
+        style.map("TButton", foreground=[("disabled", "#101828"), ("!disabled", "#101828")])
+        style.configure("TCheckbutton", background="#FFFFFF", foreground="#101828", font=("Microsoft YaHei UI", 11, "bold"), padding=(2, 3))
+        style.configure("TEntry", font=("Microsoft YaHei UI", 11), foreground="#101828", padding=5)
+        style.configure("TCombobox", font=("Microsoft YaHei UI", 11), padding=4)
         style.configure("Accent.TButton", background="#2563EB", foreground="#FFFFFF", borderwidth=0)
         style.map("Accent.TButton", background=[("active", "#1D4ED8"), ("disabled", "#93C5FD")])
         style.configure("Success.TButton", background="#059669", foreground="#FFFFFF", borderwidth=0)
@@ -4366,22 +5943,23 @@ class App:
         style.configure("TNotebook", background="#EEF2F7", borderwidth=0, tabmargins=(0, 0, 0, 0))
         style.configure(
             "TNotebook.Tab",
-            font=("Microsoft YaHei UI", 10),
-            padding=(22, 10),
+            font=("Microsoft YaHei UI", 12, "bold"),
+            padding=(22, 11),
             borderwidth=0,
             relief="flat",
             background="#E5E7EB",
-            foreground="#344054",
+            foreground="#1D2939",
         )
         style.map(
             "TNotebook.Tab",
             padding=[("selected", (22, 10)), ("!selected", (22, 10))],
             background=[("selected", "#EAF2FF"), ("!selected", "#E5E7EB")],
-            foreground=[("selected", "#175CD3"), ("!selected", "#344054")],
-            font=[("selected", ("Microsoft YaHei UI", 10, "bold")), ("!selected", ("Microsoft YaHei UI", 10))],
+            foreground=[("selected", "#1849A9"), ("!selected", "#1D2939")],
+            font=[("selected", ("Microsoft YaHei UI", 12, "bold")), ("!selected", ("Microsoft YaHei UI", 12, "bold"))],
         )
-        style.configure("Treeview", rowheight=30, font=("Microsoft YaHei UI", 9), background="#FFFFFF", fieldbackground="#FFFFFF")
-        style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 9, "bold"), background="#F2F4F7")
+        style.configure("Treeview", rowheight=34, font=("Microsoft YaHei UI", 11), foreground="#101828", background="#FFFFFF", fieldbackground="#FFFFFF")
+        style.map("Treeview", background=[("selected", "#175CD3")], foreground=[("selected", "#FFFFFF")])
+        style.configure("Treeview.Heading", font=("Microsoft YaHei UI", 11, "bold"), foreground="#101828", background="#EAECF0", padding=(6, 7))
 
     def _card(self, parent, title, subtitle=""):
         card = ttk.Frame(parent, style="Card.TFrame", padding=14)
@@ -4479,8 +6057,8 @@ class App:
         header = tk.Frame(self.root, bg="#172033", height=72)
         header.grid(row=0, column=0, sticky="ew")
         header.grid_propagate(False)
-        tk.Label(header, text="抖音智能发布中心", bg="#172033", fg="#FFFFFF", font=("Microsoft YaHei UI", 17, "bold")).pack(side="left", padx=(22, 8), pady=18)
-        tk.Label(header, text=f"v{APP_VERSION} · 多浏览器顺序发布", bg="#172033", fg="#98A2B3", font=("Microsoft YaHei UI", 9)).pack(side="left", pady=24)
+        tk.Label(header, text="抖音智能发布中心", bg="#172033", fg="#FFFFFF", font=("Microsoft YaHei UI", 18, "bold")).pack(side="left", padx=(22, 8), pady=18)
+        tk.Label(header, text=f"v{APP_VERSION} · 多浏览器顺序发布", bg="#172033", fg="#D0D5DD", font=("Microsoft YaHei UI", 11, "bold")).pack(side="left", pady=24)
         tk.Button(header, text="检查更新", command=self.check_update_click, bg="#2563EB", fg="#FFFFFF", activebackground="#1D4ED8", activeforeground="#FFFFFF", relief="flat", padx=16, pady=7).pack(side="right", padx=20, pady=17)
         self.auth_button = tk.Button(
             header,
@@ -4495,8 +6073,8 @@ class App:
             pady=7,
         )
         self.auth_button.pack(side="right", padx=(4, 8), pady=17)
-        tk.Label(header, textvariable=self.auth_status_var, bg="#172033", fg="#A6F4C5", font=("Microsoft YaHei UI", 9, "bold")).pack(side="right", padx=(8, 6), pady=24)
-        tk.Label(header, textvariable=self.status_var, bg="#172033", fg="#D1FAE5", font=("Microsoft YaHei UI", 10, "bold")).pack(side="right", pady=24)
+        tk.Label(header, textvariable=self.auth_status_var, bg="#172033", fg="#6CE9A6", font=("Microsoft YaHei UI", 11, "bold")).pack(side="right", padx=(8, 6), pady=24)
+        tk.Label(header, textvariable=self.status_var, bg="#172033", fg="#D1FAE5", font=("Microsoft YaHei UI", 11, "bold")).pack(side="right", pady=24)
 
         notebook = ttk.Notebook(self.root)
         self.notebook = notebook
@@ -4514,7 +6092,17 @@ class App:
         self._build_runtime_panel(self.root)
         self.refresh_browser_tree()
         self.write_ui(f"{APP_NAME} 已启动。已加载 {len(self.browser_accounts)} 个浏览器配置。\n")
-        self.write_ui("任务按浏览器列表顺序执行；掉号账号会标记并跳过，全部浏览器处理后任务才结束。\n")
+        if self.debug_cleanup_result.get("cleaned"):
+            self.write_ui(
+                f"调试截图定期清理完成：本次已清理 {self.debug_cleanup_result.get('removed', 0)} 张旧截图。\n"
+            )
+        elif self.debug_cleanup_result.get("error"):
+            self.write_ui(f"调试截图定期清理失败：{self.debug_cleanup_result['error']}\n")
+        if parse_bool(self.cfg.get("rotate_accounts_each_post"), False):
+            batch = normalize_rotate_batch_size(self.cfg.get("rotate_batch_size", 1))
+            self.write_ui(f"当前为轮换发布：每个账号连续成功发布 {batch} 条后切换下一个；每个浏览器账号仅首次轮到时打开一次，后续直接复用，软件不主动关闭浏览器。\n")
+        else:
+            self.write_ui("任务按浏览器列表顺序执行；掉号账号会标记并跳过，全部浏览器处理后任务才结束。\n")
 
     def _build_publish_tab(self, parent):
         parent.grid_columnconfigure(0, weight=1)
@@ -4525,7 +6113,9 @@ class App:
             ("发布间隔最小秒", "publish_interval_min_seconds"), ("发布间隔最大秒", "publish_interval_max_seconds"),
             ("上传检测间隔秒", "upload_check_interval_seconds"), ("上传最大等待秒", "upload_max_wait_seconds"),
             ("话题识别等待秒", "topic_wait_seconds"), ("创作者中心等待秒", "creator_center_wait_seconds"),
-            ("失败重试次数", "retry_times"),
+            ("单步骤失败后重试次数", "retry_times"),
+            ("总体流程失败后重试次数", "overall_retry_times"),
+            ("今日上限切换等待秒", "daily_limit_switch_wait_seconds"),
         ]
         self._build_field_grid(waits, fields, columns=4)
 
@@ -4545,6 +6135,38 @@ class App:
             ttk.Checkbutton(options, text=text, variable=value).grid(
                 row=index // 3, column=index % 3, padx=12, pady=8, sticky="w"
             )
+
+        rotation_options = ttk.Frame(options)
+        rotation_options.grid(row=2, column=0, columnspan=3, padx=12, pady=(10, 4), sticky="w")
+        rotate_var = tk.BooleanVar(value=parse_bool(self.cfg.get("rotate_accounts_each_post"), False))
+        self.bool_vars["rotate_accounts_each_post"] = rotate_var
+        ttk.Checkbutton(
+            rotation_options,
+            text="轮换发布",
+            variable=rotate_var,
+        ).pack(side="left")
+        ttk.Label(
+            rotation_options, text="每个账号成功发布",
+            font=("Microsoft YaHei UI", 11, "bold"),
+        ).pack(side="left", padx=(18, 6))
+        rotate_batch_var = tk.StringVar(value=str(normalize_rotate_batch_size(self.cfg.get("rotate_batch_size", 1))))
+        self.vars["rotate_batch_size"] = rotate_batch_var
+        self.rotate_batch_spinbox = ttk.Spinbox(
+            rotation_options, from_=1, to=999,
+            textvariable=rotate_batch_var, width=6,
+        )
+        self.rotate_batch_spinbox.pack(side="left")
+        ttk.Label(
+            rotation_options,
+            text="条后切换下一个，循环直到各账号“发布条数”完成",
+            font=("Microsoft YaHei UI", 11, "bold"),
+        ).pack(side="left", padx=(6, 0))
+
+        def sync_rotation_batch_state(*_args):
+            self.rotate_batch_spinbox.configure(state="normal" if rotate_var.get() else "disabled")
+
+        rotate_var.trace_add("write", sync_rotation_batch_state)
+        sync_rotation_batch_state()
 
     def _build_browser_queue_card(self, parent):
         card, body = self._card(parent, "浏览器账号队列")
@@ -4582,7 +6204,7 @@ class App:
         self.browser_tree.tag_configure("warn", foreground="#B45309")
         self.browser_tree.tag_configure("error", foreground="#B42318")
         actions = ttk.Frame(body)
-        actions.pack(fill="x", pady=(10, 0))
+        actions.pack(fill="x", pady=(12, 0))
         for text, command in [
             ("添加", self.add_browser_account), ("复制", self.duplicate_browser_account),
             ("编辑", self.edit_browser_account),
@@ -4618,12 +6240,17 @@ class App:
         self.start_button = ttk.Button(controls, text="开始本轮发布", style="Accent.TButton", command=self.start)
         self.start_button.pack(side="left", padx=7)
         self.start_button.configure(state="disabled")
+        self.retry_failed_button = ttk.Button(
+            controls, text="重试勾选失败账号", command=self.retry_selected_failed_accounts,
+        )
+        self.retry_failed_button.pack(side="left", padx=7)
+        self.retry_failed_button.configure(state="disabled")
         self.pause_button = ttk.Button(controls, text="暂停 / 继续", command=self.toggle_pause)
         self.pause_button.pack(side="left", padx=7)
         ttk.Button(controls, text="停止任务", style="Danger.TButton", command=self.stop).pack(side="left", padx=7)
         ttk.Button(controls, text="重置发布进度", command=self.reset_state).pack(side="left", padx=7)
 
-        ttk.Label(runtime, textvariable=self.countdown_var, font=("Microsoft YaHei UI", 15, "bold"), foreground="#D4380D").grid(row=1, column=0, padx=(0, 18), pady=(0, 8), sticky="w")
+        ttk.Label(runtime, textvariable=self.countdown_var, font=("Microsoft YaHei UI", 16, "bold"), foreground="#D4380D").grid(row=1, column=0, padx=(0, 18), pady=(0, 8), sticky="w")
         ttk.Label(runtime, textvariable=self.countdown_reason_var, style="Muted.TLabel").grid(row=1, column=1, pady=(0, 8), sticky="w")
         ttk.Button(runtime, text="清空日志", command=lambda: self.logbox.delete("1.0", "end")).grid(row=1, column=2, pady=(0, 8), sticky="e")
         self.logbox = ScrolledText(runtime, height=7, font=("Consolas", 10), bg="#0F172A", fg="#D1FAE5", insertbackground="#FFFFFF", relief="flat", padx=10, pady=8)
@@ -4663,7 +6290,7 @@ class App:
             ttk.Checkbutton(days_frame, text=label, variable=value).pack(side="left", padx=(0, 16))
         time_frame = ttk.Frame(body)
         time_frame.pack(fill="x", pady=(14, 8))
-        ttk.Label(time_frame, text="启动时间", font=("Microsoft YaHei UI", 10, "bold")).pack(side="left")
+        ttk.Label(time_frame, text="启动时间", font=("Microsoft YaHei UI", 11, "bold")).pack(side="left")
         try:
             hour, minute = parse_clock_text(self.cfg.get("weekly_start_time", "09:00"))
         except Exception:
@@ -4671,10 +6298,10 @@ class App:
         self.weekly_hour_var = tk.StringVar(value=f"{hour:02d}")
         self.weekly_minute_var = tk.StringVar(value=f"{minute:02d}")
         ttk.Combobox(time_frame, textvariable=self.weekly_hour_var, values=[f"{i:02d}" for i in range(24)], width=6, state="readonly").pack(side="left", padx=(16, 4))
-        ttk.Label(time_frame, text=":", font=("Microsoft YaHei UI", 12, "bold")).pack(side="left")
+        ttk.Label(time_frame, text=":", font=("Microsoft YaHei UI", 13, "bold")).pack(side="left")
         ttk.Combobox(time_frame, textvariable=self.weekly_minute_var, values=[f"{i:02d}" for i in range(60)], width=6, state="readonly").pack(side="left", padx=4)
         ttk.Button(time_frame, text="保存自动启动", style="Accent.TButton", command=lambda: self.save_from_ui(show_message=True)).pack(side="left", padx=18)
-        ttk.Label(body, textvariable=self.next_schedule_var, foreground="#1D4ED8", font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", pady=(18, 6))
+        ttk.Label(body, textvariable=self.next_schedule_var, foreground="#1D4ED8", font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w", pady=(18, 6))
 
     def _build_system_tab(self, parent):
         parent.grid_columnconfigure(0, weight=1)
@@ -4688,7 +6315,7 @@ class App:
         self.add_row(body, row, "创作者中心地址", "creator_url")
         auth_card, auth_actions = self._card(parent, "统一授权账号")
         auth_card.grid(row=1, column=0, sticky="ew", pady=(0, 10))
-        ttk.Label(auth_actions, textvariable=self.auth_status_var, font=("Microsoft YaHei UI", 10, "bold"), foreground="#067647").pack(side="left", padx=(0, 18))
+        ttk.Label(auth_actions, textvariable=self.auth_status_var, font=("Microsoft YaHei UI", 11, "bold"), foreground="#067647").pack(side="left", padx=(0, 18))
         ttk.Button(auth_actions, text="登录 / 切换账号", command=lambda: self.show_authorization_login(switch_account=True)).pack(side="left", padx=6)
         ttk.Button(auth_actions, text="退出授权账号", command=self.logout_authorization).pack(side="left", padx=6)
 
@@ -4739,9 +6366,10 @@ class App:
             else "登录授权"
         )
         if hasattr(self, "start_button"):
-            self.start_button.configure(
-                state="normal" if self.auth_client.can_start_new_task else "disabled"
-            )
+            control_state = "normal" if self.auth_client.can_start_new_task else "disabled"
+            self.start_button.configure(state=control_state)
+            if hasattr(self, "retry_failed_button"):
+                self.retry_failed_button.configure(state=control_state)
 
     def authorization_button_click(self):
         self.show_authorization_login(
@@ -4780,7 +6408,7 @@ class App:
             pass
         body = ttk.Frame(window, padding=24)
         body.pack(fill="both", expand=True)
-        ttk.Label(body, text="统一软件授权", font=("Microsoft YaHei UI", 17, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
+        ttk.Label(body, text="统一软件授权", font=("Microsoft YaHei UI", 18, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(body, text="软件账号", width=11, anchor="e").grid(row=1, column=0, padx=(0, 10), pady=(20, 7), sticky="e")
         try:
             saved_login = self.login_preference_store.load(AUTH_PRODUCT_CODE) or {}
@@ -5161,9 +6789,12 @@ class App:
         if path:
             self.vars[key].set(path)
 
-    def collect_cfg(self):
+    def collect_cfg(self, allow_no_enabled=False):
         cfg = self.cfg.copy()
-        int_keys = {"retry_times"}
+        int_keys = {
+            "retry_times", "overall_retry_times",
+            "rotate_batch_size", "daily_limit_switch_wait_seconds",
+        }
         float_keys = {
             "wait_min_seconds", "wait_max_seconds", "publish_interval_min_seconds",
             "publish_interval_max_seconds", "upload_check_interval_seconds",
@@ -5179,6 +6810,12 @@ class App:
                 cfg[key] = text_value
         for key, value in self.bool_vars.items():
             cfg[key] = bool(value.get())
+        cfg["rotate_batch_size"] = normalize_rotate_batch_size(cfg.get("rotate_batch_size", 1))
+        cfg["retry_times"] = normalize_retry_count(cfg.get("retry_times", 3), 3)
+        cfg["overall_retry_times"] = normalize_retry_count(cfg.get("overall_retry_times", 1), 1)
+        cfg["daily_limit_switch_wait_seconds"] = normalize_daily_limit_switch_wait_seconds(
+            cfg.get("daily_limit_switch_wait_seconds", 10)
+        )
         cfg["weekly_start_days"] = [index for index, value in enumerate(self.weekly_day_vars) if value.get()]
         cfg["weekly_start_time"] = f"{self.weekly_hour_var.get()}:{self.weekly_minute_var.get()}"
         parse_clock_text(cfg["weekly_start_time"])
@@ -5186,9 +6823,10 @@ class App:
             raise ValueError("启用自动启动时，至少选择一个星期。")
         cfg["browser_accounts"] = [normalize_browser_account(account, index, cfg) for index, account in enumerate(self.browser_accounts)]
         enabled = [account for account in cfg["browser_accounts"] if account.get("enabled", True)]
-        if not enabled:
+        if not enabled and not allow_no_enabled:
             raise ValueError("至少启用一个浏览器账号。")
-        validate_browser_queue_ports(enabled)
+        if enabled:
+            validate_browser_queue_ports(enabled)
         for account in enabled:
             if not account.get("browser_path"):
                 raise ValueError(f"浏览器账号“{account.get('name')}”未设置快捷方式或 EXE。")
@@ -5202,7 +6840,10 @@ class App:
                 raise ValueError(f"队列项“{account['name']}”内容检查失败：{exc}") from exc
             if account_cfg.get("use_schedule", True):
                 build_slots(account_cfg, log_result=False)
-        first = enabled[0]
+        queue_rows = enabled or cfg["browser_accounts"]
+        if not queue_rows:
+            raise ValueError("浏览器账号队列不能为空。")
+        first = queue_rows[0]
         cfg["browser_path"] = first["browser_path"]
         cfg["browser_user_data_dir"] = first.get("browser_user_data_dir", "")
         cfg["browser_profile_directory"] = first.get("browser_profile_directory", "")
@@ -5213,13 +6854,18 @@ class App:
         cfg["platform_music_only"] = True
         return cfg
 
-    def save_from_ui(self, show_message=False):
+    def save_from_ui(self, show_message=False, allow_no_enabled=False):
         try:
-            self.cfg = self.collect_cfg()
+            self.cfg = self.collect_cfg(allow_no_enabled=allow_no_enabled)
             self.browser_accounts = browser_accounts_from_config(self.cfg)
             save_config(self.cfg)
             self.refresh_browser_tree()
-            self.write_ui("配置已保存；下一次任务会使用当前浏览器顺序和发布配额。\n")
+            mode_text = (
+                f"每账号连续发 {normalize_rotate_batch_size(self.cfg.get('rotate_batch_size', 1))} 条后轮换"
+                if parse_bool(self.cfg.get("rotate_accounts_each_post"), False)
+                else "单账号完成配额后再切换"
+            )
+            self.write_ui(f"配置已保存；下一次任务会使用当前浏览器顺序和发布配额。当前模式：{mode_text}。\n")
             if show_message:
                 messagebox.showinfo("保存成功", "配置已保存。")
             return True
@@ -5240,7 +6886,8 @@ class App:
         for index, account in enumerate(self.browser_accounts, start=1):
             account_id = str(account["id"])
             status = self.browser_statuses.get(account_id, "等待任务")
-            tag = "error" if any(word in status for word in ("掉号", "失败", "错误")) else ("ok" if any(word in status for word in ("完成", "就绪")) else "warn" if "检查" in status else "")
+            published_count = int(self.browser_success_counts.get(account_id, 0) or 0)
+            tag = "error" if any(word in status for word in ("掉号", "失败", "错误")) else ("ok" if any(word in status for word in ("完成", "就绪")) else "warn" if any(word in status for word in ("检查", "上限")) else "")
             schedule_text = "立即发布"
             if parse_bool(account.get("use_schedule"), True):
                 start_date = str(account.get("publish_start_date") or "")
@@ -5253,7 +6900,7 @@ class App:
             self.browser_tree.insert(
                 "", "end", iid=account_id,
                 values=(
-                    "☑" if account.get("enabled", True) else "☐",
+                    "✓" if account.get("enabled", True) else "□",
                     index,
                     account["name"],
                     account["browser_path"],
@@ -5261,6 +6908,7 @@ class App:
                     schedule_text,
                     account["cdp_port"],
                     account["posts_per_run"],
+                    published_count,
                     status,
                 ),
                 tags=(tag,) if tag else (),
@@ -5346,7 +6994,13 @@ class App:
 
     def ensure_account_editable(self):
         if self.proc and self.proc.poll() is None:
-            messagebox.showwarning("任务运行中", "请先停止当前任务，再修改浏览器账号队列。")
+            if self.proc_mode == "worker" and self.is_paused:
+                return True
+            messagebox.showwarning(
+                "任务运行中",
+                "运行中不能直接修改浏览器账号队列。请先点击“暂停 / 继续”进入暂停状态，"
+                "暂停后即可添加、编辑、删除、勾选或调整队列顺序。",
+            )
             return False
         return True
 
@@ -5623,15 +7277,23 @@ class App:
                     "launching": "正在启动", "checking": "检查登录", "ready": "账号就绪",
                     "publishing": "正在发布", "done": "配额完成", "logged_out": "掉号已跳过",
                     "error": "失败已跳过", "waiting": "等待任务",
+                    "daily_limit": "今日上限已跳过",
                 }
                 account_id = str(payload.get("id", ""))
                 raw_status = str(payload.get("status", ""))
+                message = str(payload.get("message", "")).strip()
                 status = labels.get(str(payload.get("status", "")), str(payload.get("status", "")))
                 success_count = int(payload.get("success_count", 0) or 0)
                 quota = int(payload.get("quota", 0) or 0)
                 if quota and payload.get("status") in {"publishing", "done"}:
                     status += f" {success_count}/{quota}"
+                if message and raw_status in {"error", "logged_out", "daily_limit"}:
+                    status += f" · {message}"
                 self.browser_statuses[account_id] = status
+                self.browser_success_counts[account_id] = max(
+                    success_count,
+                    int(self.browser_success_counts.get(account_id, 0) or 0),
+                )
                 self.telemetry_success_by_account[account_id] = max(
                     success_count,
                     int(self.telemetry_success_by_account.get(account_id, 0) or 0),
@@ -5639,7 +7301,6 @@ class App:
                 if raw_status in {"error", "logged_out"}:
                     self.telemetry_failed_accounts.add(account_id or f"unknown-{len(self.telemetry_failed_accounts)}")
                 self.refresh_browser_tree()
-                message = str(payload.get("message", ""))
                 if payload.get("name"):
                     self.status_var.set(f"状态：{payload.get('name')} · {status}")
                 if message:
@@ -5799,8 +7460,17 @@ class App:
         clear_pause_flags_for_queue(
             self.cfg, browser_accounts_from_config(self.cfg, enabled_only=True)
         )
+        # 未点击“重置发布进度”时，开始/重启任务都继续显示并使用上一轮累计进度。
+        self.browser_statuses = {}
+        self.browser_success_counts = {}
+        self.restore_browser_runtime_state()
         for account in self.browser_accounts:
-            self.browser_statuses[account["id"]] = "等待任务" if account.get("enabled", True) else "未启用"
+            account_id = str(account["id"])
+            if not account.get("enabled", True):
+                self.browser_statuses[account_id] = "未启用"
+            else:
+                self.browser_statuses.setdefault(account_id, "等待任务")
+                self.browser_success_counts.setdefault(account_id, 0)
         self.refresh_browser_tree()
         cmd = application_command("--worker", CONFIG_PATH)
         self.write_ui(("自动启动已触发。\n" if scheduled else "开始本轮发布。\n") + "已加载最新配置，浏览器将按列表顺序执行。\n")
@@ -5809,34 +7479,85 @@ class App:
         self.run_subprocess(cmd, mode="worker")
         return True
 
+    def retry_selected_failed_accounts(self):
+        """重新执行已勾选且上次失败的账号；复用原队列轮次与累计进度。"""
+        if self.proc and self.proc.poll() is None:
+            messagebox.showwarning("任务运行中", "请先等待当前任务结束，或暂停/停止后再重试失败账号。")
+            return False
+        if not self.save_from_ui(show_message=False):
+            return False
+
+        queue_state = read_state(self.cfg)
+        queue_run_id = str(queue_state.get("queue_run_id") or "").strip()
+        failed_accounts = []
+        for account in browser_accounts_from_config(self.cfg, enabled_only=True):
+            account_cfg = config_for_browser_account(self.cfg, account)
+            account_state = read_state(account_cfg)
+            if queue_run_id and str(account_state.get("queue_run_id") or "") != queue_run_id:
+                continue
+            if str(account_state.get("last_account_outcome") or "") in {"error", "logged_out", "daily_limit"}:
+                failed_accounts.append(account)
+
+        if not failed_accounts:
+            messagebox.showinfo("没有可重试账号", "当前勾选的账号中没有保存的失败、掉号或今日上限状态。")
+            return False
+
+        names = "、".join(str(account.get("name") or "未命名账号") for account in failed_accounts)
+        self.write_ui(
+            f"准备重试勾选的失败账号：{names}。原发布进度、当前图片和文案均继续保留。\n"
+        )
+        return self.start(scheduled=False)
+
     def toggle_pause(self):
         if not (self.proc and self.proc.poll() is None and self.proc_mode == "worker"):
             messagebox.showinfo("当前无任务", "当前没有正在运行的发布任务。")
             return
-        if not self.save_from_ui(show_message=False):
+        # 暂停期间允许把全部账号取消勾选；继续后父调度器会读取空启用队列并安全结束本轮。
+        was_paused = bool(self.is_paused or any(Path(flag).exists() for flag in self.active_pause_flags))
+        if not self.save_from_ui(show_message=False, allow_no_enabled=was_paused):
             return
-        flags = pause_flag_paths_for_queue(
+        current_flags = pause_flag_paths_for_queue(
             self.cfg, browser_accounts_from_config(self.cfg, enabled_only=True)
         )
-        if any(flag.exists() for flag in flags):
-            clear_pause_flags_for_queue(
-                self.cfg, browser_accounts_from_config(self.cfg, enabled_only=True)
-            )
+
+        # 是否已暂停以 GUI 状态 + 已保存 flag 为准。队列在暂停期间可能被删除/改名/重排，
+        # 不能只根据“当前队列”重新算 flag，否则旧账号 worker 的暂停文件可能永远残留。
+        if was_paused:
+            all_flags = []
+            seen = set()
+            for flag in list(self.active_pause_flags) + list(current_flags):
+                path = Path(flag)
+                key = os.path.normcase(os.path.abspath(str(path)))
+                if key in seen:
+                    continue
+                seen.add(key)
+                all_flags.append(path)
+            for flag in all_flags:
+                try:
+                    if flag.exists():
+                        flag.unlink()
+                except OSError:
+                    pass
+            self.active_pause_flags = []
             self.is_paused = False
             self.status_var.set("状态：运行中")
-            self.countdown_reason_var.set("等待工作进程继续")
-            self.write_ui("已继续脚本。\n")
+            self.countdown_reason_var.set("等待工作进程继续；暂停期间的队列修改已保存")
+            self.write_ui("已继续脚本；暂停期间的浏览器队列修改已保存，后续未启动队列项会读取最新配置。\n")
         else:
-            for flag in flags:
+            created_flags = []
+            for flag in current_flags:
+                flag = Path(flag)
                 flag.parent.mkdir(parents=True, exist_ok=True)
                 flag.write_text("paused", encoding="utf-8")
+                created_flags.append(flag)
+            self.active_pause_flags = created_flags
             self.is_paused = True
             self.status_var.set("状态：已暂停")
             current = self.countdown_var.get()
             if current.startswith("倒计时："):
                 self.countdown_var.set(current.replace("倒计时：", "暂停于：", 1))
-            self.countdown_reason_var.set("暂停中，点击“暂停 / 继续”恢复")
-            self.write_ui("已请求暂停；当前安全步骤结束后生效。\n")
+            self.countdown_reason_var.set("暂停中：现在可以修改浏览器账号队列")
+            self.write_ui("已请求暂停；当前安全步骤结束后生效。暂停期间可修改浏览器队列，点击继续时自动保存。\n")
 
     def stop(self):
         was_worker = bool(self.proc and self.proc.poll() is None and self.proc_mode == "worker")
@@ -5865,6 +7586,14 @@ class App:
             self.proc = None
             self.proc_mode = ""
             clear_pause_flags_for_queue(self.cfg, self.browser_accounts)
+            for flag in list(self.active_pause_flags):
+                try:
+                    path = Path(flag)
+                    if path.exists():
+                        path.unlink()
+                except OSError:
+                    pass
+            self.active_pause_flags = []
             if was_worker:
                 self.finish_task_telemetry("stopped")
             self.reset_countdown_display("状态：已停止", "任务已停止")
@@ -5959,7 +7688,7 @@ def run_gui():
 
 def run_self_test():
     """不连接浏览器、不发布内容的内置冒烟测试。"""
-    assert APP_VERSION == "3.0.1"
+    assert APP_VERSION == "3.0.2"
     assert APP_NAME.endswith(APP_VERSION)
     empty_release = platform_release_to_manifest({"version": {}})
     assert empty_release["latest_version"] == ""
@@ -6178,6 +7907,89 @@ def run_self_test():
     assert account_run_resume_progress(
         {"queue_run_id": "queue_old", "run_progress": 64}, "queue_new", 75
     ) == 0
+    assert normalize_rotate_batch_size(3) == 3
+    assert normalize_rotate_batch_size(0) == 1
+    assert normalize_rotate_batch_size("bad") == 1
+    assert rotation_batch_target(12, 0, 5) == 5
+    assert rotation_batch_target(12, 5, 5) == 5
+    assert rotation_batch_target(12, 10, 5) == 2
+    assert normalize_daily_limit_switch_wait_seconds("15") == 15
+    assert normalize_daily_limit_switch_wait_seconds("-3") == 0
+    assert text_indicates_daily_publish_limit("抱歉，今天投稿次数已达到上限，请明天再试")
+    assert text_indicates_daily_publish_limit("抱歉，今天投稿次数已达到上限\n请明天再试")
+    retry_cfg = {
+        "retry_times": 2,
+        "overall_retry_times": 1,
+        "wait_min_seconds": 0.01,
+        "wait_max_seconds": 0.01,
+    }
+    retry_calls = {"step": 0, "overall": 0}
+
+    def eventually_succeeds():
+        retry_calls["step"] += 1
+        if retry_calls["step"] < 3:
+            raise RuntimeError("示例步骤暂未完成")
+        return "ok"
+
+    assert run_publish_workflow(
+        retry_cfg,
+        lambda _attempt, _total: run_publish_step(retry_cfg, None, "示例步骤", eventually_succeeds),
+        lambda _attempt, _error: retry_calls.__setitem__("overall", retry_calls["overall"] + 1),
+    ) == "ok"
+    assert retry_calls == {"step": 3, "overall": 0}
+
+    exhausted_calls = {"step": 0, "overall": 0}
+
+    def always_fails():
+        exhausted_calls["step"] += 1
+        raise RuntimeError("持续失败根因")
+
+    try:
+        run_publish_workflow(
+            retry_cfg,
+            lambda _attempt, _total: run_publish_step(retry_cfg, None, "音乐选择", always_fails),
+            lambda _attempt, _error: exhausted_calls.__setitem__("overall", exhausted_calls["overall"] + 1),
+        )
+        raise AssertionError("两级重试耗尽后必须抛出 PublishWorkflowFailedError")
+    except PublishWorkflowFailedError as exc:
+        assert exhausted_calls == {"step": 6, "overall": 1}
+        assert exc.step_name == "音乐选择"
+        assert "持续失败根因" in concise_publish_failure(exc)
+
+    daily_limit_calls = {"count": 0}
+
+    def raises_daily_limit():
+        daily_limit_calls["count"] += 1
+        raise DailyPublishLimitError("今天投稿次数已达到上限")
+
+    try:
+        run_publish_workflow(
+            retry_cfg,
+            lambda _attempt, _total: run_publish_step(retry_cfg, None, "提交发布", raises_daily_limit),
+        )
+        raise AssertionError("今日投稿上限必须直接向上抛出")
+    except DailyPublishLimitError:
+        assert daily_limit_calls["count"] == 1
+
+    with tempfile.TemporaryDirectory(prefix="douyin_debug_cleanup_selftest_") as temp_dir:
+        debug_dir = Path(temp_dir) / "screenshots"
+        debug_dir.mkdir()
+        generated = debug_dir / "20260810_120000_step_failed.png"
+        unrelated = debug_dir / "keep.png"
+        nested_dir = debug_dir / "nested"
+        nested_dir.mkdir()
+        nested_generated = nested_dir / "20260810_120001_nested.png"
+        generated.write_bytes(b"generated")
+        unrelated.write_bytes(b"unrelated")
+        nested_generated.write_bytes(b"nested")
+        cleanup_state = Path(temp_dir) / "cleanup_state.json"
+        cleanup_cfg = {"debug_dir": str(debug_dir)}
+        assert maintain_debug_screenshots(cleanup_cfg, cleanup_state)["cleaned"] is False
+        assert maintain_debug_screenshots(cleanup_cfg, cleanup_state)["cleaned"] is False
+        cleanup_result = maintain_debug_screenshots(cleanup_cfg, cleanup_state)
+        assert cleanup_result["cleaned"] is True and cleanup_result["removed"] == 1
+        assert not generated.exists() and unrelated.exists() and nested_generated.exists()
+    assert rotation_batch_target(12, 12, 5) == 0
     assert normalize_browser_queue_column_widths({"path": 333})["path"] == 333
     assert normalize_browser_queue_column_widths({"path": 1})["path"] == BROWSER_QUEUE_MIN_WIDTHS["path"]
     with tempfile.TemporaryDirectory(prefix="douyin_resume_selftest_") as temp_dir:
@@ -6210,6 +8022,11 @@ def run_self_test():
         assert read_state(queue_cfg)["queue_run_active"] is False
         next_run_id, next_completed, resumed = prepare_queue_run(queue_cfg, queue_accounts)
         assert resumed is False and next_run_id != queue_run_id and next_completed == set()
+    visible_cmd = build_browser_launch_command("chrome.exe", "--foo", 9222, "https://example.com", headless=False)
+    hidden_cmd = build_browser_launch_command("chrome.exe", "--foo", 9222, "https://example.com", headless=True)
+    assert "--headless" not in visible_cmd
+    assert "--headless=new" in hidden_cmd and "--window-size=1440,1100" in hidden_cmd
+
     schedule_cfg = {
         "weekly_start_enabled": True,
         "weekly_start_days": [0],
@@ -6231,15 +8048,25 @@ def run_self_test():
         assert len({id(canvas) for canvas in gui.tab_scroll_canvases}) == 4
         assert not root.bind_all("<MouseWheel>")
         assert gui.start_button.master is gui.task_controls_frame
+        assert gui.retry_failed_button.master is gui.task_controls_frame
         assert [gui.notebook.tab(index, "text") for index in range(gui.notebook.index("end"))] == [
             "发布中心", "账号与排期", "自动启动", "系统与日志"
         ]
         assert "retry_times" in gui.vars
+        assert "overall_retry_times" in gui.vars
         assert "image_dir" in gui.vars
         assert not {"excel_path", "publish_start_date", "publish_end_date", "max_posts_this_run"} & set(gui.vars)
         assert "use_schedule" not in gui.bool_vars
+        assert "rotate_accounts_each_post" in gui.bool_vars
+        assert "rotate_batch_size" in gui.vars
+        expected_rotate_state = "normal" if gui.bool_vars["rotate_accounts_each_post"].get() else "disabled"
+        assert str(gui.rotate_batch_spinbox.cget("state")) == expected_rotate_state
+        gui.bool_vars["rotate_accounts_each_post"].set(False)
+        root.update_idletasks()
+        assert str(gui.rotate_batch_spinbox.cget("state")) == "disabled"
         assert int(gui.browser_tree.cget("height")) == 8
         assert tuple(gui.browser_tree.cget("columns"))[0] == "publish"
+        assert "published" in tuple(gui.browser_tree.cget("columns"))
         assert "image" not in tuple(gui.browser_tree.cget("columns"))
         assert all(not bool(gui.browser_tree.column(key, "stretch")) for key in BROWSER_QUEUE_COLUMNS)
         saved_width_configs = []
@@ -6253,6 +8080,18 @@ def run_self_test():
         finally:
             globals()["save_config"] = old_save_config
         first_account_id = gui.browser_accounts[0]["id"]
+        gui.handle_worker_event(
+            BROWSER_STATUS_EVENT_PREFIX + json.dumps({
+                "id": first_account_id,
+                "name": gui.browser_accounts[0]["name"],
+                "status": "error",
+                "message": "音乐选择失败：未检测到已使用音乐；进度 2/5 已保留",
+                "success_count": 2,
+                "quota": 5,
+            }, ensure_ascii=False)
+        )
+        assert "音乐选择失败" in gui.browser_statuses[first_account_id]
+        assert gui.browser_success_counts[first_account_id] >= 2
         first_enabled = parse_bool(gui.browser_accounts[0].get("enabled"), True)
         assert gui.toggle_browser_account_enabled(first_account_id) is True
         assert parse_bool(gui.browser_accounts[0].get("enabled"), True) is not first_enabled
@@ -6260,6 +8099,8 @@ def run_self_test():
         assert len(browser_accounts_from_config({**gui.cfg, "browser_accounts": gui.browser_accounts}, enabled_only=True)) == len(gui.browser_accounts)
         assert gui.set_all_browser_accounts_enabled(False) is True
         assert browser_accounts_from_config({**gui.cfg, "browser_accounts": gui.browser_accounts}, enabled_only=True) == []
+        disabled_cfg = gui.collect_cfg(allow_no_enabled=True)
+        assert browser_accounts_from_config(disabled_cfg, enabled_only=True) == []
         gui.set_all_browser_accounts_enabled(True)
         with tempfile.TemporaryDirectory(prefix="douyin_queue_selftest_") as temp_dir:
             queue_path = Path(temp_dir) / "queue.xlsx"

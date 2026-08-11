@@ -1,6 +1,6 @@
 # 抖音智能发布中心
 
-当前正式版：`v3.0.4`（定时时间输入与提交门禁修复）
+当前正式版：`v3.0.5`（音乐抽屉、首次 CDP 连接与队列状态修复）
 
 Windows 桌面端抖音图文自动发布工具。当前版本已接入统一授权后台，支持多浏览器账号按队列发布、账号专属内容、定时启动、运行遥测和安全在线更新。视频发布与 AI 内容生成属于后续版本范围，本版不包含这两项。
 
@@ -45,10 +45,9 @@ Windows 桌面端抖音图文自动发布工具。当前版本已接入统一授
 客户端按以下顺序检查：
 
 1. 已授权时优先读取统一管理后台 `publisher.douyin` 的稳定通道策略。
-2. 后台不可达、未配置版本或返回的新版本策略不完整时，回退 GitHub Raw 根目录 `version.json`。
-3. GitHub Raw 不可用时，使用 jsDelivr 备用清单。
+2. 后台不可达、未配置版本或返回的新版本策略不完整时，回退统一云服务器静态清单。
 
-当前更新包下载地址使用 GitHub Releases。所有更新都必须通过 SHA256 校验，更新器还会检查 ZIP 路径安全，并保留用户配置后再无黑框重启。
+更新清单和更新包均使用 `https://api.xibao-zg.top/updates/publisher.douyin/` 云服务器通道；GitHub 只备份源码，不再作为客户端更新下载源。所有更新都必须通过 SHA256 校验，更新器还会检查 ZIP 路径安全，并保留用户配置后再无黑框重启。
 
 ## 构建
 
@@ -60,8 +59,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build_release.ps1
 
 构建结果：
 
-- `release/DouyinPublisher_Setup_v3.0.4.exe`
-- `packages/DouyinPublisher_Update_v3.0.4.zip`
+- `release/DouyinPublisher_Setup_v3.0.5.exe`
+- `packages/DouyinPublisher_Update_v3.0.5.zip`
 
 构建脚本会把依赖冻结到安装目录，并在成功后清理临时 `build`、`.spec`、`__pycache__` 和 `.pyc`。
 

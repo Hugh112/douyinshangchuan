@@ -111,7 +111,7 @@ CONFIG_PATH = APP_DATA_DIR / "douyin_gui_config.json"
 AUTH_TOKEN_PATH = APP_DATA_DIR / "authorization.bin"
 AUTH_LOGIN_PREFERENCES_PATH = APP_DATA_DIR / "login_preferences.bin"
 DEBUG_SCREENSHOT_CLEANUP_STATE_PATH = APP_DATA_DIR / "debug_screenshot_cleanup.json"
-APP_VERSION = "3.0.4"
+APP_VERSION = "3.0.5"
 APP_NAME = f"抖音智能发布中心 v{APP_VERSION}"
 LOGO_ICO = RESOURCE_DIR / "assets" / "app_logo.ico"
 LOGO_PNG = RESOURCE_DIR / "assets" / "app_logo.png"
@@ -126,11 +126,10 @@ AUTH_RELEASE_CHANNEL = "stable"
 AUTH_HEARTBEAT_SECONDS = 60
 
 # 更新顺序：已授权时优先读取统一后台；后台不可达或未返回有效策略时，
-# 回退 GitHub raw，并以 jsDelivr 作为最后备用。HTTP 清单请求均追加防缓存参数。
-UPDATE_MANIFEST_URL = "https://raw.githubusercontent.com/Hugh112/douyinshangchuan/main/version.json"
-UPDATE_MANIFEST_FALLBACK_URLS = [
-    "https://cdn.jsdelivr.net/gh/Hugh112/douyinshangchuan@main/version.json",
-]
+# 回退统一云服务器的静态清单。客户端不再依赖 GitHub / jsDelivr 下载更新包。
+# HTTP 清单请求均追加防缓存参数。
+UPDATE_MANIFEST_URL = "https://api.xibao-zg.top/updates/publisher.douyin/stable/manifest.json"
+UPDATE_MANIFEST_FALLBACK_URLS = []
 UPDATE_TIMEOUT_SECONDS = 12
 PRESERVE_UPDATE_PATHS = [
     "app/douyin_gui_config.json",  # 兼容旧版首次迁移
@@ -192,7 +191,7 @@ def platform_release_to_manifest(policy):
 
 
 def fetch_update_manifest(auth_client=None):
-    """统一后台优先；未登录或后台不可达时回退 GitHub raw，再回退 jsDelivr。"""
+    """统一后台优先；未登录或后台不可达时回退统一云服务器静态清单。"""
     errors = []
     if auth_client is not None and auth_client.state == STATE_AUTHORIZED:
         try:
@@ -219,7 +218,7 @@ def fetch_update_manifest(auth_client=None):
             manifest = json.loads(data)
             if not isinstance(manifest, dict):
                 raise ValueError("版本配置文件格式不正确")
-            manifest["source"] = "github-raw" if "raw.githubusercontent.com" in url else "jsdelivr"
+            manifest["source"] = "unified-cloud"
             return manifest
         except Exception as e:
             last_err = e
@@ -1076,7 +1075,31 @@ def open_browser_with_cdp(cfg, force_new=False):
         wlog(f"打开浏览器：{target}")
     proc = subprocess.Popen(cmd, shell=True, **hidden_subprocess_kwargs())
     if not wait_cdp(port, 45):
-        raise RuntimeError("浏览器已尝试启动，但无法连接调试端口。请检查用户目录是否被其它 Chrome 占用，或勾选启动前关闭Chrome残留。")
+        # 部分电脑首次启动浏览器时会进行 Profile 检查、扩展加载或安全扫描，
+        # 进程已经起来但 CDP 端口会晚几十秒才开始监听。旧逻辑在 45 秒时直接失败，
+        # 留下的浏览器随后完成启动，因此同一账号第二轮又能正常连接。
+        # 这里只延长目标端口对应进程的等待，不关闭或干预用户的其它浏览器。
+        matching_pids = find_chrome_pids_for_cdp(port)
+        if matching_pids:
+            wlog(
+                f"浏览器进程已经启动，但调试端口 {port} 尚未就绪；"
+                "判定为首次慢启动，继续等待最多 35 秒。"
+            )
+            if not wait_cdp(port, 35):
+                raise RuntimeError(
+                    f"浏览器进程已启动，但调试端口 {port} 在延长等待后仍不可用。"
+                    "请确认该快捷方式的用户目录没有被另一个未启用调试端口的浏览器实例占用。"
+                )
+        else:
+            # 启动命令没有留下目标端口进程时，只重试启动动作一次；
+            # 这是浏览器启动步骤重试，不会重跑图片、文案或发布流程。
+            wlog(f"首次启动后未检测到调试端口 {port} 对应进程，正在重试浏览器启动步骤。")
+            proc = subprocess.Popen(cmd, shell=True, **hidden_subprocess_kwargs())
+            if not wait_cdp(port, 45):
+                raise RuntimeError(
+                    f"浏览器启动步骤已重试，但仍无法连接调试端口 {port}。"
+                    "请检查快捷方式目标、用户目录占用或安全软件拦截记录。"
+                )
     return {
         "launched": True,
         "process": proc,
@@ -1117,6 +1140,15 @@ def _nonnegative_state_int(value, default=0):
         return max(0, int(value or 0))
     except Exception:
         return max(0, int(default or 0))
+
+
+def browser_status_at_run_start(enabled, progress, quota):
+    """开始或重试任务时保留数量，但清除上一轮失败文案。"""
+    if not parse_bool(enabled, True):
+        return "未启用"
+    progress = _nonnegative_state_int(progress, 0)
+    quota = max(1, _nonnegative_state_int(quota, 1))
+    return f"配额完成 {progress}/{quota}" if progress >= quota else "等待任务"
 
 
 def account_run_resume_progress(state, queue_run_id, quota):
@@ -2960,7 +2992,7 @@ def _legacy_platform_music_panel_opened(page):
 
 
 def music_panel_info(page):
-    """按 role、aria/data 属性和模块内容识别音乐面板，不把屏幕坐标作为唯一条件。"""
+    """识别音乐面板外壳与列表加载状态；加载中的面板也算已打开。"""
     try:
         return page.evaluate(r"""
         () => {
@@ -2980,14 +3012,18 @@ def music_panel_info(page):
           const candidates = [];
           for (const el of nodes) {
             const text = txt(el);
-            if (!text.includes('选择音乐') || text.length > 3000) continue;
-            if (!(text.includes('使用') || text.includes('热门') || text.includes('推荐') || text.includes('搜索音乐'))) continue;
+            if (text.length > 3000) continue;
             const r = el.getBoundingClientRect();
             if (r.width < 260 || r.height < 180) continue;
             const role = el.getAttribute('role') || '';
             const data = (el.getAttribute('data-e2e') || '') + (el.getAttribute('data-testid') || '');
             const position = getComputedStyle(el).position;
             const semanticPanel = role === 'dialog' || el.getAttribute('aria-modal') === 'true' || /music/i.test(data);
+            const hasMusicTitle = text.includes('选择音乐') || text.includes('音乐库') || text.includes('添加音乐');
+            const listReady = text.includes('使用') || text.includes('热门') || text.includes('推荐') ||
+                              text.includes('搜索音乐') || text.includes('原创榜');
+            const loading = text.includes('加载') || text.includes('暂无') || text.includes('重试');
+            if (!hasMusicTitle && !(semanticPanel && (listReady || loading))) continue;
             if (!semanticPanel && !['fixed','absolute','sticky'].includes(position) && r.width > vw * 0.65) continue;
             if (!semanticPanel && (r.width > vw * 0.82 || r.height > vh * 1.35 || r.top < -50)) continue;
             if (text.includes('基础信息') && text.includes('发布设置')) continue;
@@ -3001,13 +3037,14 @@ def music_panel_info(page):
             if (el.querySelector('button,[role="button"]')) score += 100;
             score += Math.min(300, el.querySelectorAll('li,[role="listitem"],img').length * 10);
             score -= Math.abs(r.width * r.height - 350000) / 10000;
-            candidates.push({el, score, text, r});
+            candidates.push({el, score, text, r, listReady, loading});
           }
           candidates.sort((a,b) => b.score - a.score);
           const panel = candidates[0];
           if (!panel) return {opened:false, text:'', candidates:0};
           return {
-            opened:true, text:panel.text.slice(0,500), candidates:candidates.length,
+            opened:true, listReady:panel.listReady, loading:panel.loading,
+            text:panel.text.slice(0,500), candidates:candidates.length,
             role:panel.el.getAttribute('role') || '',
             data:(panel.el.getAttribute('data-e2e') || panel.el.getAttribute('data-testid') || ''),
             x:panel.r.left, y:panel.r.top, width:panel.r.width, height:panel.r.height
@@ -3228,11 +3265,11 @@ def open_music_panel(cfg, page):
             pass
 
     for item in semantic_candidates:
-        if click_locator_with_fallback(page, item, "打开音乐面板") and wait_music_panel_open(page, 3):
+        if click_locator_with_fallback(page, item, "打开音乐面板") and wait_music_panel_open(page, 6):
             wlog("平台音乐面板已打开。")
             return True
 
-    # DOM 模块兜底：定位含添加提示的最小音乐行，使用原生 click。
+    # DOM 模块兜底：定位编辑区内含添加提示的最小音乐行，优先点击其最右侧操作控件。
     try:
         result = page.evaluate("""
         () => {
@@ -3241,34 +3278,50 @@ def open_music_panel(cfg, page):
             return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
           }
           function txt(el){ return ((el.innerText || el.textContent || '') + '').trim(); }
-          const nodes = [...document.querySelectorAll('button,[role="button"],div,section,li')].filter(visible);
+          const nodes = [...document.querySelectorAll('div,section,li')].filter(visible);
           const rows = nodes.filter(el => {
             const t = txt(el); const r = el.getBoundingClientRect();
-            return t && t.length < 500 && r.width > 220 && r.height > 28 && r.height < 220 &&
-              (t.includes('点击添加合适作品风格音乐') || t === '选择音乐');
+            const inDialog = !!el.closest('[role="dialog"],[aria-modal="true"],[data-e2e*="music" i],[data-testid*="music" i]');
+            return !inDialog && t && t.length < 500 && r.width > 220 && r.height > 28 && r.height < 180 &&
+              (t.includes('点击添加合适作品风格音乐') || t.includes('选择音乐'));
           }).sort((a,b) => (a.getBoundingClientRect().width*a.getBoundingClientRect().height) -
                             (b.getBoundingClientRect().width*b.getBoundingClientRect().height));
           const row = rows[0];
           if (!row) return {ok:false};
           row.scrollIntoView({block:'center', inline:'nearest'});
-          const clickable = [...row.querySelectorAll('button,[role="button"],a,span,div')].filter(visible)
-            .find(el => txt(el).includes('选择音乐'));
-          (clickable || row).click();
-          return {ok:true, text:txt(row).slice(0,120)};
+          const rowRect = row.getBoundingClientRect();
+          const clickables = [...row.querySelectorAll('button,[role="button"],a,[tabindex],span,div')]
+            .filter(visible).map(el => ({el, r:el.getBoundingClientRect(), text:txt(el)}))
+            .filter(item => item.r.left >= rowRect.left + rowRect.width * 0.45 &&
+                            (item.text.includes('选择音乐') || item.el.matches('button,[role="button"],a,[tabindex]') ||
+                             getComputedStyle(item.el).cursor === 'pointer'))
+            .sort((a,b) => b.r.left - a.r.left || (a.r.width*a.r.height) - (b.r.width*b.r.height));
+          const target = clickables.length ? clickables[0].el : row;
+          const rect = target.getBoundingClientRect();
+          target.click();
+          return {ok:true, text:txt(row).slice(0,120), x:rect.left+rect.width/2, y:rect.top+rect.height/2};
         }
         """)
-        if result and result.get("ok") and wait_music_panel_open(page, 3):
-            wlog("通过音乐模块 DOM 原生 click 打开面板。")
-            return True
+        if result and result.get("ok"):
+            if wait_music_panel_open(page, 6):
+                wlog("通过音乐模块 DOM 原生 click 打开面板。")
+                return True
+            if result.get("x") is not None and result.get("y") is not None:
+                page.mouse.click(float(result["x"]), float(result["y"]))
+                if wait_music_panel_open(page, 4):
+                    wlog("通过音乐模块真实鼠标点击打开面板。")
+                    return True
     except Exception as exc:
         wlog(f"音乐模块 DOM click 兜底失败：{repr(exc)}")
 
-    # 最后兜底：只点击页面实际“选择音乐”文字的可见矩形，不使用固定屏幕坐标。
+    # 最后兜底：只点击编辑区实际“选择音乐”文字的可见矩形，不使用固定屏幕坐标。
     try:
         rects = get_text_rects(page, "选择音乐")
-        for rect in rects:
+        viewport_width = page.evaluate("() => window.innerWidth")
+        rects = [rect for rect in rects if float(rect.get("cx", viewport_width)) < float(viewport_width) * 0.78]
+        for rect in sorted(rects, key=lambda item: float(item.get("cx", 0)), reverse=True):
             page.mouse.click(float(rect["cx"]), float(rect["cy"]))
-            if wait_music_panel_open(page, 2):
+            if wait_music_panel_open(page, 4):
                 wlog("通过选择音乐文字矩形打开面板。")
                 return True
     except Exception:
@@ -3510,12 +3563,16 @@ def mark_music_song_rows(page):
               if (position === 'fixed') score += 300;
               score += Math.min(250, el.querySelectorAll('li,[role="listitem"],img').length * 10);
               return {el,text,r,score,semanticPanel,position};
-            }).filter(x => x.text.includes('选择音乐') &&
-              (x.text.includes('使用') || x.text.includes('热门') || x.text.includes('推荐') || x.text.includes('搜索音乐')) &&
-              x.r.width >= 260 && x.r.height >= 180 && x.text.length < 3000 &&
-              !(x.text.includes('基础信息') && x.text.includes('发布设置')) &&
-              (x.semanticPanel || (['fixed','absolute','sticky'].includes(x.position) &&
-                x.r.width < window.innerWidth * 0.72 && x.r.height < window.innerHeight * 1.35 && x.r.top >= -50)))
+            }).filter(x => {
+              const hasMusicTitle = x.text.includes('选择音乐') || x.text.includes('音乐库') || x.text.includes('添加音乐');
+              const listReady = x.text.includes('使用') || x.text.includes('热门') || x.text.includes('推荐') || x.text.includes('搜索音乐');
+              const loading = x.text.includes('加载') || x.text.includes('暂无') || x.text.includes('重试');
+              return (hasMusicTitle || (x.semanticPanel && (listReady || loading))) &&
+                x.r.width >= 260 && x.r.height >= 180 && x.text.length < 3000 &&
+                !(x.text.includes('基础信息') && x.text.includes('发布设置')) &&
+                (x.semanticPanel || (['fixed','absolute','sticky'].includes(x.position) &&
+                  x.r.width < window.innerWidth * 0.72 && x.r.height < window.innerHeight * 1.35 && x.r.top >= -50));
+            })
             .sort((a,b) => b.score - a.score);
           const panel = panels[0] && panels[0].el;
           if (!panel) return {panel:false, rowCount:0, text:''};
@@ -3569,7 +3626,10 @@ def scroll_music_panel_list(page, amount=420):
               const data = (el.getAttribute('data-e2e') || '') + (el.getAttribute('data-testid') || '');
               const position = getComputedStyle(el).position;
               const semanticPanel = role === 'dialog' || el.getAttribute('aria-modal') === 'true' || /music/i.test(data);
-              return t.includes('选择音乐') && (t.includes('使用') || t.includes('热门') || t.includes('推荐')) &&
+              const hasMusicTitle = t.includes('选择音乐') || t.includes('音乐库') || t.includes('添加音乐');
+              const listReady = t.includes('使用') || t.includes('热门') || t.includes('推荐');
+              const loading = t.includes('加载') || t.includes('暂无') || t.includes('重试');
+              return (hasMusicTitle || (semanticPanel && (listReady || loading))) &&
                 !(t.includes('基础信息') && t.includes('发布设置')) &&
                 (semanticPanel || (['fixed','absolute','sticky'].includes(position) && r.width < window.innerWidth * 0.72));
             });
@@ -3675,8 +3735,9 @@ def choose_music(cfg, page):
             if try_apply_music_use(cfg, page, use_button):
                 return True
 
-        # 短轮询等待列表加载；只在确实未加载时做一次面板内滚动。
-        deadline = time.time() + 4.0
+        # 短轮询等待列表加载；慢电脑首次打开抽屉时允许骨架屏完成加载。
+        # 面板外壳已出现就不再误判为“没有打开”，也不重复点击入口。
+        deadline = time.time() + 8.0
         while time.time() < deadline:
             last_row_info = mark_music_song_rows(page)
             if int(last_row_info.get("rowCount", 0) or 0) > 0 or visible_music_use_buttons(page):
@@ -3695,7 +3756,7 @@ def choose_music(cfg, page):
             row_count = 0
         saw_rows = saw_rows or row_count > 0
 
-        if row_count == 0:
+        if row_count == 0 and music_panel_info(page).get("opened"):
             try:
                 activate_music_category(page)
                 last_row_info = mark_music_song_rows(page)
@@ -7517,6 +7578,9 @@ class App:
                 )
                 if raw_status in {"error", "logged_out"}:
                     self.telemetry_failed_accounts.add(account_id or f"unknown-{len(self.telemetry_failed_accounts)}")
+                elif account_id and raw_status in {"launching", "checking", "ready", "publishing", "waiting", "done"}:
+                    # 账号重新启动或重试成功后，实时清掉上一轮的失败标记。
+                    self.telemetry_failed_accounts.discard(account_id)
                 self.refresh_browser_tree()
                 if payload.get("name"):
                     self.status_var.set(f"状态：{payload.get('name')} · {status}")
@@ -7683,11 +7747,14 @@ class App:
         self.restore_browser_runtime_state()
         for account in self.browser_accounts:
             account_id = str(account["id"])
-            if not account.get("enabled", True):
-                self.browser_statuses[account_id] = "未启用"
-            else:
-                self.browser_statuses.setdefault(account_id, "等待任务")
-                self.browser_success_counts.setdefault(account_id, 0)
+            progress = int(self.browser_success_counts.get(account_id, 0) or 0)
+            quota = max(1, int(account.get("posts_per_run", 1) or 1))
+            # 新一轮/失败重试开始时保留累计发布数量，但不继续展示上轮失败原因。
+            # 当前 worker 的 launching/checking/publishing 事件会继续实时覆盖该状态。
+            self.browser_statuses[account_id] = browser_status_at_run_start(
+                account.get("enabled", True), progress, quota
+            )
+            self.browser_success_counts[account_id] = progress
         self.refresh_browser_tree()
         cmd = application_command("--worker", CONFIG_PATH)
         self.write_ui(("自动启动已触发。\n" if scheduled else "开始本轮发布。\n") + "已加载最新配置，浏览器将按列表顺序执行。\n")
@@ -7905,8 +7972,13 @@ def run_gui():
 
 def run_self_test():
     """不连接浏览器、不发布内容的内置冒烟测试。"""
-    assert APP_VERSION == "3.0.4"
+    assert APP_VERSION == "3.0.5"
     assert APP_NAME.endswith(APP_VERSION)
+    assert UPDATE_MANIFEST_URL.startswith("https://api.xibao-zg.top/updates/")
+    assert "github" not in UPDATE_MANIFEST_URL.lower() and not UPDATE_MANIFEST_FALLBACK_URLS
+    assert browser_status_at_run_start(True, 32, 75) == "等待任务"
+    assert browser_status_at_run_start(True, 75, 75) == "配额完成 75/75"
+    assert browser_status_at_run_start(False, 0, 75) == "未启用"
     empty_release = platform_release_to_manifest({"version": {}})
     assert empty_release["latest_version"] == ""
     valid_release = platform_release_to_manifest(

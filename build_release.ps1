@@ -3,7 +3,7 @@ param()
 
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = [System.IO.Path]::GetFullPath($PSScriptRoot)
-$Version = '3.0.4'
+$Version = '3.0.5'
 $MainDist = Join-Path $ProjectRoot 'dist\DouyinPublisher'
 $UpdateZip = Join-Path $ProjectRoot "packages\DouyinPublisher_Update_v$Version.zip"
 $InnoCompiler = 'C:\Users\1\AppData\Local\Programs\Inno Setup 6\ISCC.exe'
@@ -26,8 +26,11 @@ function Remove-BuildTarget([string]$TargetPath) {
 Set-Location -LiteralPath $ProjectRoot
 Remove-BuildTarget (Join-Path $ProjectRoot 'build')
 Remove-BuildTarget (Join-Path $ProjectRoot 'dist')
-Remove-BuildTarget (Join-Path $ProjectRoot 'release')
 Remove-BuildTarget (Join-Path $ProjectRoot 'DouyinPublisher.spec')
+$currentInstaller = Join-Path $ProjectRoot "release\DouyinPublisher_Setup_v$Version.exe"
+if (Test-Path -LiteralPath $currentInstaller) {
+    Remove-Item -LiteralPath $currentInstaller -Force
+}
 if (Test-Path -LiteralPath $UpdateZip) {
     Remove-Item -LiteralPath $UpdateZip -Force
 }
@@ -55,11 +58,13 @@ py -m PyInstaller --noconfirm --clean --windowed --onefile `
     app\online_updater.py
 if ($LASTEXITCODE -ne 0) { throw 'Updater build failed.' }
 
+$fixedLauncher = Join-Path $ProjectRoot 'release_transition\Start_Douyin_Publisher.vbs'
+Copy-Item -LiteralPath $fixedLauncher -Destination $MainDist -Force
+
 $staging = Join-Path $ProjectRoot 'build\update-staging'
 Remove-BuildTarget $staging
 New-Item -ItemType Directory -Path $staging | Out-Null
 Copy-Item -Path (Join-Path $MainDist '*') -Destination $staging -Recurse -Force
-Copy-Item -LiteralPath (Join-Path $ProjectRoot 'release_transition\Start_Douyin_Publisher.vbs') -Destination $staging -Force
 Compress-Archive -Path (Join-Path $staging '*') -DestinationPath $UpdateZip -CompressionLevel Optimal
 
 if (-not (Test-Path -LiteralPath $InnoCompiler)) {

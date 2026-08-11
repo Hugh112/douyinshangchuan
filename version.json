@@ -1,9 +1,9 @@
 {
-  "latest_version": "3.0.4",
+  "latest_version": "3.0.5",
   "minimum_supported_version": "2.3.0",
-  "download_url": "https://github.com/Hugh112/douyinshangchuan/releases/download/v3.0.4/DouyinPublisher_Update_v3.0.4.zip",
-  "sha256": "be8a3b2c0e745ff826bd06876f1194f06bbf64e51a762144acf8a946005f4b21",
-  "package_size_bytes": 89869975,
+  "download_url": "https://api.xibao-zg.top/updates/publisher.douyin/stable/3.0.5/DouyinPublisher_Update_v3.0.5.zip",
+  "sha256": "d2a0ebd23fd9ca466abc485850d052be43fa9f682dd9ee6cca1852f61fd82c67",
+  "package_size_bytes": 89870261,
   "force_update": false,
   "is_forced": false,
   "rollout_percentage": 100,
@@ -11,9 +11,10 @@
     "app/douyin_gui_config.json"
   ],
   "release_notes": [
-    "修复新版抖音已选中定时发布却被误判为点击失败的问题。",
-    "等待发布时间框出现后，严格执行清空旧值、写入账号排期时间和回读确认。",
-    "受控日期组件优先使用 v3.0.1 已验证的 DOM 输入逻辑，并保留键盘和日期面板兜底。",
-    "点击底部发布前再次校验定时时间；不一致时禁止提交。本次为可选更新。"
+    "\u4fee\u590d\u4e2a\u522b\u7535\u8111\u9996\u6b21\u542f\u52a8\u6d4f\u89c8\u5668\u8f83\u6162\u65f6\u8c03\u8bd5\u7aef\u53e3\u88ab\u8fc7\u65e9\u5224\u5b9a\u5931\u8d25\uff1b\u4ec5\u5ef6\u957f\u76ee\u6807\u7aef\u53e3\u7b49\u5f85\u6216\u91cd\u8bd5\u6d4f\u89c8\u5668\u542f\u52a8\u6b65\u9aa4\u3002",
+    "\u4fee\u590d\u8d26\u53f7\u7b2c\u4e8c\u8f6e\u5df2\u7ecf\u6b63\u5e38\u53d1\u5e03\uff0c\u961f\u5217\u8868\u4ecd\u663e\u793a\u4e0a\u8f6e\u5931\u8d25\u72b6\u6001\uff1b\u7d2f\u8ba1\u53d1\u5e03\u8fdb\u5ea6\u7ee7\u7eed\u4fdd\u7559\u5e76\u5b9e\u65f6\u5237\u65b0\u72b6\u6001\u3002",
+    "\u4f18\u5316\u97f3\u4e50\u62bd\u5c49\u52a0\u8f7d\u8bc6\u522b\u548c\u5165\u53e3\u70b9\u51fb\uff0c\u52a0\u8f7d\u4e2d\u7684\u9762\u677f\u4e0d\u518d\u88ab\u8bef\u5224\u4e3a\u672a\u6253\u5f00\u3002",
+    "\u5408\u5e76 v3.0.4 \u7acb\u5373\u53d1\u5e03\u8865\u4e01\uff1b\u672a\u542f\u7528\u5b9a\u65f6\u53d1\u5e03\u65f6\u76f4\u63a5\u6821\u9a8c\u5e76\u70b9\u51fb\u5e95\u90e8\u53d1\u5e03\u6309\u94ae\u3002",
+    "\u66f4\u65b0\u5305\u5207\u6362\u4e3a\u7edf\u4e00\u4e91\u670d\u52a1\u5668\u4e0b\u8f7d\uff0c\u5e76\u7ee7\u7eed\u6267\u884c SHA256 \u4e0e ZIP \u8def\u5f84\u5b89\u5168\u6821\u9a8c\u3002\u672c\u6b21\u4e3a\u53ef\u9009\u66f4\u65b0\u3002"
   ]
 }

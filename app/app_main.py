@@ -111,7 +111,7 @@ CONFIG_PATH = APP_DATA_DIR / "douyin_gui_config.json"
 AUTH_TOKEN_PATH = APP_DATA_DIR / "authorization.bin"
 AUTH_LOGIN_PREFERENCES_PATH = APP_DATA_DIR / "login_preferences.bin"
 DEBUG_SCREENSHOT_CLEANUP_STATE_PATH = APP_DATA_DIR / "debug_screenshot_cleanup.json"
-APP_VERSION = "3.0.5"
+APP_VERSION = "3.0.6"
 APP_NAME = f"抖音智能发布中心 v{APP_VERSION}"
 LOGO_ICO = RESOURCE_DIR / "assets" / "app_logo.ico"
 LOGO_PNG = RESOURCE_DIR / "assets" / "app_logo.png"
@@ -493,6 +493,27 @@ def browser_accounts_from_config(cfg, enabled_only=False):
     return accounts
 
 
+def resolved_output_file_path(value, default_filename):
+    """文件字段误选为目录时，在该目录内使用固定文件名，不改写用户配置。"""
+    raw = str(value or "").strip().strip('"')
+    path = Path(raw or default_filename)
+    directory_hint = raw.endswith(("/", "\\"))
+    try:
+        if directory_hint or path.is_dir():
+            return path / default_filename
+    except OSError:
+        pass
+    return path
+
+
+def state_file_path(cfg):
+    return resolved_output_file_path(cfg.get("state_path"), "douyin_publish_state.json")
+
+
+def log_file_path(cfg):
+    return resolved_output_file_path(cfg.get("log_path"), "douyin_publish_log.csv")
+
+
 def config_for_browser_account(cfg, account):
     result = copy.deepcopy(cfg)
     result["browser_path"] = account["browser_path"]
@@ -503,8 +524,9 @@ def config_for_browser_account(cfg, account):
     result["active_browser_account_name"] = account.get("name", "")
     # 每个队列项都拥有独立进度。排期序号不会从前一个浏览器接着累计；
     # 同一个浏览器重复入队时，也按每一行队列任务分别计算。
-    base_state_path = Path(
-        str(cfg.get("_queue_state_base_path") or cfg.get("state_path") or "douyin_publish_state.json")
+    base_state_path = resolved_output_file_path(
+        cfg.get("_queue_state_base_path") or cfg.get("state_path"),
+        "douyin_publish_state.json",
     )
     safe_id = re.sub(r"[^0-9A-Za-z_-]+", "_", str(account.get("id") or "account"))
     result["_queue_state_base_path"] = str(base_state_path)
@@ -746,7 +768,7 @@ def popup_pause_alert(msg="脚本已暂停，请查看前端日志。"):
 
 def pause_flag_path(cfg):
     try:
-        state = Path(cfg.get("state_path", "douyin_publish_state.json"))
+        state = state_file_path(cfg)
         return state.with_suffix(".pause")
     except Exception:
         return APP_DIR / "douyin_pause.flag"
@@ -997,11 +1019,27 @@ def has_user_data_dir_arg(args):
     return "--user-data-dir" in str(args or "").lower()
 
 
+def rotation_default_browser_user_data_dir(cfg, browser_path, args=""):
+    """轮换保留多个 Chrome 时，为每个快捷方式/端口生成稳定且隔离的默认用户目录。"""
+    configured_path = os.path.normcase(os.path.abspath(str(browser_path or cfg.get("browser_path") or "browser")))
+    profile_match = re.search(r"--profile-directory(?:=|\s+)(?:\"([^\"]+)\"|'([^']+)'|([^\s]+))", str(args or ""), re.I)
+    shortcut_profile = next((item for item in (profile_match.groups() if profile_match else ()) if item), "")
+    seed = "|".join((
+        configured_path,
+        str(cfg.get("browser_profile_directory") or shortcut_profile or "").strip().casefold(),
+        str(int(cfg.get("cdp_port", 9222) or 9222)),
+    ))
+    digest = hashlib.sha1(seed.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return APP_DATA_DIR / "browser_profiles" / f"cdp_{digest}"
+
+
 def kill_chrome_residue(cfg):
     if not cfg.get("close_chrome_before_start", False):
         return
-    wlog("已启用：启动前关闭 Chrome / node 残留进程。")
-    for proc in ["chrome.exe", "node.exe"]:
+    wlog("已启用：启动前关闭 Chrome 残留进程。")
+    # 不再全局结束 node.exe：Playwright 驱动和其它正常软件也使用 Node，
+    # 误杀会直接导致 connect_over_cdp 报 Connection closed while reading from the driver。
+    for proc in ["chrome.exe"]:
         try:
             subprocess.run(["taskkill", "/F", "/IM", proc], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                            **hidden_subprocess_kwargs())
@@ -1062,7 +1100,11 @@ def open_browser_with_cdp(cfg, force_new=False):
     else:
         # 如果快捷方式本身没有 user-data-dir，为了适配新版 Chrome 远程调试限制，使用脚本专用默认目录。
         if not has_user_data_dir_arg(args):
-            default_profile = str(Path(os.environ.get("USERPROFILE", "D:")) / "douyin_chrome_profile_v21")
+            if parse_bool(cfg.get("_rotation_keep_browsers_open"), False):
+                default_profile = str(rotation_default_browser_user_data_dir(cfg, browser_path, args))
+                wlog(f"轮换模式为当前浏览器使用独立默认用户目录：{default_profile}")
+            else:
+                default_profile = str(Path(os.environ.get("USERPROFILE", "D:")) / "douyin_chrome_profile_v21")
             args = (args + f' --user-data-dir="{default_profile}"').strip()
             wlog(f"快捷方式未带 user-data-dir，已临时使用脚本专用目录：{default_profile}")
 
@@ -1111,7 +1153,7 @@ def open_browser_with_cdp(cfg, force_new=False):
 
 
 def read_state(cfg):
-    p = Path(cfg["state_path"])
+    p = state_file_path(cfg)
     if p.exists():
         try:
             return json.loads(p.read_text(encoding="utf-8"))
@@ -1121,7 +1163,7 @@ def read_state(cfg):
 
 
 def write_state(cfg, state):
-    p = Path(cfg["state_path"])
+    p = state_file_path(cfg)
     p.parent.mkdir(parents=True, exist_ok=True)
     temp_path = p.with_name(f".{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
     try:
@@ -1212,15 +1254,20 @@ def update_queue_run_state(cfg, run_id, accounts, completed_ids, active):
 
 
 def append_log(cfg, row):
-    p = Path(cfg["log_path"])
-    p.parent.mkdir(parents=True, exist_ok=True)
-    exists = p.exists()
-    with p.open("a", newline="", encoding="utf-8-sig") as f:
-        fields = ["time", "image", "copy_index", "schedule_time", "copy_preview", "status"]
-        wr = csv.DictWriter(f, fieldnames=fields)
-        if not exists:
-            wr.writeheader()
-        wr.writerow(row)
+    p = log_file_path(cfg)
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        exists = p.exists()
+        with p.open("a", newline="", encoding="utf-8-sig") as f:
+            fields = ["time", "image", "copy_index", "schedule_time", "copy_preview", "status"]
+            wr = csv.DictWriter(f, fieldnames=fields)
+            if not exists:
+                wr.writeheader()
+            wr.writerow(row)
+        return True
+    except Exception as exc:
+        wlog(f"发布日志写入失败（不影响已确认的发布结果和进度）：{repr(exc)}")
+        return False
 
 
 
@@ -1436,12 +1483,51 @@ def is_city_header(value):
     return normalized_header_name(value) in CITY_HEADER_NAMES
 
 
+CITY_ADMIN_SUFFIXES = (
+    "特别行政区", "自治区", "自治州", "自治县", "自治旗",
+    "市辖区", "地区", "林区", "新区", "市", "州", "区", "县", "盟", "旗",
+)
+CITY_ETHNIC_SUFFIX_PATTERN = re.compile(
+    r"(?:维吾尔族|蒙古族|哈萨克族|柯尔克孜族|土家族|布依族|朝鲜族|"
+    r"达斡尔族|鄂温克族|鄂伦春族|俄罗斯族|乌孜别克族|塔吉克族|"
+    r"苗族|彝族|壮族|藏族|回族|满族|侗族|瑶族|白族|哈尼族|"
+    r"傣族|黎族|傈僳族|佤族|畲族|拉祜族|水族|东乡族|纳西族|"
+    r"景颇族|土族|仫佬族|羌族|布朗族|撒拉族|毛南族|仡佬族|"
+    r"锡伯族|阿昌族|普米族|怒族|德昂族|保安族|裕固族|京族|"
+    r"塔塔尔族|独龙族|赫哲族|门巴族|珞巴族|基诺族)+$"
+)
+
+
+def city_name_aliases(value):
+    """生成行政区名称别名；精确名称始终保留，只移除一个末尾行政级别。"""
+    raw = re.sub(r"\s+", "", copy_cell_text(value)).casefold()
+    if not raw:
+        return set()
+    aliases = {raw}
+    for suffix in CITY_ADMIN_SUFFIXES:
+        if not raw.endswith(suffix) or len(raw) <= len(suffix):
+            continue
+        # “广州/杭州/苏州”等二字地名中的“州”是名称本身，不当作行政后缀。
+        if suffix == "州" and len(raw) <= 2:
+            continue
+        base = raw[:-len(suffix)]
+        if base:
+            aliases.add(base)
+            short_base = CITY_ETHNIC_SUFFIX_PATTERN.sub("", base)
+            if short_base:
+                aliases.add(short_base)
+        break
+    return aliases
+
+
 def normalized_city_name(value):
-    """用于匹配 Excel 城市和图片子文件夹；兼容“济南”与“济南市”。"""
-    name = re.sub(r"\s+", "", copy_cell_text(value)).casefold()
-    if len(name) > 1 and name.endswith("市"):
-        name = name[:-1]
-    return name
+    """返回最短行政区别名，兼容市、州、区、县等带/不带后缀写法。"""
+    aliases = city_name_aliases(value)
+    return min(aliases, key=lambda item: (len(item), item)) if aliases else ""
+
+
+def city_names_match(left, right):
+    return bool(city_name_aliases(left) & city_name_aliases(right))
 
 
 def image_city_folder_names(cfg):
@@ -1457,7 +1543,9 @@ def image_city_folder_names(cfg):
 
 def infer_city_column(frame, known_city_names, excluded_columns=()):
     """依据图片子文件夹名称识别无表头/非常用表头中的城市列。"""
-    known_keys = {normalized_city_name(name) for name in (known_city_names or [])}
+    known_keys = set()
+    for name in known_city_names or []:
+        known_keys.update(city_name_aliases(name))
     known_keys.discard("")
     if not known_keys or frame is None or frame.empty:
         return None
@@ -1471,7 +1559,7 @@ def infer_city_column(frame, known_city_names, excluded_columns=()):
         values = [value for value in values if value]
         if not values:
             continue
-        matched = sum(normalized_city_name(value) in known_keys for value in values)
+        matched = sum(bool(city_name_aliases(value) & known_keys) for value in values)
         # 至少六成非空值应当是现有城市文件夹；错误项随后会给出具体城市提示。
         if matched and matched * 5 >= len(values) * 3:
             candidates.append((matched / len(values), matched, column))
@@ -1704,14 +1792,21 @@ def resolve_image_dir_for_record(cfg, record):
         return root
 
     city = validate_city_folder_name(record.get("city", ""))
-    city_key = normalized_city_name(city)
-    matches = [
-        child for child in root.iterdir()
-        if child.is_dir() and normalized_city_name(child.name) == city_key
-    ]
+    children = [child for child in root.iterdir() if child.is_dir()]
+    exact = next(
+        (child for child in children if re.sub(r"\s+", "", child.name).casefold() == re.sub(r"\s+", "", city).casefold()),
+        None,
+    )
+    if exact is not None:
+        matches = [exact]
+    else:
+        matches = [child for child in children if city_names_match(child.name, city)]
     if not matches:
         raise FileNotFoundError(f"找不到城市“{city}”对应的图片子文件夹：{root / city}")
-    exact = next((child for child in matches if child.name == city), matches[0])
+    if len(matches) > 1:
+        names = "、".join(child.name for child in matches[:8])
+        raise RuntimeError(f"城市“{city}”同时匹配多个图片子文件夹：{names}；请在 Excel 中填写完整行政区名称。")
+    exact = matches[0]
     root_resolved = root.resolve()
     exact_resolved = exact.resolve()
     if exact_resolved.parent != root_resolved:
@@ -2992,7 +3087,7 @@ def _legacy_platform_music_panel_opened(page):
 
 
 def music_panel_info(page):
-    """识别音乐面板外壳与列表加载状态；加载中的面板也算已打开。"""
+    """严格识别音乐抽屉；普通发布页里的空音乐模块绝不能算已打开。"""
     try:
         return page.evaluate(r"""
         () => {
@@ -3003,6 +3098,8 @@ def music_panel_info(page):
                    s.visibility !== 'hidden' && Number(s.opacity || 1) > 0;
           }
           function txt(el){ return ((el.innerText || el.textContent || '') + '').replace(/\s+/g, ' ').trim(); }
+          document.querySelectorAll('[data-douyin-music-panel-confirmed]')
+            .forEach(el => el.removeAttribute('data-douyin-music-panel-confirmed'));
           const selectors = [
             '[role="dialog"]','[aria-modal="true"]','[data-e2e*="music" i]',
             '[data-testid*="music" i]','aside','section','div'
@@ -3018,33 +3115,52 @@ def music_panel_info(page):
             const role = el.getAttribute('role') || '';
             const data = (el.getAttribute('data-e2e') || '') + (el.getAttribute('data-testid') || '');
             const position = getComputedStyle(el).position;
-            const semanticPanel = role === 'dialog' || el.getAttribute('aria-modal') === 'true' || /music/i.test(data);
+            const semanticDialog = role === 'dialog' || el.getAttribute('aria-modal') === 'true';
+            const dataMusic = /music/i.test(data);
             const hasMusicTitle = text.includes('选择音乐') || text.includes('音乐库') || text.includes('添加音乐');
-            const listReady = text.includes('使用') || text.includes('热门') || text.includes('推荐') ||
-                              text.includes('搜索音乐') || text.includes('原创榜');
-            const loading = text.includes('加载') || text.includes('暂无') || text.includes('重试');
-            if (!hasMusicTitle && !(semanticPanel && (listReady || loading))) continue;
-            if (!semanticPanel && !['fixed','absolute','sticky'].includes(position) && r.width > vw * 0.65) continue;
-            if (!semanticPanel && (r.width > vw * 0.82 || r.height > vh * 1.35 || r.top < -50)) continue;
+            // 这是发布页未选择音乐时的主模块提示，不是音乐抽屉。旧判断在部分缩放/布局下会误判它。
+            const explicitEmptyModule = text.includes('点击添加合适作品风格音乐');
+            if (explicitEmptyModule) continue;
+            const controls = [...el.querySelectorAll('button,[role="button"],input')].filter(visible);
+            const useButtonCount = controls.filter(node => /^(使用|使用音乐)$/.test(txt(node))).length;
+            const searchControl = controls.some(node => /搜索.*音乐|音乐.*搜索/.test(
+              `${node.getAttribute('placeholder') || ''} ${node.getAttribute('aria-label') || ''} ${txt(node)}`
+            ));
+            const categoryControl = controls.some(node => /^(推荐|推荐音乐|热门|热门榜|热门音乐|原创榜)$/.test(txt(node)));
+            const listItems = el.querySelectorAll('li,[role="listitem"],article').length;
+            const listReady = useButtonCount > 0 || searchControl || categoryControl ||
+                              text.includes('搜索音乐') || text.includes('热门榜') ||
+                              text.includes('热门音乐') || text.includes('推荐音乐') || text.includes('原创榜');
+            const loading = /音乐[^。]{0,12}(加载中|正在加载|暂无|重试)|加载音乐/.test(text);
+            const overlayGeometry = ['fixed','absolute','sticky'].includes(position) &&
+              r.width < vw * 0.82 && r.height < vh * 1.35 && r.top >= -50;
+            // role=dialog/aria-modal 是强证据；普通 data-*music* 只是页面模块标记，不能单独证明抽屉已打开。
+            const confirmed = semanticDialog
+              ? (hasMusicTitle || dataMusic) && (listReady || loading || hasMusicTitle)
+              : overlayGeometry && hasMusicTitle && (listReady || loading) &&
+                (dataMusic || r.left > vw * 0.25 || listItems > 0);
+            if (!confirmed) continue;
             if (text.includes('基础信息') && text.includes('发布设置')) continue;
             let score = 0;
             if (role === 'dialog') score += 1000;
             if (el.getAttribute('aria-modal') === 'true') score += 800;
-            if (/music/i.test(data)) score += 700;
+            if (dataMusic) score += 500;
             if (position === 'fixed') score += 300;
             if (r.left > vw * 0.35) score += 100;
-            if (text.includes('使用')) score += 200;
-            if (el.querySelector('button,[role="button"]')) score += 100;
+            if (useButtonCount) score += 300;
+            if (searchControl || categoryControl) score += 200;
             score += Math.min(300, el.querySelectorAll('li,[role="listitem"],img').length * 10);
             score -= Math.abs(r.width * r.height - 350000) / 10000;
-            candidates.push({el, score, text, r, listReady, loading});
+            candidates.push({el, score, text, r, listReady, loading, useButtonCount, listItems});
           }
           candidates.sort((a,b) => b.score - a.score);
           const panel = candidates[0];
           if (!panel) return {opened:false, text:'', candidates:0};
+          panel.el.setAttribute('data-douyin-music-panel-confirmed', '1');
           return {
             opened:true, listReady:panel.listReady, loading:panel.loading,
             text:panel.text.slice(0,500), candidates:candidates.length,
+            useButtonCount:panel.useButtonCount, listItems:panel.listItems,
             role:panel.el.getAttribute('role') || '',
             data:(panel.el.getAttribute('data-e2e') || panel.el.getAttribute('data-testid') || ''),
             x:panel.r.left, y:panel.r.top, width:panel.r.width, height:panel.r.height
@@ -3093,7 +3209,8 @@ def scroll_to_music_area(cfg, page):
     return False
 
 
-def _legacy_open_music_panel(cfg, page):
+def open_music_panel_v301_recognition(cfg, page):
+    """使用 v3.0.1 的音乐行识别、右侧区域及文字矩形真实点击流程。"""
     if verify_music_selected(page):
         return True
     if platform_music_panel_opened(page):
@@ -3314,21 +3431,20 @@ def open_music_panel(cfg, page):
     except Exception as exc:
         wlog(f"音乐模块 DOM click 兜底失败：{repr(exc)}")
 
-    # 最后兜底：只点击编辑区实际“选择音乐”文字的可见矩形，不使用固定屏幕坐标。
+    # 新版模块点击未打开抽屉时，完整执行 v3.0.1 的页面识别点击流程。
+    # 该流程会重新识别主编辑区音乐行，再依次执行行右侧区域和文字矩形真实点击。
+    wlog("新版音乐模块点击未打开面板，切换到 v3.0.1 页面识别点击流程。")
     try:
-        rects = get_text_rects(page, "选择音乐")
-        viewport_width = page.evaluate("() => window.innerWidth")
-        rects = [rect for rect in rects if float(rect.get("cx", viewport_width)) < float(viewport_width) * 0.78]
-        for rect in sorted(rects, key=lambda item: float(item.get("cx", 0)), reverse=True):
-            page.mouse.click(float(rect["cx"]), float(rect["cy"]))
-            if wait_music_panel_open(page, 4):
-                wlog("通过选择音乐文字矩形打开面板。")
-                return True
-    except Exception:
-        pass
+        if open_music_panel_v301_recognition(cfg, page):
+            wlog("v3.0.1 页面识别点击已成功打开音乐面板。")
+            return True
+    except Exception as recognition_exc:
+        wlog(f"v3.0.1 页面识别点击失败：{repr(recognition_exc)}")
 
     save_debug(cfg, page, "music_panel_not_opened")
-    raise RuntimeError("音乐面板未打开：语义定位、DOM click 和真实鼠标兜底均未生效。")
+    raise RuntimeError(
+        "音乐面板未打开：新版模块点击及 v3.0.1 页面识别点击均未生效。"
+    )
 
 
 def _legacy_choose_music(cfg, page):
@@ -3485,32 +3601,17 @@ def _legacy_choose_music(cfg, page):
 
 def music_control_belongs_to_panel(locator):
     try:
-        return bool(locator.evaluate(r"""
-        el => {
-          function txt(node){ return ((node.innerText || node.textContent || '') + '').replace(/\s+/g, ' ').trim(); }
-          for (let node = el; node && node !== document.body; node = node.parentElement) {
-            const text = txt(node);
-            const role = node.getAttribute && node.getAttribute('role');
-            const data = node.getAttribute && ((node.getAttribute('data-e2e') || '') + (node.getAttribute('data-testid') || ''));
-            const r = node.getBoundingClientRect();
-            const position = getComputedStyle(node).position;
-            const semanticPanel = role === 'dialog' || (node.getAttribute && node.getAttribute('aria-modal') === 'true') || /music/i.test(data);
-            const boundedDrawer = r.width < window.innerWidth * 0.72 && r.height < window.innerHeight * 1.35 && r.top >= -50;
-            if (text.includes('选择音乐') && (text.includes('使用') || text.includes('热门') || text.includes('推荐')) &&
-                (semanticPanel || (boundedDrawer && ['fixed','absolute','sticky'].includes(position))) &&
-                !(text.includes('基础信息') && text.includes('发布设置'))) {
-              return true;
-            }
-          }
-          return false;
-        }
-        """))
+        return bool(locator.evaluate(
+            "el => !!el.closest('[data-douyin-music-panel-confirmed=\"1\"]')"
+        ))
     except Exception:
         return False
 
 
 def visible_music_use_buttons(page):
     """返回音乐面板内当前可见的使用按钮，优先语义 role，再兼容原生按钮结构。"""
+    if not music_panel_info(page).get("opened"):
+        return []
     candidates = []
     locators = [
         page.get_by_role("button", name=re.compile(r"^使用(?:音乐)?$")),
@@ -3538,6 +3639,9 @@ def visible_music_use_buttons(page):
 
 def mark_music_song_rows(page):
     """标记音乐面板内可能的歌曲行；不要求“万使用”或固定时长文本。"""
+    panel_info = music_panel_info(page)
+    if not panel_info.get("opened"):
+        return {"panel": False, "rowCount": 0, "text": ""}
     try:
         return page.evaluate(r"""
         () => {
@@ -3549,32 +3653,7 @@ def mark_music_song_rows(page):
           function txt(el){ return ((el.innerText || el.textContent || '') + '').replace(/\s+/g, ' ').trim(); }
           document.querySelectorAll('[data-douyin-music-row-candidate]').forEach(el => el.removeAttribute('data-douyin-music-row-candidate'));
 
-          const panels = [...document.querySelectorAll('[role="dialog"],[aria-modal="true"],[data-e2e*="music" i],[data-testid*="music" i],aside,section,div')]
-            .filter(visible).map(el => {
-              const text = txt(el); const r = el.getBoundingClientRect();
-              const role = el.getAttribute('role') || '';
-              const data = (el.getAttribute('data-e2e') || '') + (el.getAttribute('data-testid') || '');
-              const position = getComputedStyle(el).position;
-              const semanticPanel = role === 'dialog' || el.getAttribute('aria-modal') === 'true' || /music/i.test(data);
-              let score = 0;
-              if (role === 'dialog') score += 1000;
-              if (el.getAttribute('aria-modal') === 'true') score += 800;
-              if (/music/i.test(data)) score += 700;
-              if (position === 'fixed') score += 300;
-              score += Math.min(250, el.querySelectorAll('li,[role="listitem"],img').length * 10);
-              return {el,text,r,score,semanticPanel,position};
-            }).filter(x => {
-              const hasMusicTitle = x.text.includes('选择音乐') || x.text.includes('音乐库') || x.text.includes('添加音乐');
-              const listReady = x.text.includes('使用') || x.text.includes('热门') || x.text.includes('推荐') || x.text.includes('搜索音乐');
-              const loading = x.text.includes('加载') || x.text.includes('暂无') || x.text.includes('重试');
-              return (hasMusicTitle || (x.semanticPanel && (listReady || loading))) &&
-                x.r.width >= 260 && x.r.height >= 180 && x.text.length < 3000 &&
-                !(x.text.includes('基础信息') && x.text.includes('发布设置')) &&
-                (x.semanticPanel || (['fixed','absolute','sticky'].includes(x.position) &&
-                  x.r.width < window.innerWidth * 0.72 && x.r.height < window.innerHeight * 1.35 && x.r.top >= -50));
-            })
-            .sort((a,b) => b.score - a.score);
-          const panel = panels[0] && panels[0].el;
+          const panel = document.querySelector('[data-douyin-music-panel-confirmed="1"]');
           if (!panel) return {panel:false, rowCount:0, text:''};
 
           const excluded = /^(选择音乐|热门榜|热门音乐|推荐|推荐音乐|搜索音乐|原创榜|取消|关闭|确定|确认|完成|使用)$/;
@@ -3611,6 +3690,9 @@ def mark_music_song_rows(page):
 
 def scroll_music_panel_list(page, amount=420):
     """只滚动音乐面板内部列表；DOM 滚动失败后才在面板实际边界内使用鼠标滚轮。"""
+    info = music_panel_info(page)
+    if not info.get("opened"):
+        return False
     try:
         result = page.evaluate("""
         amount => {
@@ -3618,31 +3700,18 @@ def scroll_music_panel_list(page, amount=420):
             const r = el.getBoundingClientRect(); const s = getComputedStyle(el);
             return r.width > 0 && r.height > 0 && s.display !== 'none' && s.visibility !== 'hidden';
           }
-          function txt(el){ return ((el.innerText || el.textContent || '') + '').trim(); }
-          const panels = [...document.querySelectorAll('[role="dialog"],[aria-modal="true"],[data-e2e*="music" i],[data-testid*="music" i],aside,section,div')]
-            .filter(visible).filter(el => {
-              const t = txt(el); const r = el.getBoundingClientRect();
-              const role = el.getAttribute('role') || '';
-              const data = (el.getAttribute('data-e2e') || '') + (el.getAttribute('data-testid') || '');
-              const position = getComputedStyle(el).position;
-              const semanticPanel = role === 'dialog' || el.getAttribute('aria-modal') === 'true' || /music/i.test(data);
-              const hasMusicTitle = t.includes('选择音乐') || t.includes('音乐库') || t.includes('添加音乐');
-              const listReady = t.includes('使用') || t.includes('热门') || t.includes('推荐');
-              const loading = t.includes('加载') || t.includes('暂无') || t.includes('重试');
-              return (hasMusicTitle || (semanticPanel && (listReady || loading))) &&
-                !(t.includes('基础信息') && t.includes('发布设置')) &&
-                (semanticPanel || (['fixed','absolute','sticky'].includes(position) && r.width < window.innerWidth * 0.72));
-            });
-          for (const panel of panels) {
+          const panel = document.querySelector('[data-douyin-music-panel-confirmed="1"]');
+          if (panel && visible(panel)) {
             const scrollables = [panel, ...panel.querySelectorAll('div,ul,ol,section')].filter(visible)
               .filter(el => el.scrollHeight > el.clientHeight + 20)
               .sort((a,b) => (b.scrollHeight-b.clientHeight) - (a.scrollHeight-a.clientHeight));
-            if (!scrollables.length) continue;
-            const target = scrollables[0];
-            const before = target.scrollTop;
-            target.scrollBy({top:Number(amount || 420), behavior:'auto'});
-            const r = target.getBoundingClientRect();
-            return {ok:true, moved:target.scrollTop !== before, x:r.left, y:r.top, width:r.width, height:r.height};
+            if (scrollables.length) {
+              const target = scrollables[0];
+              const before = target.scrollTop;
+              target.scrollBy({top:Number(amount || 420), behavior:'auto'});
+              const r = target.getBoundingClientRect();
+              return {ok:true, moved:target.scrollTop !== before, x:r.left, y:r.top, width:r.width, height:r.height};
+            }
           }
           return {ok:false};
         }
@@ -3652,7 +3721,6 @@ def scroll_music_panel_list(page, amount=420):
     except Exception:
         result = None
     try:
-        info = music_panel_info(page)
         if info.get("opened"):
             page.mouse.move(
                 float(info.get("x", 0)) + float(info.get("width", 0)) / 2,
@@ -4637,6 +4705,11 @@ def set_publish_now(cfg, page):
     step_wait(cfg, "切换立即发布状态后等待")
 
 
+def publish_mode_plan(use_schedule):
+    """v3.0.4 热补丁门禁：非定时任务直接进入底部提交，不点击立即发布单选项。"""
+    return "schedule" if parse_bool(use_schedule, True) else "direct_submit"
+
+
 
 def publish_page_still_visible(page):
     """
@@ -5034,9 +5107,11 @@ def account_worker(config_path):
             )
 
         try:
+            launch_info = open_browser_with_cdp(account_cfg, force_new=False)
+            # “启动前关闭 Chrome 残留”必须在启动 Playwright 驱动前完成；
+            # 清理函数只处理 Chrome，不得结束 Playwright 自身使用的 node.exe。
             playwright_manager = sync_playwright()
             playwright = playwright_manager.start()
-            launch_info = open_browser_with_cdp(account_cfg, force_new=False)
             browser = playwright.chromium.connect_over_cdp(
                 f"http://127.0.0.1:{int(account_cfg['cdp_port'])}"
             )
@@ -5157,7 +5232,7 @@ def account_worker(config_path):
 
                     run_publish_step(account_cfg, page, "定位发布设置", locate_publish_settings)
 
-                    if account_cfg.get("use_schedule", True):
+                    if publish_mode_plan(account_cfg.get("use_schedule", True)) == "schedule":
                         def set_and_verify_schedule():
                             set_schedule(account_cfg, page, slot)
                             if not verify_schedule_time(page, slot):
@@ -5315,14 +5390,7 @@ def account_worker(config_path):
                     except Exception as exc:
                         wlog(f"删除已用文案失败：{repr(exc)}")
 
-                append_log(account_cfg, {
-                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "image": str(img), "copy_index": ci + 1,
-                    "schedule_time": slot.strftime("%Y-%m-%d %H:%M") if account_cfg.get("use_schedule", True) else "立即发布",
-                    "copy_preview": copy_text[:80].replace("\n", " "),
-                    "status": f"success[{account_name}]"
-                })
-
+                published_copy_index = ci + 1
                 ci = 0 if account_cfg.get("delete_copy_after_success", True) else ci + 1
                 si += 1
                 account_done += 1
@@ -5342,6 +5410,13 @@ def account_worker(config_path):
                     "last_account_message": "",
                 })
                 write_state(account_cfg, state_now)
+                append_log(account_cfg, {
+                    "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "image": str(img), "copy_index": published_copy_index,
+                    "schedule_time": slot.strftime("%Y-%m-%d %H:%M") if account_cfg.get("use_schedule", True) else "立即发布",
+                    "copy_preview": copy_text[:80].replace("\n", " "),
+                    "status": f"success[{account_name}]"
+                })
                 emit_browser_status(
                     account, "publishing" if account_done < account_quota else "done",
                     f"本账号已成功 {account_done}/{account_quota} 条",
@@ -5558,6 +5633,7 @@ def run_isolated_browser_sequence(config_path, child_switch, publish_mode=False)
                 child_cfg["reuse_existing_cdp"] = True
                 child_cfg["close_chrome_before_start"] = False
                 child_cfg["no_raise_browser"] = True
+                child_cfg["_rotation_keep_browsers_open"] = True
         child_path = temp_root / f"account_{index}_round_{round_no}.json"
         child_path.write_text(json.dumps(child_cfg, ensure_ascii=False, indent=2), encoding="utf-8")
 
@@ -5809,9 +5885,9 @@ def probe_account_in_process(config_path):
         emit_browser_status(account, "launching", "登录检查：正在启动浏览器", 0, quota)
         wlog(f"登录检查 {index}/{len(accounts)}：{account['name']}")
         try:
+            launch_info = open_browser_with_cdp(account_cfg, force_new=False)
             playwright_manager = sync_playwright()
             playwright = playwright_manager.start()
-            launch_info = open_browser_with_cdp(account_cfg, force_new=False)
             browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{int(account_cfg['cdp_port'])}")
             context = browser.contexts[0] if browser.contexts else browser.new_context()
             page = keep_single_browser_tab(context, context.pages[-1] if context.pages else context.new_page())
@@ -7005,8 +7081,7 @@ class App:
             prompt += notes + "\n\n"
         source_names = {
             "unified-platform": "统一管理后台",
-            "github-raw": "GitHub raw 备用源",
-            "jsdelivr": "jsDelivr 备用源",
+            "unified-cloud": "统一云服务器备用清单",
         }
         prompt += f"更新策略来源：{source_names.get(info.get('source'), info.get('source') or '未知')}。\n"
         prompt += "是否现在下载并更新？本机配置和 DPAPI 授权会话不会放入安装目录，也不会被覆盖。"
@@ -7041,6 +7116,8 @@ class App:
             "--current-pid", str(os.getpid()),
             "--download-url", str(info.get("download_url", "")),
             "--sha256", str(info.get("sha256", "")),
+            "--version", str(info.get("latest_version") or info.get("version") or ""),
+            "--package-size", str(info.get("package_size_bytes") or 0),
             "--launch", str(sys.executable if IS_FROZEN else Path(__file__).resolve()),
             "--preserve", preserve_arg,
         ]
@@ -7972,13 +8049,21 @@ def run_gui():
 
 def run_self_test():
     """不连接浏览器、不发布内容的内置冒烟测试。"""
-    assert APP_VERSION == "3.0.5"
+    assert APP_VERSION == "3.0.6"
     assert APP_NAME.endswith(APP_VERSION)
     assert UPDATE_MANIFEST_URL.startswith("https://api.xibao-zg.top/updates/")
     assert "github" not in UPDATE_MANIFEST_URL.lower() and not UPDATE_MANIFEST_FALLBACK_URLS
     assert browser_status_at_run_start(True, 32, 75) == "等待任务"
     assert browser_status_at_run_start(True, 75, 75) == "配额完成 75/75"
     assert browser_status_at_run_start(False, 0, 75) == "未启用"
+    assert publish_mode_plan(False) == "direct_submit"
+    assert publish_mode_plan(True) == "schedule"
+    assert "open_music_panel_v301_recognition" in open_music_panel.__code__.co_names
+    assert "click_locator_with_fallback" in open_music_panel.__code__.co_names
+    assert "get_text_rects" in open_music_panel_v301_recognition.__code__.co_names
+    assert "click_locator_with_fallback" not in open_music_panel_v301_recognition.__code__.co_names
+    assert "_legacy_open_music_panel" not in globals()
+    assert "node.exe" not in kill_chrome_residue.__code__.co_consts
     empty_release = platform_release_to_manifest({"version": {}})
     assert empty_release["latest_version"] == ""
     valid_release = platform_release_to_manifest(
@@ -8016,6 +8101,12 @@ def run_self_test():
     assert alias_records[0]["city"] == "北京市"
     assert alias_records[0]["title"] == "北京标题"
     assert alias_records[0]["copy"] == "北京正文"
+    assert normalized_city_name("广州市") == "广州"
+    assert normalized_city_name("广州") == "广州"
+    assert city_names_match("恩施", "恩施土家族苗族自治州")
+    assert city_names_match("朝阳", "朝阳区")
+    assert city_names_match("曹", "曹县")
+    assert not city_names_match("广州", "广")
     headerless_city_records = extract_publish_records(
         pd.DataFrame([
             ["济南", "标题一", "正文一"],
@@ -8049,11 +8140,47 @@ def run_self_test():
         assert choose_image_for_record(image_cfg, structured_records[0]).name == "A.png"
         assert choose_image_for_record({**image_cfg, "random_image": True}, structured_records[0]).parent == city_dir
         assert resolve_image_dir_for_record(image_cfg, alias_records[0]) == city_dir
+        region_folders = {
+            "恩施土家族苗族自治州": "恩施",
+            "朝阳区": "朝阳",
+            "曹县": "曹",
+        }
+        for folder_name, excel_name in region_folders.items():
+            folder = image_root / folder_name
+            folder.mkdir()
+            record = {**structured_records[0], "city": excel_name}
+            assert resolve_image_dir_for_record(image_cfg, record) == folder
+        (image_root / "新城区").mkdir()
+        (image_root / "新城县").mkdir()
+        try:
+            resolve_image_dir_for_record(image_cfg, {**structured_records[0], "city": "新城"})
+            raise AssertionError("行政区短名同时匹配多个目录时必须拒绝猜测")
+        except RuntimeError as exc:
+            assert "同时匹配多个" in str(exc)
         try:
             list_images_for_record(image_cfg, {**structured_records[0], "city": "../北京"})
             raise AssertionError("城市列不应允许路径跳转")
         except RuntimeError:
             pass
+
+        output_dir = Path(temp_dir) / "日志状态"
+        output_dir.mkdir()
+        output_cfg = {"state_path": str(output_dir), "log_path": str(output_dir)}
+        write_state(output_cfg, {"copy_index": 7, "slot_index": 2})
+        append_log(output_cfg, {
+            "time": "2026-08-11 00:00:00", "image": "a.jpg", "copy_index": 1,
+            "schedule_time": "", "copy_preview": "测试", "status": "ok",
+        })
+        assert state_file_path(output_cfg) == output_dir / "douyin_publish_state.json"
+        assert log_file_path(output_cfg) == output_dir / "douyin_publish_log.csv"
+        assert read_state(output_cfg)["copy_index"] == 7
+        assert log_file_path(output_cfg).is_file()
+        blocked_parent = Path(temp_dir) / "blocked_parent"
+        blocked_parent.write_text("not a directory", encoding="utf-8")
+        assert append_log({"log_path": str(blocked_parent / "publish.csv")}, {
+            "time": "", "image": "", "copy_index": 0,
+            "schedule_time": "", "copy_preview": "", "status": "ok",
+        }) is False
         try:
             list_images_for_record(image_cfg, {**structured_records[1], "city": ""})
             raise AssertionError("存在城市列时城市不能为空")
@@ -8159,6 +8286,16 @@ def run_self_test():
     duplicate_state_b = config_for_browser_account(legacy, duplicate_accounts[1])
     assert duplicate_state_a["state_path"] != duplicate_state_b["state_path"]
     assert config_for_browser_account(duplicate_state_a, duplicate_accounts[0])["state_path"] == duplicate_state_a["state_path"]
+    rotation_profile_a = rotation_default_browser_user_data_dir(
+        {"browser_path": r"D:\浏览器1.lnk", "cdp_port": 9222}, r"D:\浏览器1.lnk"
+    )
+    rotation_profile_b = rotation_default_browser_user_data_dir(
+        {"browser_path": r"D:\浏览器2.lnk", "cdp_port": 9223}, r"D:\浏览器2.lnk"
+    )
+    assert rotation_profile_a != rotation_profile_b
+    assert rotation_profile_a == rotation_default_browser_user_data_dir(
+        {"browser_path": r"D:\浏览器1.lnk", "cdp_port": 9222}, r"D:\浏览器1.lnk"
+    )
     try:
         validate_browser_queue_ports([duplicate_a, {**duplicate_b, "browser_path": r"D:\浏览器8.lnk"}])
         raise AssertionError("不同浏览器不应允许复用同一 CDP 端口")

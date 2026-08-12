@@ -16,10 +16,11 @@
 1. `available_update_info` 比较语义化数字版本。
 2. 新版本必须提供 64 位十六进制 SHA256；否则拒绝更新。
 3. `start_online_update` 启动 `DouyinPublisherUpdater.exe` 并退出主程序。
-4. 更新器下载到临时目录并再次计算 SHA256。
-5. 安全检查 ZIP 条目，拒绝绝对路径、父目录穿越和符号链接。
-6. 覆盖固定文件名，保留清单声明的配置路径，并清理 `OBSOLETE_PATHS` 中明确列出的历史文件；固定名 `Start_Douyin_Publisher.vbs` 作为旧快捷方式到新 EXE 的兼容桥接，不得删除。
-7. 优先无黑框启动固定 `DouyinPublisher.exe`，旧安装快捷方式继续通过固定 VBS 启动该 EXE，源码场景才回退 `.pyw`。
+4. 更新器立即显示独立进度窗口；下载阶段显示百分比、已下载/总大小和重试次数。
+5. SHA256、ZIP 路径安全检查、解压、等待主程序退出、覆盖文件、历史清理和重启都显示对应阶段及总进度。
+6. 安全检查 ZIP 条目，拒绝绝对路径、父目录穿越和符号链接。
+7. 覆盖固定文件名，保留清单声明的配置路径，并清理 `OBSOLETE_PATHS` 中明确列出的历史文件；固定名 `Start_Douyin_Publisher.vbs` 作为旧快捷方式到新 EXE 的兼容桥接，不得删除。
+8. 优先无黑框启动固定 `DouyinPublisher.exe`，旧安装快捷方式继续通过固定 VBS 启动该 EXE，源码场景才回退 `.pyw`。
 
 ## 3. 发布新版本
 
@@ -27,21 +28,22 @@
 2. 保持 `app_main.py` 与 `app_main.pyw` 完全一致。
 3. 执行语法检查、自检和核心回归。
 4. 运行 `build_release.ps1` 生成安装包与更新 ZIP。
-5. 检查 ZIP 根目录直接包含 `DouyinPublisher.exe`、`DouyinPublisherUpdater.exe`、`_internal` 和固定名兼容启动器，不得多套一层目录。
-6. 确认 ZIP 不含 `__pycache__`、`.pyc`、`.spec`、版本号启动器、历史 README 或用户配置。
-7. 计算最终 ZIP SHA256 和大小，写入根目录 `version.json`。
-8. 把安装包、更新 ZIP 和 `manifest.json` 上传到统一云服务器固定产品/通道目录；同一文件先以临时名上传，服务端校验 SHA256 和大小后再原子替换。
-9. 通过公网 HTTPS 对清单、完整下载、Range 请求、大小和 SHA256 做一次真实校验，再在统一后台登记相同版本、云服务器 URL、SHA256、大小和发布说明。
-10. GitHub 只推送已验证源码、版本清单和发布说明，可创建同版本标签作为源码备份，但不让客户端读取 GitHub 包体。
-11. 观察授权心跳、更新检查错误率和客户端遥测后再扩大投放比例。
+5. 在隔离环境安装上一线上稳定版，从该真实安装目录发起一次到本候选的完整更新；必须肉眼确认独立进度窗口立即出现，并持续显示下载百分比/大小、SHA256、ZIP 检查、解压、安装和重启阶段。只验证新包内 `DouyinPublisherUpdater.exe` 不算通过，因为升级过程首先调用的是上一版已安装的更新器。任何阶段无可见进度都必须停止发布并提升版本修复，不得把“更新完成后新更新器具备进度窗口”当作本次跨版本验证。
+6. 检查 ZIP 根目录直接包含 `DouyinPublisher.exe`、`DouyinPublisherUpdater.exe`、`_internal` 和固定名兼容启动器，不得多套一层目录。
+7. 确认 ZIP 不含 `__pycache__`、`.pyc`、`.spec`、版本号启动器、历史 README 或用户配置。
+8. 计算最终 ZIP SHA256 和大小，写入根目录 `version.json`。
+9. 把安装包、更新 ZIP 和 `manifest.json` 上传到统一云服务器固定产品/通道目录；同一文件先以临时名上传，服务端校验 SHA256 和大小后再原子替换。
+10. 通过公网 HTTPS 对清单、完整下载、Range 请求、大小和 SHA256 做一次真实校验，再在统一后台登记相同版本、云服务器 URL、SHA256、大小和发布说明。
+11. GitHub 只推送已验证源码、版本清单和发布说明，可创建同版本标签作为源码备份，但不让客户端读取 GitHub 包体。
+12. 观察授权心跳、更新检查错误率和客户端遥测后再扩大投放比例。
 
 ## 4. `version.json` 必填字段
 
 ```json
 {
-  "latest_version": "3.0.5",
+  "latest_version": "3.0.6",
   "minimum_supported_version": "2.3.0",
-  "download_url": "https://api.xibao-zg.top/updates/publisher.douyin/stable/3.0.5/DouyinPublisher_Update_v3.0.5.zip",
+  "download_url": "https://api.xibao-zg.top/updates/publisher.douyin/stable/3.0.6/DouyinPublisher_Update_v3.0.6.zip",
   "sha256": "最终 ZIP 的小写 SHA256",
   "package_size_bytes": 0,
   "force_update": false,

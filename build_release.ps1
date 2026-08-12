@@ -3,7 +3,7 @@ param()
 
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = [System.IO.Path]::GetFullPath($PSScriptRoot)
-$Version = '3.0.5'
+$Version = '3.0.6'
 $MainDist = Join-Path $ProjectRoot 'dist\DouyinPublisher'
 $UpdateZip = Join-Path $ProjectRoot "packages\DouyinPublisher_Update_v$Version.zip"
 $InnoCompiler = 'C:\Users\1\AppData\Local\Programs\Inno Setup 6\ISCC.exe'
@@ -52,6 +52,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Main executable build failed.' }
 py -m PyInstaller --noconfirm --clean --windowed --onefile `
     --name DouyinPublisherUpdater `
     --icon $IconPath `
+    --add-data "$IconPath;assets" `
     --distpath $MainDist `
     --workpath build\updater `
     --specpath build\updater-spec `

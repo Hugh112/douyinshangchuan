@@ -1,9 +1,9 @@
 {
-  "latest_version": "3.0.5",
+  "latest_version": "3.0.6",
   "minimum_supported_version": "2.3.0",
-  "download_url": "https://api.xibao-zg.top/updates/publisher.douyin/stable/3.0.5/DouyinPublisher_Update_v3.0.5.zip",
-  "sha256": "d2a0ebd23fd9ca466abc485850d052be43fa9f682dd9ee6cca1852f61fd82c67",
-  "package_size_bytes": 89870261,
+  "download_url": "https://api.xibao-zg.top/updates/publisher.douyin/stable/3.0.6/DouyinPublisher_Update_v3.0.6.zip",
+  "sha256": "7eb90cd7df2987aacdb15f1c911261b4158be796d02e46c85826883e65a762da",
+  "package_size_bytes": 89971758,
   "force_update": false,
   "is_forced": false,
   "rollout_percentage": 100,
@@ -11,10 +11,16 @@
     "app/douyin_gui_config.json"
   ],
   "release_notes": [
-    "\u4fee\u590d\u4e2a\u522b\u7535\u8111\u9996\u6b21\u542f\u52a8\u6d4f\u89c8\u5668\u8f83\u6162\u65f6\u8c03\u8bd5\u7aef\u53e3\u88ab\u8fc7\u65e9\u5224\u5b9a\u5931\u8d25\uff1b\u4ec5\u5ef6\u957f\u76ee\u6807\u7aef\u53e3\u7b49\u5f85\u6216\u91cd\u8bd5\u6d4f\u89c8\u5668\u542f\u52a8\u6b65\u9aa4\u3002",
-    "\u4fee\u590d\u8d26\u53f7\u7b2c\u4e8c\u8f6e\u5df2\u7ecf\u6b63\u5e38\u53d1\u5e03\uff0c\u961f\u5217\u8868\u4ecd\u663e\u793a\u4e0a\u8f6e\u5931\u8d25\u72b6\u6001\uff1b\u7d2f\u8ba1\u53d1\u5e03\u8fdb\u5ea6\u7ee7\u7eed\u4fdd\u7559\u5e76\u5b9e\u65f6\u5237\u65b0\u72b6\u6001\u3002",
-    "\u4f18\u5316\u97f3\u4e50\u62bd\u5c49\u52a0\u8f7d\u8bc6\u522b\u548c\u5165\u53e3\u70b9\u51fb\uff0c\u52a0\u8f7d\u4e2d\u7684\u9762\u677f\u4e0d\u518d\u88ab\u8bef\u5224\u4e3a\u672a\u6253\u5f00\u3002",
-    "\u5408\u5e76 v3.0.4 \u7acb\u5373\u53d1\u5e03\u8865\u4e01\uff1b\u672a\u542f\u7528\u5b9a\u65f6\u53d1\u5e03\u65f6\u76f4\u63a5\u6821\u9a8c\u5e76\u70b9\u51fb\u5e95\u90e8\u53d1\u5e03\u6309\u94ae\u3002",
-    "\u66f4\u65b0\u5305\u5207\u6362\u4e3a\u7edf\u4e00\u4e91\u670d\u52a1\u5668\u4e0b\u8f7d\uff0c\u5e76\u7ee7\u7eed\u6267\u884c SHA256 \u4e0e ZIP \u8def\u5f84\u5b89\u5168\u6821\u9a8c\u3002\u672c\u6b21\u4e3a\u53ef\u9009\u66f4\u65b0\u3002"
+    "修复部分缩放比例和页面布局下把发布页空音乐模块误判为音乐面板已打开的问题。",
+    "音乐入口优先使用新版模块直控；严格确认抽屉未打开后，完整执行 v3.0.1 音乐行识别、右侧区域和文字矩形真实点击。",
+    "歌曲列表、使用按钮、面板滚动和音乐生效校验继续使用新版规则，并限制在已确认的音乐抽屉内。",
+    "修复状态或日志路径误选为文件夹时出现 Permission denied；自动在该目录使用固定 JSON/CSV 文件名，且不改写用户配置。",
+    "发布成功后先保存账号进度；日志写入失败不再覆盖已确认成功状态，也不会重复消费文案。",
+    "城市图片子文件夹匹配新增市、州、区、县、自治州、自治县、盟、旗等行政区后缀，并对同名歧义给出明确提示。",
+    "修复启动前关闭 Chrome 残留时误杀 Playwright Node 驱动造成 Connection closed while reading from the driver。",
+    "轮换发布为缺少专用用户目录的浏览器按快捷方式和端口分配隔离持久目录，避免多个账号争用同一 Chrome 进程导致端口连接失败。",
+    "在线更新器增加下载、SHA256 校验、ZIP 检查、解压、安装和重启进度显示。",
+    "完整保留 v3.0.4 立即发布热补丁：未启用定时时直接点击底部发布按钮。",
+    "保留 v3.0.5 首次 CDP 慢启动等待和运行状态实时刷新。本次为可选更新。"
   ]
 }

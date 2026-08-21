@@ -123,7 +123,6 @@ AUTO_PAUSE_EVENT_PREFIX = "__DOUYIN_AUTO_PAUSE__:"
 AUTH_API_BASE_URL = "https://api.xibao-zg.top"
 AUTH_PRODUCT_CODE = "publisher.douyin"
 AUTH_RELEASE_CHANNEL = "stable"
-AUTH_HEARTBEAT_SECONDS = 60
 
 # 更新顺序：已授权时优先读取统一后台；后台不可达或未返回有效策略时，
 # 回退统一云服务器的静态清单。客户端不再依赖 GitHub / jsDelivr 下载更新包。
@@ -6201,7 +6200,6 @@ class App:
             AUTH_RELEASE_CHANNEL,
         )
         self.login_preference_store = DpapiTokenStore(AUTH_LOGIN_PREFERENCES_PATH)
-        self.auth_heartbeat_inflight = False
         self.auth_force_logout_prompt_shown = False
         self.telemetry_task_id = ""
         self.telemetry_planned_count = 0
@@ -6700,7 +6698,6 @@ class App:
             self._show_main_window()
             if self.auth_client.state == STATE_AUTHORIZED:
                 self.report_client_launch()
-            self.schedule_authorization_heartbeat(first_contact=True)
             return
         if error:
             self.write_ui(f"软件授权自动登录失败：{error}\n")
@@ -6876,7 +6873,6 @@ class App:
             window.destroy()
             self._show_main_window()
             self.report_client_launch()
-            self.schedule_authorization_heartbeat(first_contact=True)
 
         def login_failed(exc):
             self.apply_authorization_state()
@@ -6922,50 +6918,6 @@ class App:
         self.main_window_revealed = False
         self.root.withdraw()
         self.root.after(100, lambda: self.show_authorization_login(switch_account=False))
-
-    def schedule_authorization_heartbeat(self, first_contact=False):
-        delay = self.auth_client.next_heartbeat_delay(
-            first_contact=first_contact,
-            configured_seconds=AUTH_HEARTBEAT_SECONDS,
-        )
-        self.root.after(max(1000, int(delay * 1000)), self.run_authorization_heartbeat)
-
-    def run_authorization_heartbeat(self):
-        if self.auth_heartbeat_inflight:
-            return
-        if self.auth_client.state not in {STATE_AUTHORIZED, STATE_GRACE}:
-            return
-        self.auth_heartbeat_inflight = True
-
-        def task():
-            error = None
-            try:
-                # 与 ByxxPublisher 一致：短暂网络故障在进入下个周期前最多快速重试 3 次。
-                for attempt in range(3):
-                    self.auth_client.heartbeat()
-                    if self.auth_client.state == STATE_AUTHORIZED:
-                        break
-                    if attempt < 2:
-                        time.sleep(0.5 if attempt == 0 else 2.0)
-            except Exception as exc:
-                error = exc
-            self.root.after(0, lambda: self.handle_authorization_heartbeat(error))
-
-        threading.Thread(target=task, daemon=True).start()
-
-    def handle_authorization_heartbeat(self, error=None):
-        self.auth_heartbeat_inflight = False
-        previous = self.auth_status_var.get()
-        self.apply_authorization_state()
-        current = self.auth_status_var.get()
-        if current != previous:
-            self.write_ui(f"软件授权状态变化：{current}。\n")
-        if self.auth_client.state == STATE_FORCE_LOGOUT:
-            self.handle_authorization_revoked(error)
-            return
-        if error and self.auth_client.state != STATE_GRACE:
-            self.write_ui(f"授权心跳将在后台重试：{error}\n")
-        self.schedule_authorization_heartbeat(first_contact=False)
 
     def handle_authorization_revoked(self, error=None):
         if self.proc and self.proc.poll() is None:

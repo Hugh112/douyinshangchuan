@@ -29,6 +29,9 @@ STATE_AUTHORIZED = "authorized"
 STATE_GRACE = "grace_period"
 STATE_FORCE_LOGOUT = "force_logout"
 
+VALIDATION_LOGIN_ONLY = "login_only"
+VALIDATION_CONTINUOUS = "continuous"
+
 
 class PlatformAuthError(RuntimeError):
     def __init__(self, code, message, retryable=False, status=0, trace_id=""):
@@ -185,6 +188,7 @@ class PlatformAuthClient:
         token_path,
         release_channel="stable",
         timeout=15,
+        validation_mode=VALIDATION_LOGIN_ONLY,
     ):
         parsed = urllib.parse.urlparse(str(base_url or "").strip())
         is_loopback = parsed.hostname in {"127.0.0.1", "localhost", "::1"}
@@ -196,6 +200,9 @@ class PlatformAuthClient:
         self.product_code = str(product_code).strip()
         self.client_version = str(client_version).strip()
         self.release_channel = str(release_channel).strip() or "stable"
+        self.validation_mode = str(validation_mode or VALIDATION_LOGIN_ONLY).strip().lower()
+        if self.validation_mode not in {VALIDATION_LOGIN_ONLY, VALIDATION_CONTINUOUS}:
+            raise ValueError("授权验证模式无效。")
         self.timeout = max(5, min(120, int(timeout or 15)))
         self.store = DpapiTokenStore(token_path)
         self.device = windows_device_identity()
@@ -367,11 +374,20 @@ class PlatformAuthClient:
                 return None
             self.state = STATE_AUTHENTICATING
             try:
-                return self.refresh()
+                return self._refresh_for_login()
             except PlatformAuthError as exc:
-                if exc.retryable:
+                if exc.retryable and self.validation_mode == VALIDATION_CONTINUOUS:
                     self._enter_grace(exc)
                     return dict(self.session) if self.session else None
+                if exc.retryable:
+                    # 登录单次验证模式下，启动恢复本身就是一次新登录。
+                    # 本次在线验证失败时不能使用旧授权快照放行；保留受保护的
+                    # Refresh Token 文件，便于下次启动再次在线验证。
+                    self.state = STATE_SIGNED_OUT
+                    self.session = None
+                    self.access_token = self.refresh_token = ""
+                    self.last_error = exc
+                    return None
                 self.clear_local_session(STATE_SIGNED_OUT)
                 return None
 
@@ -402,7 +418,7 @@ class PlatformAuthClient:
         self.last_error = None
         self._save()
 
-    def refresh(self):
+    def _refresh_for_login(self):
         with self._lock:
             if not self.session or not self.refresh_token:
                 raise PlatformAuthError("STORED_SESSION_NOT_FOUND", "没有可刷新的本机授权会话。")
@@ -419,15 +435,30 @@ class PlatformAuthClient:
             self._update_refreshed_session(response["data"], response.get("serverTimeUtc"))
             return dict(self.session)
 
+    def refresh(self):
+        if self.validation_mode == VALIDATION_LOGIN_ONLY:
+            raise PlatformAuthError(
+                "SESSION_RELOGIN_REQUIRED",
+                "当前登录已固定授权快照；退出后重新登录可再次验证授权。",
+            )
+        return self._refresh_for_login()
+
     def _ensure_access_token(self):
         expiry = self.access_expires_at
         if not self.access_token or not expiry or expiry <= _utc_now() + timedelta(seconds=45):
-            self.refresh()
+            if self.validation_mode == VALIDATION_LOGIN_ONLY:
+                raise PlatformAuthError(
+                    "SESSION_RELOGIN_REQUIRED",
+                    "当前登录的访问令牌已到期；退出后重新登录可继续访问平台附加服务。",
+                )
+            self._refresh_for_login()
 
     def heartbeat(self):
         with self._lock:
             if not self.session:
                 raise PlatformAuthError("SESSION_NOT_AVAILABLE", "当前没有有效授权会话。")
+            if self.validation_mode == VALIDATION_LOGIN_ONLY:
+                return dict(self.session)
             try:
                 self._ensure_access_token()
                 response = self._request(
@@ -583,6 +614,8 @@ class PlatformAuthClient:
         self.state = state
 
     def next_heartbeat_delay(self, first_contact=False, configured_seconds=60):
+        if self.validation_mode == VALIDATION_LOGIN_ONLY:
+            return None
         if first_contact:
             return 10
         if self.state == STATE_GRACE:

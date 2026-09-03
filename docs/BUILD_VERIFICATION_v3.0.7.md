@@ -28,5 +28,10 @@
 
 ## 发布后校验
 
-- 云服务器文件大小、SHA-256、JSON 清单解析、公开完整下载、Range 下载与公开 SHA-256 需全部通过后才算正式上线。
-- 统一管理后台登记为 Stable、版本代码 30007、非强制、灰度 100%。
+- 2026-09-03 已在轻量应用服务器端校验人工上传的安装包和更新 ZIP：文件名、大小及 SHA-256 均与正式构建记录一致。
+- 正式文件保存于数据盘 `/data/douyin-publisher/downloads/stable/3.0.7/`；现有项目级绑定将其发布到 `/srv/apps/ByxxPublisher/runtime/platform-production/updates/publisher.douyin/stable/3.0.7/`，未修改全局 Docker data-root，也未影响其他容器。
+- 公网安装包完整下载后 SHA-256 为 `a13d33e4e39be12cc196e4d4d5d274bf0659483f99f1a966ef0ea36cfdd90eb0`。
+- 公网更新 ZIP 完整下载后 SHA-256 为 `64a4a5e9f2a6591e5d5cbceea200419fa292a0ca7d4ccfd3479e6894f548fbd4`，Range 请求返回 `206 Partial Content` 和总长度 `100638123`。
+- 原 v3.0.6 清单已备份到 `/data/douyin-publisher/backups/update-manifests/`，正式清单通过临时文件校验后原子替换。
+- 公网清单已确认版本 3.0.7、最低兼容版本 2.3.0、非强制、灰度 100%，下载 URL、包大小和 SHA-256 均正确。
+- 按用户要求，统一管理后台由用户自行登记：Stable、版本代码 30007、非强制、灰度 100%。

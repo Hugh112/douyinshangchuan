@@ -1,6 +1,6 @@
 # 抖音智能发布中心
 
-当前线上稳定版：`v3.0.6`（音乐入口、目录日志、行政区图片与多浏览器 CDP 修复），于 2026-08-12 按 100% 灰度、非强制策略正式发布。
+当前线上稳定版：`v3.0.7`（网页崩溃恢复、音乐入口实效校验、轮换文案去重、图片目录缓存与平台失败原因采集），于 2026-09-03 按 100% 灰度、非强制策略正式发布。
 
 Windows 桌面端抖音图文自动发布工具。当前版本已接入统一授权后台，支持多浏览器账号按队列发布、账号专属内容、定时启动、运行遥测和安全在线更新。视频发布与 AI 内容生成属于后续版本范围，本版不包含这两项。
 
@@ -59,8 +59,8 @@ powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\build_release.ps1
 
 构建结果：
 
-- `release/DouyinPublisher_Setup_v3.0.6.exe`
-- `packages/DouyinPublisher_Update_v3.0.6.zip`
+- `release/DouyinPublisher_Setup_v3.0.7.exe`
+- `packages/DouyinPublisher_Update_v3.0.7.zip`
 
 构建脚本会把依赖冻结到安装目录，并在成功后清理临时 `build`、`.spec`、`__pycache__` 和 `.pyc`。
 

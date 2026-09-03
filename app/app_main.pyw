@@ -19,6 +19,7 @@
 
 import copy
 import csv
+import functools
 import hashlib
 import json
 import math
@@ -111,11 +112,17 @@ CONFIG_PATH = APP_DATA_DIR / "douyin_gui_config.json"
 AUTH_TOKEN_PATH = APP_DATA_DIR / "authorization.bin"
 AUTH_LOGIN_PREFERENCES_PATH = APP_DATA_DIR / "login_preferences.bin"
 DEBUG_SCREENSHOT_CLEANUP_STATE_PATH = APP_DATA_DIR / "debug_screenshot_cleanup.json"
-APP_VERSION = "3.0.6"
+APP_VERSION = "3.0.7"
 APP_NAME = f"抖音智能发布中心 v{APP_VERSION}"
 LOGO_ICO = RESOURCE_DIR / "assets" / "app_logo.ico"
 LOGO_PNG = RESOURCE_DIR / "assets" / "app_logo.png"
 ACTIVE_CFG = None
+_IMAGE_FOLDER_CACHE = {}
+_PUBLISH_RECORD_CACHE = {}
+_CACHE_LOCK = threading.RLock()
+_CRASHED_PAGE_IDS = set()
+_MONITORED_PAGE_IDS = set()
+_PUBLISH_FAILURE_REASONS = {}
 COUNTDOWN_EVENT_PREFIX = "__DOUYIN_COUNTDOWN__:"
 BROWSER_STATUS_EVENT_PREFIX = "__DOUYIN_BROWSER_STATUS__:"
 AUTO_PAUSE_EVENT_PREFIX = "__DOUYIN_AUTO_PAUSE__:"
@@ -1252,6 +1259,33 @@ def update_queue_run_state(cfg, run_id, accounts, completed_ids, active):
     write_state(cfg, state)
 
 
+def reset_scheduled_queue_round(cfg, accounts):
+    """自动启动代表新的发布轮次：重置配额/排期轮次，但继续未消费的文案游标。"""
+    base_state = read_state(cfg)
+    base_state.update({
+        "queue_run_id": "",
+        "queue_run_active": False,
+        "queue_run_signature": "",
+        "queue_completed_account_ids": [],
+    })
+    write_state(cfg, base_state)
+    for account in accounts:
+        account_cfg = config_for_browser_account(cfg, account)
+        state = read_state(account_cfg)
+        state.update({
+            "slot_index": 0,
+            "schedule_signature": "",
+            "queue_run_id": "",
+            "run_progress": 0,
+            "run_quota": 0,
+            "run_active": False,
+            "last_account_outcome": "",
+            "last_account_message": "",
+        })
+        # copy_index、最后文案键以及删行失败共享凭据必须保留，避免自动启动重复文案。
+        write_state(account_cfg, state)
+
+
 def append_log(cfg, row):
     p = log_file_path(cfg)
     try:
@@ -1486,6 +1520,12 @@ CITY_ADMIN_SUFFIXES = (
     "特别行政区", "自治区", "自治州", "自治县", "自治旗",
     "市辖区", "地区", "林区", "新区", "市", "州", "区", "县", "盟", "旗",
 )
+CITY_PARENT_SUFFIXES = (
+    "特别行政区", "自治区", "自治州", "地区", "盟", "省", "市", "州",
+)
+CITY_CHILD_SUFFIXES = (
+    "自治县", "自治旗", "市辖区", "林区", "新区", "区", "县", "旗", "市",
+)
 CITY_ETHNIC_SUFFIX_PATTERN = re.compile(
     r"(?:维吾尔族|蒙古族|哈萨克族|柯尔克孜族|土家族|布依族|朝鲜族|"
     r"达斡尔族|鄂温克族|鄂伦春族|俄罗斯族|乌孜别克族|塔吉克族|"
@@ -1497,26 +1537,61 @@ CITY_ETHNIC_SUFFIX_PATTERN = re.compile(
 )
 
 
-def city_name_aliases(value):
-    """生成行政区名称别名；精确名称始终保留，只移除一个末尾行政级别。"""
-    raw = re.sub(r"\s+", "", copy_cell_text(value)).casefold()
+@functools.lru_cache(maxsize=20000)
+def _city_aliases_cached(raw):
+    """同时生成单级行政区别名和“地级市 + 区县”的层级别名。"""
     if not raw:
-        return set()
+        return frozenset()
     aliases = {raw}
-    for suffix in CITY_ADMIN_SUFFIXES:
-        if not raw.endswith(suffix) or len(raw) <= len(suffix):
-            continue
-        # “广州/杭州/苏州”等二字地名中的“州”是名称本身，不当作行政后缀。
-        if suffix == "州" and len(raw) <= 2:
-            continue
-        base = raw[:-len(suffix)]
-        if base:
-            aliases.add(base)
+    pending = [raw]
+    while pending and len(aliases) < 48:
+        current = pending.pop()
+
+        for suffix in CITY_ADMIN_SUFFIXES:
+            if not current.endswith(suffix) or len(current) <= len(suffix):
+                continue
+            # “广州/杭州/苏州”等二字地名中的“州”是名称本身。
+            if suffix == "州" and len(current) <= 2:
+                continue
+            base = current[:-len(suffix)]
+            if base and base not in aliases:
+                aliases.add(base)
+                pending.append(base)
             short_base = CITY_ETHNIC_SUFFIX_PATTERN.sub("", base)
-            if short_base:
+            if short_base and short_base not in aliases:
                 aliases.add(short_base)
-        break
-    return aliases
+                pending.append(short_base)
+            break
+
+        # 兼容“潍坊市奎文区 / 潍坊奎文区 / 奎文区”等层级写法。
+        # 只在尾部明确是区县级名称时拆父级，避免把“杭州余杭区”的“州”误删。
+        if not any(current.endswith(suffix) for suffix in CITY_CHILD_SUFFIXES):
+            continue
+        for suffix in CITY_PARENT_SUFFIXES:
+            start = 0
+            while True:
+                index = current.find(suffix, start)
+                if index < 0:
+                    break
+                prefix = current[:index]
+                tail = current[index + len(suffix):]
+                start = index + len(suffix)
+                if len(prefix) < 2 or len(tail) < 2:
+                    continue
+                if suffix == "州" and len(prefix) < 2:
+                    continue
+                without_parent = prefix + tail
+                for alias in (without_parent, tail):
+                    if alias and alias not in aliases:
+                        aliases.add(alias)
+                        pending.append(alias)
+    return frozenset(aliases)
+
+
+def city_name_aliases(value):
+    """精确名称优先，并兼容行政后缀及地级市/区县层级写法。"""
+    raw = re.sub(r"\s+", "", copy_cell_text(value)).casefold()
+    return set(_city_aliases_cached(raw))
 
 
 def normalized_city_name(value):
@@ -1529,15 +1604,70 @@ def city_names_match(left, right):
     return bool(city_name_aliases(left) & city_name_aliases(right))
 
 
-def image_city_folder_names(cfg):
-    """只读取图片总目录的直接子文件夹，不递归扫描用户的其他文件。"""
+def _normalized_path_key(path):
+    return os.path.normcase(os.path.abspath(str(path)))
+
+
+def _directory_signature(path):
+    try:
+        stat = Path(path).stat()
+        return int(stat.st_mtime_ns), int(stat.st_size)
+    except OSError:
+        return 0, 0
+
+
+def city_hierarchy_suffixes(value):
+    """生成区县级尾部候选，用于“地级市名 + 区县名”没有分隔符的写法。"""
+    normalized = re.sub(r"\s+", "", copy_cell_text(value)).casefold()
+    if not normalized or not any(normalized.endswith(suffix) for suffix in CITY_CHILD_SUFFIXES):
+        return set()
+    # 至少保留三个汉字，避免把“文区”等过短片段当成行政区名称。
+    return {normalized[index:] for index in range(0, max(1, len(normalized) - 2))}
+
+
+def image_folder_index(cfg, force=False):
+    """扫描一次图片根目录并缓存名称/别名索引；根目录变化时自动失效。"""
     root = Path(str(cfg.get("image_dir", "")).strip().strip('"'))
     if not root.is_dir():
-        return []
+        return {
+            "root": root, "children": [], "exact": {}, "aliases": {},
+            "hierarchy_suffixes": {}, "signature": (0, 0),
+        }
+    key = _normalized_path_key(root)
+    signature = _directory_signature(root)
+    with _CACHE_LOCK:
+        cached = _IMAGE_FOLDER_CACHE.get(key)
+        if not force and cached and cached.get("signature") == signature:
+            return cached
     try:
-        return [child.name for child in root.iterdir() if child.is_dir()]
+        children = sorted((child for child in root.iterdir() if child.is_dir()), key=lambda p: p.name.casefold())
     except OSError:
-        return []
+        children = []
+    exact = {}
+    aliases = {}
+    hierarchy_suffixes = {}
+    for child in children:
+        normalized = re.sub(r"\s+", "", child.name).casefold()
+        exact.setdefault(normalized, []).append(child)
+        for alias in city_name_aliases(child.name):
+            aliases.setdefault(alias, []).append(child)
+        for suffix in city_hierarchy_suffixes(child.name):
+            hierarchy_suffixes.setdefault(suffix, []).append(child)
+    result = {
+        "root": root, "children": children, "exact": exact,
+        "aliases": aliases, "hierarchy_suffixes": hierarchy_suffixes,
+        "signature": signature,
+    }
+    with _CACHE_LOCK:
+        _IMAGE_FOLDER_CACHE[key] = result
+        if len(_IMAGE_FOLDER_CACHE) > 32:
+            _IMAGE_FOLDER_CACHE.pop(next(iter(_IMAGE_FOLDER_CACHE)), None)
+    return result
+
+
+def image_city_folder_names(cfg):
+    """只读取图片总目录的直接子文件夹；大量目录时复用缓存，不递归扫描。"""
+    return [child.name for child in image_folder_index(cfg).get("children", [])]
 
 
 def infer_city_column(frame, known_city_names, excluded_columns=()):
@@ -1663,6 +1793,22 @@ def extract_copy_texts(df):
 def read_publish_records(cfg):
     p = validate_copy_file_path(cfg.get("excel_path", ""))
     suffix = p.suffix.lower()
+    try:
+        file_stat = p.stat()
+        file_signature = (int(file_stat.st_mtime_ns), int(file_stat.st_size))
+    except OSError:
+        file_signature = (0, 0)
+    root_text = str(cfg.get("image_dir", "")).strip().strip('"')
+    root = Path(root_text) if root_text else None
+    root_signature = (_normalized_path_key(root), _directory_signature(root)) if root is not None else ("", (0, 0))
+    cache_key = (
+        _normalized_path_key(p), str(cfg.get("sheet_name", "")).strip().casefold(),
+        file_signature, root_signature,
+    )
+    with _CACHE_LOCK:
+        cached = _PUBLISH_RECORD_CACHE.get(cache_key)
+        if cached is not None:
+            return [dict(record) for record in cached]
     # v2.2.7：不要让 pandas 自己猜 Excel 类型，按文件后缀指定引擎。
     engine = "openpyxl" if suffix in {".xlsx", ".xlsm"} else "xlrd"
 
@@ -1697,7 +1843,29 @@ def read_publish_records(cfg):
     finally:
         xls.close()
 
-    return extract_publish_records(df, known_city_names=image_city_folder_names(cfg))
+    frame = df.dropna(how="all")
+    known_city_names = []
+    if not frame.empty:
+        first_index = frame.index[0]
+        header_values = [copy_cell_text(frame.at[first_index, column]) for column in frame.columns]
+        recognized = [
+            is_copy_header(value) or is_title_header(value) or is_city_header(value)
+            for value in header_values
+        ]
+        active_columns = [
+            column for column in frame.columns
+            if any(copy_cell_text(value) for value in frame[column].tolist())
+        ]
+        has_explicit_city = any(is_city_header(value) for value in header_values)
+        has_unknown_header_column = any(value and not known for value, known in zip(header_values, recognized))
+        if not has_explicit_city and (len(active_columns) >= 2 and (not any(recognized) or has_unknown_header_column)):
+            known_city_names = image_city_folder_names(cfg)
+    records = extract_publish_records(df, known_city_names=known_city_names)
+    with _CACHE_LOCK:
+        _PUBLISH_RECORD_CACHE[cache_key] = tuple(dict(record) for record in records)
+        if len(_PUBLISH_RECORD_CACHE) > 64:
+            _PUBLISH_RECORD_CACHE.pop(next(iter(_PUBLISH_RECORD_CACHE)), None)
+    return records
 
 
 def read_copies(cfg):
@@ -1727,7 +1895,114 @@ def publish_record_key(record):
     return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
 
 
-def filter_used_publish_records(records, state):
+def publish_records_signature(records):
+    raw = "|".join(publish_record_key(record) for record in records or [])
+    return hashlib.sha1(raw.encode("utf-8", errors="ignore")).hexdigest()
+
+
+def copy_source_identity(cfg):
+    path = _normalized_path_key(str(cfg.get("excel_path", "")).strip().strip('"'))
+    sheet = str(cfg.get("sheet_name", "")).strip().casefold()
+    return hashlib.sha1(f"{path}|{sheet}".encode("utf-8", errors="ignore")).hexdigest()
+
+
+def publish_record_consumption_token(cfg, record):
+    source = copy_source_identity(cfg)
+    row = max(0, _nonnegative_state_int(record.get("excel_row"), 0))
+    return hashlib.sha1(
+        f"{source}|{row}|{publish_record_key(record)}".encode("utf-8", errors="ignore")
+    ).hexdigest()
+
+
+def queue_base_state_cfg(cfg):
+    return {"state_path": str(cfg.get("_queue_state_base_path") or cfg.get("state_path") or "")}
+
+
+def failed_delete_receipts(cfg):
+    state = read_state(queue_base_state_cfg(cfg))
+    receipts = state.get("failed_delete_receipts", [])
+    return [item for item in receipts if isinstance(item, dict)] if isinstance(receipts, list) else []
+
+
+def mark_failed_delete_receipt(cfg, record):
+    """Excel 删行失败时写入队列共享状态，轮换到其它账号也不会重复使用。"""
+    base_cfg = queue_base_state_cfg(cfg)
+    state = read_state(base_cfg)
+    receipts = [item for item in state.get("failed_delete_receipts", []) if isinstance(item, dict)]
+    token = publish_record_consumption_token(cfg, record)
+    receipts = [item for item in receipts if str(item.get("token") or "") != token]
+    receipts.append({
+        "token": token,
+        "source": copy_source_identity(cfg),
+        "record_key": publish_record_key(record),
+        "excel_row": _nonnegative_state_int(record.get("excel_row"), 0),
+        "city": str(record.get("city") or ""),
+        "title": str(record.get("title") or ""),
+        "copy": str(record.get("copy") or ""),
+        "has_city_column": bool(record.get("has_city_column", False)),
+        "created_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    })
+    state["failed_delete_receipts"] = receipts[-5000:]
+    write_state(base_cfg, state)
+    wlog("Excel 未能删行，已把当前记录写入队列共享占用状态，后续轮换账号不会重复使用。")
+
+
+def clear_failed_delete_receipt(cfg, record):
+    base_cfg = queue_base_state_cfg(cfg)
+    state = read_state(base_cfg)
+    receipts = [item for item in state.get("failed_delete_receipts", []) if isinstance(item, dict)]
+    token = publish_record_consumption_token(cfg, record)
+    updated = [item for item in receipts if str(item.get("token") or "") != token]
+    if len(updated) != len(receipts):
+        state["failed_delete_receipts"] = updated
+        write_state(base_cfg, state)
+
+
+def retry_failed_excel_deletions(cfg):
+    """下一次运行时补删已确认发布但此前因占用未删掉的行，使表格数量恢复一致。"""
+    source = copy_source_identity(cfg)
+    receipts = [item for item in failed_delete_receipts(cfg) if str(item.get("source") or "") == source]
+    cleaned = 0
+    for item in receipts[:200]:
+        if not str(item.get("copy") or "").strip():
+            continue
+        record = {
+            "city": str(item.get("city") or ""),
+            "title": str(item.get("title") or ""),
+            "copy": str(item.get("copy") or ""),
+            "excel_row": _nonnegative_state_int(item.get("excel_row"), 0),
+            "has_city_column": bool(item.get("has_city_column", False)),
+            "format": "recovered_failed_delete",
+        }
+        if delete_copy_from_excel(cfg, record):
+            clear_failed_delete_receipt(cfg, record)
+            cleaned += 1
+        else:
+            break
+    if cleaned:
+        wlog(f"已补删 {cleaned} 条此前因 Excel 占用而保留的已发布文案。")
+    return cleaned
+
+
+def filter_used_publish_records(records, state, cfg=None):
+    if cfg is not None:
+        source = copy_source_identity(cfg)
+        used = {
+            str(item.get("token") or "") for item in failed_delete_receipts(cfg)
+            if str(item.get("source") or "") == source
+        }
+        if not used:
+            return records
+        filtered = [
+            record for record in records
+            if publish_record_consumption_token(cfg, record) not in used
+        ]
+        skipped = len(records) - len(filtered)
+        if skipped:
+            wlog(f"已根据队列共享状态跳过 {skipped} 条发布成功但未能从 Excel 删除的记录。")
+        return filtered
+
+    # 兼容旧的工具调用/自检；正式发布流程已使用上面的共享删行失败凭据。
     used = set(state.get("used_copy_keys", []) or [])
     if not used:
         return records
@@ -1763,6 +2038,44 @@ def mark_publish_record_used_in_state(cfg, record):
     wlog("已把当前城市、标题和文案写入进度文件，避免后续重复使用。")
 
 
+def migrate_legacy_copy_tracking(cfg):
+    """旧版无论删行是否成功都会留 used_copy_keys；只迁移一次，避免误判文案耗尽。"""
+    state = read_state(cfg)
+    if _nonnegative_state_int(state.get("copy_tracking_version"), 0) >= 2:
+        return state
+    if state.get("used_copy_keys"):
+        state["used_copy_keys"] = []
+        wlog("已清理旧版残留的已用文案标记；今后仅在 Excel 删行失败时记录共享占用。")
+    state["copy_tracking_version"] = 2
+    write_state(cfg, state)
+    return state
+
+
+def reconcile_copy_cursor(cfg, records, state, cursor, legacy_source_newer=False):
+    """Excel 内容变化后自动寻找下一条；替换/补充文案不再要求手动重置进度。"""
+    cursor = max(0, _nonnegative_state_int(cursor, 0))
+    current_signature = publish_records_signature(records)
+    previous_signature = str(state.get("copy_records_signature") or "")
+    changed = bool(previous_signature and previous_signature != current_signature)
+    changed = changed or (not previous_signature and bool(legacy_source_newer))
+    changed = changed or cursor > len(records)
+    if not records or not changed:
+        return cursor, False, current_signature
+
+    last_key = str(state.get("last_published_record_key") or "")
+    if last_key:
+        matching = [index for index, record in enumerate(records) if publish_record_key(record) == last_key]
+        if matching and matching[-1] + 1 < len(records):
+            cursor = matching[-1] + 1
+        elif matching:
+            cursor = matching[-1] + 1
+        else:
+            cursor = 0
+    else:
+        cursor = 0
+    return cursor, True, current_signature
+
+
 def mark_copy_used_in_state(cfg, copy_text):
     state = read_state(cfg)
     used = list(state.get("used_copy_keys", []) or [])
@@ -1791,15 +2104,57 @@ def resolve_image_dir_for_record(cfg, record):
         return root
 
     city = validate_city_folder_name(record.get("city", ""))
-    children = [child for child in root.iterdir() if child.is_dir()]
-    exact = next(
-        (child for child in children if re.sub(r"\s+", "", child.name).casefold() == re.sub(r"\s+", "", city).casefold()),
-        None,
-    )
-    if exact is not None:
-        matches = [exact]
-    else:
-        matches = [child for child in children if city_names_match(child.name, city)]
+    # 第一优先级永远是当前文案城市字段的同名文件夹；命中时不扫描全部目录。
+    direct = root / city
+    try:
+        if direct.is_dir() and direct.resolve().parent == root.resolve():
+            return direct
+    except OSError:
+        pass
+
+    index = image_folder_index(cfg)
+    normalized = re.sub(r"\s+", "", city).casefold()
+    matches = list(index.get("exact", {}).get(normalized, []))
+    if not matches:
+        seen = set()
+        for alias in city_name_aliases(city):
+            for child in index.get("aliases", {}).get(alias, []):
+                child_key = _normalized_path_key(child)
+                if child_key not in seen:
+                    seen.add(child_key)
+                    matches.append(child)
+        # 处理“潍坊奎文区 ↔ 奎文区”这类省略“市”字、无法仅靠行政后缀拆分的层级写法。
+        for candidate in city_hierarchy_suffixes(city):
+            for child in (
+                index.get("exact", {}).get(candidate, []) +
+                index.get("hierarchy_suffixes", {}).get(candidate, [])
+            ):
+                child_key = _normalized_path_key(child)
+                if child_key not in seen:
+                    seen.add(child_key)
+                    matches.append(child)
+    if not matches:
+        # 某些 Windows 文件系统在短时间内新增目录时父目录时间戳不会立刻变化；
+        # 仅在首次未命中时强制刷新一次，正常大量目录匹配仍使用缓存。
+        index = image_folder_index(cfg, force=True)
+        matches = list(index.get("exact", {}).get(normalized, []))
+        if not matches:
+            seen = set()
+            for alias in city_name_aliases(city):
+                for child in index.get("aliases", {}).get(alias, []):
+                    child_key = _normalized_path_key(child)
+                    if child_key not in seen:
+                        seen.add(child_key)
+                        matches.append(child)
+            for candidate in city_hierarchy_suffixes(city):
+                for child in (
+                    index.get("exact", {}).get(candidate, []) +
+                    index.get("hierarchy_suffixes", {}).get(candidate, [])
+                ):
+                    child_key = _normalized_path_key(child)
+                    if child_key not in seen:
+                        seen.add(child_key)
+                        matches.append(child)
     if not matches:
         raise FileNotFoundError(f"找不到城市“{city}”对应的图片子文件夹：{root / city}")
     if len(matches) > 1:
@@ -2053,6 +2408,98 @@ class DailyPublishLimitError(RuntimeError):
     """抖音明确提示今天投稿次数已达到上限。"""
 
 
+class PageContentResetAfterCrashError(RuntimeError):
+    """网页崩溃后已经自动刷新；当前未提交作品需要从上传重新恢复。"""
+
+
+PAGE_CRASH_MARKERS = (
+    "网页已崩溃", "网页崩溃", "糟糕，网页崩溃了", "喔唷，崩溃啦",
+    "aw, snap", "status_access_violation", "result_code_", "page crashed",
+)
+
+
+def register_page_health_monitor(page):
+    if page is None or id(page) in _MONITORED_PAGE_IDS:
+        return page
+    try:
+        page.on("crash", lambda *_args, target=page: _CRASHED_PAGE_IDS.add(id(target)))
+        _MONITORED_PAGE_IDS.add(id(page))
+    except Exception:
+        pass
+    return page
+
+
+def page_crash_info(page):
+    if page is None:
+        return {"crashed": False, "reason": ""}
+    register_page_health_monitor(page)
+    if id(page) in _CRASHED_PAGE_IDS:
+        return {"crashed": True, "reason": "Playwright 检测到页面 crash 事件"}
+    try:
+        if page.is_closed():
+            return {"crashed": True, "reason": "发布标签页已经关闭", "closed": True}
+    except Exception:
+        pass
+    try:
+        url = str(page.url or "")
+    except Exception:
+        url = ""
+    try:
+        title = str(page.title() or "")
+    except Exception:
+        title = ""
+    try:
+        body = str(page.locator("body").inner_text(timeout=900) or "")[:2000]
+    except Exception:
+        body = ""
+    evidence = f"{title}\n{body}".casefold()
+    marker = next((item for item in PAGE_CRASH_MARKERS if item.casefold() in evidence), "")
+    error_url = url.casefold().startswith(("chrome-error://", "about:crash"))
+    return {
+        "crashed": bool(marker or error_url),
+        "reason": marker or ("Chrome 错误页面" if error_url else ""),
+        "url": url,
+    }
+
+
+def recover_crashed_page(cfg, page, target_url=""):
+    """识别 Chrome 崩溃页后自动刷新；失败再回到指定/当前创作者页。"""
+    info = page_crash_info(page)
+    if not info.get("crashed"):
+        return False
+    if info.get("closed"):
+        # 已关闭标签不能原位刷新；交给“整理浏览器标签/总体重试”创建新标签。
+        return False
+    wlog(f"检测到网页已崩溃（{info.get('reason') or '未知崩溃提示'}），正在自动刷新恢复。")
+    save_debug(cfg, page, "page_crashed_before_recovery")
+    fallback_url = str(target_url or info.get("url") or cfg.get("creator_url") or "").strip()
+    if fallback_url.casefold().startswith(("chrome-error://", "about:")):
+        fallback_url = str(cfg.get("creator_url") or "https://creator.douyin.com/")
+    last_error = None
+    for attempt in range(1, 4):
+        _CRASHED_PAGE_IDS.discard(id(page))
+        try:
+            page.reload(wait_until="domcontentloaded", timeout=60000)
+        except Exception as exc:
+            last_error = exc
+            if fallback_url:
+                try:
+                    page.goto(fallback_url, wait_until="domcontentloaded", timeout=60000)
+                except Exception as goto_exc:
+                    last_error = goto_exc
+        try:
+            page.wait_for_timeout(700)
+        except Exception:
+            pass
+        state = page_crash_info(page)
+        if not state.get("crashed"):
+            wlog(f"网页崩溃恢复成功（第 {attempt} 次自动刷新）。")
+            return True
+        last_error = RuntimeError(state.get("reason") or "刷新后仍是崩溃页")
+    save_debug(cfg, page, "page_crash_recovery_failed")
+    raise RuntimeError(f"网页崩溃后自动刷新 3 次仍未恢复：{last_error}")
+
+
 DAILY_PUBLISH_LIMIT_MARKERS = (
     "抱歉，今天投稿次数已达到上限，请明天再试",
     "今天投稿次数已达到上限，请明天再试",
@@ -2122,13 +2569,28 @@ def run_publish_step(cfg, page, step_name, action):
     total_attempts = retry_count + 1
     for attempt in range(1, total_attempts + 1):
         try:
+            if page is not None and recover_crashed_page(cfg, page):
+                raise PageContentResetAfterCrashError("网页已自动刷新，当前作品需从图片上传步骤恢复。")
             result = action()
             if attempt > 1:
                 wlog(f"步骤“{step_name}”第 {attempt}/{total_attempts} 次执行成功。")
             return result
         except (AccountLoggedOutError, DailyPublishLimitError):
             raise
+        except PageContentResetAfterCrashError as exc:
+            raise PublishStepFailedError(step_name, 1, exc) from exc
         except Exception as exc:
+            if page is not None:
+                try:
+                    if recover_crashed_page(cfg, page):
+                        recovered = PageContentResetAfterCrashError(
+                            f"步骤“{step_name}”执行时网页崩溃，已自动刷新并准备重新上传当前作品。"
+                        )
+                        raise PublishStepFailedError(step_name, 1, recovered) from recovered
+                except PublishStepFailedError:
+                    raise
+                except Exception as recovery_exc:
+                    exc = RuntimeError(f"{exc}；网页崩溃自动恢复失败：{recovery_exc}")
             wlog(f"步骤“{step_name}”第 {attempt}/{total_attempts} 次失败：{repr(exc)}")
             if page is not None:
                 safe_name = re.sub(r"[^0-9A-Za-z_-]+", "_", str(step_name)).strip("_") or "publish_step"
@@ -2144,13 +2606,29 @@ def run_publish_workflow(cfg, workflow, before_overall_retry=None):
     overall_retry_count = normalize_retry_count(cfg.get("overall_retry_times", 1), 1)
     total_attempts = overall_retry_count + 1
     last_error = None
-    for attempt in range(1, total_attempts + 1):
+    attempt = 1
+    crash_restarts = 0
+    while attempt <= total_attempts:
         try:
             return workflow(attempt, total_attempts)
         except (AccountLoggedOutError, DailyPublishLimitError):
             raise
         except PublishStepFailedError as exc:
             last_error = exc
+            root_cause = exc
+            visited = set()
+            while getattr(root_cause, "cause", None) is not None and id(root_cause) not in visited:
+                visited.add(id(root_cause))
+                root_cause = root_cause.cause
+            if isinstance(root_cause, PageContentResetAfterCrashError) and crash_restarts < 2:
+                crash_restarts += 1
+                wlog(
+                    f"网页崩溃已自动刷新，正在第 {crash_restarts}/2 次恢复当前作品；"
+                    "本次不消耗用户设置的普通总体重试次数。"
+                )
+                if before_overall_retry is not None:
+                    before_overall_retry(attempt, exc)
+                continue
             if attempt >= total_attempts:
                 raise PublishWorkflowFailedError(total_attempts, exc) from exc
             wlog(
@@ -2160,6 +2638,7 @@ def run_publish_workflow(cfg, workflow, before_overall_retry=None):
             if before_overall_retry is not None:
                 before_overall_retry(attempt, exc)
             step_wait(cfg, "当前作品总体重试：准备重新上传")
+            attempt += 1
     raise PublishWorkflowFailedError(total_attempts, last_error or RuntimeError("未知发布错误"))
 
 
@@ -2253,6 +2732,8 @@ def wait_uploaded_with_config(cfg, page):
     wlog(f"判断图片是否上传完成，检测间隔={interval}秒，最大等待={max_wait}秒。")
     start = time.time()
     while True:
+        if recover_crashed_page(cfg, page):
+            raise PageContentResetAfterCrashError("图片检测期间网页崩溃，已自动刷新；需要重新上传当前图片。")
         if image_upload_completed(page):
             wlog("图片上传完成：检测到编辑图片/已添加图片/封面设置等完成标识。")
             return True
@@ -2421,8 +2902,10 @@ def click_creator_publish_entry(cfg, page):
     if wait_sec < 0:
         wait_sec = 0
 
+    register_page_health_monitor(page)
     wlog("当前标签打开抖音创作者中心首页。")
     page.goto(cfg.get("creator_url", "https://creator.douyin.com/"), wait_until="domcontentloaded", timeout=60000)
+    recover_crashed_page(cfg, page, cfg.get("creator_url", "https://creator.douyin.com/"))
     safe_bring_to_front(cfg, page)
 
     wait_login(page)
@@ -2472,6 +2955,7 @@ def click_creator_publish_entry(cfg, page):
         wlog("未读到可用发布入口 href，使用图文上传页地址作为无坐标兜底。")
 
     page.goto(target_url, wait_until="domcontentloaded", timeout=60000)
+    recover_crashed_page(cfg, page, target_url)
     step_wait(cfg, "当前标签打开发布图文上传页后等待")
 
     if platform_image_publish_page_ready(page):
@@ -2552,6 +3036,8 @@ def wait_after_upload_to_editor(cfg, page):
     interval = max(1, interval)
     start_time = time.time()
     while True:
+        if recover_crashed_page(cfg, page):
+            raise PageContentResetAfterCrashError("上传后网页崩溃，已自动刷新；需要重新上传当前图片。")
         try:
             text = page.locator("body").inner_text(timeout=2500)
         except Exception:
@@ -3198,7 +3684,7 @@ def scroll_to_music_area(cfg, page):
             """)
         except Exception:
             pass
-        step_wait(cfg, f"滚动到选择音乐区域 第{i}次")
+        page.wait_for_timeout(250)
         try:
             text = page.locator("body").inner_text(timeout=2000)
         except Exception:
@@ -3285,35 +3771,46 @@ def open_music_panel_v301_recognition(cfg, page):
     }
     """
 
-    for attempt in range(1, 8):
+    for attempt in range(1, 5):
         try:
             result = page.evaluate(js_click_music)
             wlog("点击音乐入口结果：" + json.dumps(result, ensure_ascii=False)[:400])
             if result and result.get("ok"):
-                step_wait(cfg, f"第 {attempt} 次点击选择音乐后等待面板")
-                if platform_music_panel_opened(page):
+                if wait_music_panel_open(page, 2.5):
                     wlog("平台音乐面板已打开。")
                     return True
+                # DOM click 没触发时，必须在同一识别目标上补一次真实鼠标点击。
+                if result.get("x") is not None and result.get("y") is not None:
+                    page.mouse.click(float(result["x"]), float(result["y"]))
+                    if wait_music_panel_open(page, 2.5):
+                        wlog("v3.0.1 识别目标经真实鼠标点击后已打开音乐面板。")
+                        return True
         except Exception as e:
             wlog(f"第 {attempt} 次点击选择音乐入口失败：{repr(e)}")
 
         # 有些情况下点了行但没打开，再点"选择音乐"文字坐标
         try:
             rects = get_text_rects(page, "选择音乐")
-            # 选择左侧/中间编辑区的文字
-            rects = [r for r in rects if r.get("x", 9999) < 700]
+            viewport = page.evaluate("() => ({w:window.innerWidth,h:window.innerHeight})")
+            viewport_width = max(1, float((viewport or {}).get("w", 1)))
+            viewport_height = max(1, float((viewport or {}).get("h", 1)))
+            # 旧版固定 x<700 会在宽屏/缩放设备上过滤真实入口；改为相对视口范围。
+            rects = [
+                r for r in rects
+                if 0 <= float(r.get("x", -1)) < viewport_width * 0.86
+                and 0 <= float(r.get("y", -1)) < viewport_height
+            ]
             if rects:
-                r = rects[-1]
+                r = max(rects, key=lambda item: (float(item.get("y", 0)), float(item.get("x", 0))))
                 page.mouse.click(float(r["cx"]), float(r["cy"]))
-                step_wait(cfg, "点击选择音乐文字后等待")
-                if platform_music_panel_opened(page):
+                if wait_music_panel_open(page, 2.5):
                     wlog("平台音乐面板已打开。")
                     return True
         except Exception:
             pass
 
         scroll_to_music_area(cfg, page)
-        step_wait(cfg, "音乐面板未打开，准备重试")
+        page.wait_for_timeout(350)
 
     save_debug(cfg, page, "music_panel_not_opened")
     raise RuntimeError("没有打开平台音乐面板。")
@@ -3357,6 +3854,43 @@ def wait_music_panel_open(page, timeout_seconds=4):
     return False
 
 
+def click_music_entry_locator(page, locator, label="打开音乐面板"):
+    """同一入口逐级点击并逐次校验，避免“click 未报错”被误当作已打开。"""
+    try:
+        locator.scroll_into_view_if_needed(timeout=1500)
+    except Exception:
+        pass
+    def real_mouse_click():
+        box = locator.bounding_box(timeout=1200)
+        if not box:
+            raise RuntimeError("入口没有可点击边界")
+        page.mouse.click(
+            box["x"] + box["width"] / 2,
+            box["y"] + box["height"] / 2,
+        )
+
+    methods = (
+        ("Playwright 语义点击", lambda: locator.click(timeout=2200)),
+        (
+            "DOM 原生 click",
+            lambda: locator.evaluate(
+                "el => (el.closest('button,[role=button],a,[tabindex]') || el).click()",
+                timeout=1800,
+            ),
+        ),
+        ("真实鼠标点击", real_mouse_click),
+    )
+    for method, action in methods:
+        try:
+            action()
+            wlog(f"{label}：已执行{method}，正在校验音乐抽屉。")
+            if wait_music_panel_open(page, 2.5):
+                return True
+        except Exception as exc:
+            wlog(f"{label}：{method}未完成：{repr(exc)}")
+    return False
+
+
 def open_music_panel(cfg, page):
     if verify_music_selected(page, log_detail=False):
         return True
@@ -3381,7 +3915,9 @@ def open_music_panel(cfg, page):
             pass
 
     for item in semantic_candidates:
-        if click_locator_with_fallback(page, item, "打开音乐面板") and wait_music_panel_open(page, 6):
+        if music_control_belongs_to_panel(item):
+            continue
+        if click_music_entry_locator(page, item, "打开音乐面板"):
             wlog("平台音乐面板已打开。")
             return True
 
@@ -3397,7 +3933,7 @@ def open_music_panel(cfg, page):
           const nodes = [...document.querySelectorAll('div,section,li')].filter(visible);
           const rows = nodes.filter(el => {
             const t = txt(el); const r = el.getBoundingClientRect();
-            const inDialog = !!el.closest('[role="dialog"],[aria-modal="true"],[data-e2e*="music" i],[data-testid*="music" i]');
+            const inDialog = !!el.closest('[role="dialog"],[aria-modal="true"],[data-douyin-music-panel-confirmed="1"]');
             return !inDialog && t && t.length < 500 && r.width > 220 && r.height > 28 && r.height < 180 &&
               (t.includes('点击添加合适作品风格音乐') || t.includes('选择音乐'));
           }).sort((a,b) => (a.getBoundingClientRect().width*a.getBoundingClientRect().height) -
@@ -4823,8 +5359,55 @@ def click_bottom_publish_button(cfg, page):
     if not click_locator_with_fallback(page, btn, "底部发布按钮", timeout=8000):
         save_debug(cfg, page, "publish_button_click_failed")
         raise RuntimeError("底部发布按钮语义点击、DOM click 和真实鼠标兜底均失败。")
-    step_wait(cfg, "点击发布后等待")
+    # 失败 Toast 可能只显示数秒，提交后立即进入结果轮询，不能先随机长等待。
+    page.wait_for_timeout(250)
     return True
+
+
+def detect_publish_failure_reason(page):
+    """读取可见 Toast/alert/弹窗中的平台原始失败原因。"""
+    try:
+        result = page.evaluate(r"""
+        () => {
+          function visible(el){
+            const r=el.getBoundingClientRect(), s=getComputedStyle(el);
+            return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden' && Number(s.opacity||1)>0;
+          }
+          function text(el){ return ((el.innerText||el.textContent||'')+'').replace(/\s+/g,' ').trim(); }
+          const strong = /(投稿|发布|作品|视频|图文).{0,30}(失败|错误|封禁|限制|不可用|未通过|拒绝)|(?:失败|错误|封禁|违规|过于频繁|稍后再试|请完善|不能为空|不符合)/;
+          const exclude = /作品未见异常|快速检测|温馨提示.*机器检测/;
+          const semantic = [
+            '[role="alert"]','[role="status"]','[aria-live="assertive"]','[aria-live="polite"]',
+            '[data-e2e*="toast" i]','[data-testid*="toast" i]','[data-e2e*="message" i]',
+            '[data-testid*="message" i]','[class*="toast" i]','[class*="message" i]',
+            '[class*="notification" i]','[class*="alert" i]','[class*="error" i]','[role="dialog"]'
+          ];
+          const nodes=[...new Set(semantic.flatMap(sel=>[...document.querySelectorAll(sel)]))].filter(visible);
+          for(const el of [...document.querySelectorAll('div,span,p')]){
+            if(!visible(el)) continue;
+            const t=text(el);
+            if(t && t.length<=360 && strong.test(t)) nodes.push(el);
+          }
+          const values=[];
+          for(const el of [...new Set(nodes)]){
+            const t=text(el);
+            if(!t || t.length>600 || exclude.test(t) || !strong.test(t)) continue;
+            const r=el.getBoundingClientRect();
+            let score=0;
+            if(el.matches('[role="alert"],[role="status"],[aria-live]')) score+=1000;
+            if(/toast|message|notification|alert|error/i.test(String(el.className||''))) score+=700;
+            if(/封禁|限制|拒绝|失败/.test(t)) score+=500;
+            if(r.top>=0 && r.top<window.innerHeight*.35) score+=200;
+            score-=t.length;
+            values.push({text:t,score});
+          }
+          values.sort((a,b)=>b.score-a.score);
+          return values[0] || {text:'',score:0};
+        }
+        """)
+        return re.sub(r"\s+", " ", str((result or {}).get("text") or "")).strip()[:500]
+    except Exception:
+        return ""
 
 
 def wait_publish_result_once(cfg, page, wait_seconds=35):
@@ -4839,8 +5422,11 @@ def wait_publish_result_once(cfg, page, wait_seconds=35):
     end = time.time() + wait_seconds
     last_state_log = 0
     success_notice_seen = False
+    _PUBLISH_FAILURE_REASONS.pop(id(page), None)
 
     while time.time() < end:
+        if recover_crashed_page(cfg, page):
+            raise PageContentResetAfterCrashError("提交后网页崩溃，已自动刷新；无法确认本次提交结果。")
         if daily_publish_limit_visible(page):
             save_debug(cfg, page, "daily_publish_limit")
             wlog("发布结果判断：检测到‘今天投稿次数已达到上限，请明天再试’。")
@@ -4855,9 +5441,11 @@ def wait_publish_result_once(cfg, page, wait_seconds=35):
                 wlog("发布结果判断：检测到成功提示，继续等待并确认进入作品管理页。")
                 success_notice_seen = True
 
-        if has_any(page, ["发布失败", "错误", "请完善", "不能为空", "违规", "过于频繁", "稍后再试"], 600):
+        failure_reason = detect_publish_failure_reason(page)
+        if failure_reason:
+            _PUBLISH_FAILURE_REASONS[id(page)] = failure_reason
             save_debug(cfg, page, "publish_error")
-            wlog("发布结果判断：检测到失败或错误提示。")
+            wlog(f"发布结果判断：平台提示“{failure_reason}”。")
             return "error"
 
         if publish_page_still_visible(page):
@@ -4872,7 +5460,7 @@ def wait_publish_result_once(cfg, page, wait_seconds=35):
                     wlog("发布结果判断：页面跳转中。")
                 last_state_log = time.time()
 
-        time.sleep(2)
+        page.wait_for_timeout(500)
 
     if daily_publish_limit_visible(page):
         save_debug(cfg, page, "daily_publish_limit")
@@ -4880,6 +5468,11 @@ def wait_publish_result_once(cfg, page, wait_seconds=35):
 
     if manage_page_visible(page):
         return "success"
+
+    failure_reason = detect_publish_failure_reason(page)
+    if failure_reason:
+        _PUBLISH_FAILURE_REASONS[id(page)] = failure_reason
+        return "error"
 
     if publish_page_still_visible(page):
         return "still_publish"
@@ -4905,7 +5498,10 @@ def submit(cfg, page):
         save_debug(cfg, page, "publish_still_on_publish_page")
         wlog("发布结果判断：仍停留在发布页面，本次完整作品尝试失败。")
     elif result == "error":
-        wlog("发布结果判断：页面返回失败提示，本次完整作品尝试失败。")
+        reason = str(_PUBLISH_FAILURE_REASONS.get(id(page), "") or "").strip()
+        if reason:
+            raise RuntimeError(f"抖音平台拒绝发布：{reason}")
+        raise RuntimeError("抖音页面提示发布失败，但没有提供可读取的具体原因。")
     else:
         save_debug(cfg, page, "publish_result_unknown")
         wlog("发布结果判断：未能确认是否进入作品管理页，本次完整作品尝试失败。")
@@ -4922,7 +5518,7 @@ def keep_single_browser_tab(context, page=None):
     try:
         pages = list(context.pages)
         if not pages:
-            return context.new_page()
+            return register_page_health_monitor(context.new_page())
 
         chosen = page if page in pages else None
         if chosen is None:
@@ -4946,7 +5542,7 @@ def keep_single_browser_tab(context, page=None):
         # v1.1：不主动拉起/恢复最小化浏览器
         safe_bring_to_front(ACTIVE_CFG or {}, chosen)
         wlog("已整理浏览器标签：仅保留 1 个发布标签。")
-        return chosen
+        return register_page_health_monitor(chosen)
     except Exception as e:
         wlog(f"整理浏览器标签失败：{repr(e)}")
         try:
@@ -4996,9 +5592,18 @@ def account_worker(config_path):
     cfg["browser_accounts"] = [accounts[0]]
     accounts = [accounts[0]]
     ACTIVE_CFG = cfg
+    if cfg.get("delete_copy_after_success", True):
+        retry_failed_excel_deletions(cfg)
     records = read_publish_records(cfg)
     slots = build_slots(cfg) if cfg.get("use_schedule", True) else []
     state = read_state(cfg)
+    try:
+        legacy_source_newer_than_state = (
+            Path(cfg["excel_path"]).stat().st_mtime_ns > state_file_path(cfg).stat().st_mtime_ns
+        )
+    except OSError:
+        legacy_source_newer_than_state = False
+    state = migrate_legacy_copy_tracking(cfg)
     primary_account = accounts[0]
     primary_quota = max(1, int(primary_account.get("posts_per_run", 1) or 1))
     # 轮换发布模式下，父进程仍保留账号完整配额，但每次只允许当前账号成功发布指定条数。
@@ -5126,11 +5731,36 @@ def account_worker(config_path):
 
             while account_done < account_quota and (queue_pass_limit <= 0 or pass_done < queue_pass_limit):
                 records = read_publish_records(account_cfg)
+                raw_record_count = len(records)
                 if account_cfg.get("delete_copy_after_success", True):
-                    records = filter_used_publish_records(records, read_state(account_cfg))
+                    records = filter_used_publish_records(records, read_state(account_cfg), account_cfg)
                     ci = 0
+                else:
+                    cursor_state = read_state(account_cfg)
+                    ci, reconciled, record_signature = reconcile_copy_cursor(
+                        account_cfg, records, cursor_state, ci,
+                        legacy_source_newer=legacy_source_newer_than_state,
+                    )
+                    if reconciled:
+                        cursor_state.update({
+                            "copy_index": ci,
+                            "copy_records_signature": record_signature,
+                        })
+                        write_state(account_cfg, cursor_state)
+                        wlog(f"检测到 Excel 内容已补充或替换，文案序号已自动校准为 {ci + 1}。")
+                    legacy_source_newer_than_state = False
                 if not records:
-                    alert_auto_pause("提醒：Excel 中已没有可发布文案，全部任务结束。")
+                    empty_state = read_state(account_cfg)
+                    empty_state["copy_records_signature"] = publish_records_signature([])
+                    write_state(account_cfg, empty_state)
+                    if raw_record_count:
+                        empty_message = (
+                            "Excel 中现有文案均已确认发布成功，但此前删行失败；"
+                            "已按共享进度跳过，避免轮换账号重复发布。"
+                        )
+                    else:
+                        empty_message = "Excel 中已没有可发布文案，全部任务结束。"
+                    alert_auto_pause("提醒：" + empty_message)
                     append_log(account_cfg, {
                         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
                         "image": "", "copy_index": 0,
@@ -5371,12 +6001,12 @@ def account_worker(config_path):
                     alert_auto_pause(
                         f"自动暂停提醒：{account_name} 的失败步骤已重试 {retry_times} 次，"
                         f"总体流程又重试 {overall_retry_times} 次后仍未完成，"
-                        "当前内容未消费；请查看固定运行日志和调试截图。"
+                        f"当前内容未消费。具体原因：{failure_reason}。"
+                        "请查看固定运行日志和调试截图。"
                     )
                     break
 
                 # 只有确认进入作品管理页后，才消费图片、文案和排期。
-                mark_publish_record_used_in_state(account_cfg, publish_record)
                 if account_cfg.get("delete_image_after_success", True):
                     try:
                         img.unlink()
@@ -5384,10 +6014,15 @@ def account_worker(config_path):
                     except Exception as exc:
                         wlog(f"删除图片失败：{exc}")
                 if account_cfg.get("delete_copy_after_success", True):
+                    deleted_copy = False
                     try:
-                        delete_copy_from_excel(account_cfg, publish_record)
+                        deleted_copy = bool(delete_copy_from_excel(account_cfg, publish_record))
                     except Exception as exc:
                         wlog(f"删除已用文案失败：{repr(exc)}")
+                    if deleted_copy:
+                        clear_failed_delete_receipt(account_cfg, publish_record)
+                    else:
+                        mark_failed_delete_receipt(account_cfg, publish_record)
 
                 published_copy_index = ci + 1
                 ci = 0 if account_cfg.get("delete_copy_after_success", True) else ci + 1
@@ -5399,7 +6034,14 @@ def account_worker(config_path):
                 state_now.update({
                     "copy_index": ci,
                     "slot_index": si,
-                    "used_copy_keys": state_now.get("used_copy_keys", []),
+                    "used_copy_keys": [],
+                    "copy_tracking_version": 2,
+                    "copy_records_signature": (
+                        publish_records_signature(records)
+                        if not account_cfg.get("delete_copy_after_success", True) else
+                        str(state_now.get("copy_records_signature") or "")
+                    ),
+                    "last_published_record_key": publish_record_key(publish_record),
                     "schedule_signature": schedule_signature(account_cfg),
                     "queue_run_id": queue_run_id,
                     "run_progress": account_done,
@@ -7767,6 +8409,10 @@ class App:
             if not scheduled:
                 messagebox.showwarning("无法开始", str(exc))
             return False
+        if scheduled:
+            enabled_accounts = browser_accounts_from_config(self.cfg, enabled_only=True)
+            reset_scheduled_queue_round(self.cfg, enabled_accounts)
+            self.write_ui("自动启动已建立新一轮任务：账号发布配额和排期轮次已重置，未消费文案进度继续保留。\n")
         clear_pause_flags_for_queue(
             self.cfg, browser_accounts_from_config(self.cfg, enabled_only=True)
         )
@@ -7930,6 +8576,10 @@ class App:
                     "copy_index": 0,
                     "slot_index": 0,
                     "used_copy_keys": [],
+                    "failed_delete_receipts": [],
+                    "copy_records_signature": "",
+                    "last_published_record_key": "",
+                    "copy_tracking_version": 2,
                     "schedule_signature": "",
                     "queue_run_id": "",
                     "queue_run_active": False,
@@ -8001,7 +8651,7 @@ def run_gui():
 
 def run_self_test():
     """不连接浏览器、不发布内容的内置冒烟测试。"""
-    assert APP_VERSION == "3.0.6"
+    assert APP_VERSION == "3.0.7"
     assert APP_NAME.endswith(APP_VERSION)
     assert UPDATE_MANIFEST_URL.startswith("https://api.xibao-zg.top/updates/")
     assert "github" not in UPDATE_MANIFEST_URL.lower() and not UPDATE_MANIFEST_FALLBACK_URLS
@@ -8011,7 +8661,7 @@ def run_self_test():
     assert publish_mode_plan(False) == "direct_submit"
     assert publish_mode_plan(True) == "schedule"
     assert "open_music_panel_v301_recognition" in open_music_panel.__code__.co_names
-    assert "click_locator_with_fallback" in open_music_panel.__code__.co_names
+    assert "click_music_entry_locator" in open_music_panel.__code__.co_names
     assert "get_text_rects" in open_music_panel_v301_recognition.__code__.co_names
     assert "click_locator_with_fallback" not in open_music_panel_v301_recognition.__code__.co_names
     assert "_legacy_open_music_panel" not in globals()
@@ -8058,6 +8708,10 @@ def run_self_test():
     assert city_names_match("恩施", "恩施土家族苗族自治州")
     assert city_names_match("朝阳", "朝阳区")
     assert city_names_match("曹", "曹县")
+    assert city_names_match("潍坊市奎文区", "潍坊奎文区")
+    assert city_names_match("潍坊市奎文区", "奎文区")
+    assert "奎文区" in city_hierarchy_suffixes("潍坊奎文区")
+    assert "杭余杭区" not in city_name_aliases("杭州余杭区")
     assert not city_names_match("广州", "广")
     headerless_city_records = extract_publish_records(
         pd.DataFrame([
@@ -8102,6 +8756,21 @@ def run_self_test():
             folder.mkdir()
             record = {**structured_records[0], "city": excel_name}
             assert resolve_image_dir_for_record(image_cfg, record) == folder
+        hierarchy_folder = image_root / "潍坊奎文区"
+        hierarchy_folder.mkdir()
+        assert resolve_image_dir_for_record(
+            image_cfg, {**structured_records[0], "city": "潍坊市奎文区"}
+        ) == hierarchy_folder
+        assert resolve_image_dir_for_record(
+            image_cfg, {**structured_records[0], "city": "奎文区"}
+        ) == hierarchy_folder
+        district_folder = image_root / "余杭区"
+        district_folder.mkdir()
+        assert resolve_image_dir_for_record(
+            image_cfg, {**structured_records[0], "city": "杭州余杭区"}
+        ) == district_folder
+        cached_index = image_folder_index(image_cfg)
+        assert image_folder_index(image_cfg) is cached_index
         (image_root / "新城区").mkdir()
         (image_root / "新城县").mkdir()
         try:
@@ -8200,6 +8869,46 @@ def run_self_test():
         assert delete_copy_from_excel(structured_cfg, records[0]) is True
         remaining = read_publish_records(structured_cfg)
         assert len(remaining) == 1 and remaining[0]["title"] == "标题二"
+
+        shared_state_path = Path(temp_dir) / "shared_queue_state.json"
+        account_state_path = Path(temp_dir) / "account_state.json"
+        receipt_cfg = {
+            **structured_cfg,
+            "state_path": str(account_state_path),
+            "_queue_state_base_path": str(shared_state_path),
+        }
+        receipt_record = remaining[0]
+        mark_failed_delete_receipt(receipt_cfg, receipt_record)
+        assert filter_used_publish_records([receipt_record], {}, receipt_cfg) == []
+        second_account_cfg = {**receipt_cfg, "state_path": str(Path(temp_dir) / "account_state_2.json")}
+        assert filter_used_publish_records([receipt_record], {}, second_account_cfg) == []
+        clear_failed_delete_receipt(receipt_cfg, receipt_record)
+        assert filter_used_publish_records([receipt_record], {}, second_account_cfg) == [receipt_record]
+
+        write_state(receipt_cfg, {"used_copy_keys": [publish_record_key(receipt_record)]})
+        migrated = migrate_legacy_copy_tracking(receipt_cfg)
+        assert migrated["used_copy_keys"] == [] and migrated["copy_tracking_version"] == 2
+
+        old_records = [
+            {**receipt_record, "copy": "旧文案一", "excel_row": 2},
+            {**receipt_record, "copy": "旧文案二", "excel_row": 3},
+        ]
+        new_records = [{**receipt_record, "copy": "新放入文案", "excel_row": 2}]
+        cursor_state = {
+            "copy_records_signature": publish_records_signature(old_records),
+            "last_published_record_key": publish_record_key(old_records[-1]),
+        }
+        cursor, changed, _signature = reconcile_copy_cursor(receipt_cfg, new_records, cursor_state, 2)
+        assert changed is True and cursor == 0
+        expanded_records = [
+            {**receipt_record, "copy": f"新文案{index}", "excel_row": index + 2}
+            for index in range(8)
+        ]
+        cursor, changed, _signature = reconcile_copy_cursor(
+            receipt_cfg, expanded_records,
+            {"copy_records_signature": publish_records_signature([])}, 5,
+        )
+        assert changed is True and cursor == 0
     legacy = default_config()
     legacy["browser_path"] = r"D:\浏览器7.lnk"
     legacy["image_dir"] = r"D:\共享城市图片"
@@ -8349,6 +9058,21 @@ def run_self_test():
     except DailyPublishLimitError:
         assert daily_limit_calls["count"] == 1
 
+    crash_retry_calls = {"workflow": 0, "prepare": 0}
+
+    def crash_once(_attempt, _total):
+        crash_retry_calls["workflow"] += 1
+        if crash_retry_calls["workflow"] == 1:
+            cause = PageContentResetAfterCrashError("网页已刷新")
+            raise PublishStepFailedError("等待编辑页", 1, cause)
+        return "recovered"
+
+    assert run_publish_workflow(
+        {"overall_retry_times": 0}, crash_once,
+        lambda _attempt, _error: crash_retry_calls.__setitem__("prepare", crash_retry_calls["prepare"] + 1),
+    ) == "recovered"
+    assert crash_retry_calls == {"workflow": 2, "prepare": 1}
+
     with tempfile.TemporaryDirectory(prefix="douyin_debug_cleanup_selftest_") as temp_dir:
         debug_dir = Path(temp_dir) / "screenshots"
         debug_dir.mkdir()
@@ -8381,6 +9105,21 @@ def run_self_test():
         resumed_id, resumed_completed, resumed = prepare_queue_run(queue_cfg, queue_accounts)
         assert resumed is True and resumed_id == queue_run_id
         assert resumed_completed == {duplicate_a["id"]}
+        for account in queue_accounts:
+            account_cfg = config_for_browser_account(queue_cfg, account)
+            write_state(account_cfg, {
+                "copy_index": 7, "slot_index": 4, "run_progress": 2,
+                "queue_run_id": queue_run_id, "last_published_record_key": "keep-copy-key",
+            })
+        reset_scheduled_queue_round(queue_cfg, queue_accounts)
+        assert read_state(queue_cfg)["queue_run_active"] is False
+        for account in queue_accounts:
+            scheduled_state = read_state(config_for_browser_account(queue_cfg, account))
+            assert scheduled_state["copy_index"] == 7
+            assert scheduled_state["slot_index"] == 0 and scheduled_state["run_progress"] == 0
+            assert scheduled_state["last_published_record_key"] == "keep-copy-key"
+        queue_run_id, completed_ids, resumed = prepare_queue_run(queue_cfg, queue_accounts)
+        assert resumed is False and completed_ids == set()
         pause_paths = pause_flag_paths_for_queue(queue_cfg, queue_accounts)
         for flag in pause_paths:
             flag.parent.mkdir(parents=True, exist_ok=True)
@@ -8419,6 +9158,33 @@ def run_self_test():
     assert normalize_schedule_input_value("2026/8/11 8:05:00") == "2026-08-11 08:05"
     assert schedule_value_matches("2026-08-11T08:05:00", schedule_slot)
     assert not schedule_value_matches("2026-08-11 17:05", schedule_slot)
+
+    class _CrashBody:
+        def inner_text(self, timeout=0):
+            return "糟糕，网页已崩溃"
+
+    class _CrashPage:
+        url = "https://creator.douyin.com/creator-micro/content/post/image"
+
+        def on(self, *_args):
+            return None
+
+        def is_closed(self):
+            return False
+
+        def title(self):
+            return "网页已崩溃"
+
+        def locator(self, _selector):
+            return _CrashBody()
+
+    assert page_crash_info(_CrashPage())["crashed"] is True
+
+    class _FailureReasonPage:
+        def evaluate(self, _script):
+            return {"text": "视频投稿功能已封禁，详情见【消息-系统通知】", "score": 1500}
+
+    assert "视频投稿功能已封禁" in detect_publish_failure_reason(_FailureReasonPage())
 
     class _AlreadyAtBottomMouse:
         def __init__(self):

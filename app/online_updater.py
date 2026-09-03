@@ -71,7 +71,7 @@ OBSOLETE_PATHS = [
     "app/assets/app_logo.ico",
 ]
 
-UPDATER_VERSION = "3.0.6"
+UPDATER_VERSION = "3.0.7"
 
 
 def format_bytes(value):
@@ -419,7 +419,7 @@ def relaunch_without_console(install_dir, fallback_launch=""):
 
 
 def run_self_test():
-    assert UPDATER_VERSION == "3.0.6"
+    assert UPDATER_VERSION == "3.0.7"
     assert format_bytes(0) == "0 B"
     assert format_bytes(1024) == "1.0 KB"
     assert stage_percent(5, 60, 50, 100) == 32.5

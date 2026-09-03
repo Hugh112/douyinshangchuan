@@ -1,9 +1,9 @@
 {
-  "latest_version": "3.0.6",
+  "latest_version": "3.0.7",
   "minimum_supported_version": "2.3.0",
-  "download_url": "https://api.xibao-zg.top/updates/publisher.douyin/stable/3.0.6/DouyinPublisher_Update_v3.0.6.zip",
-  "sha256": "7eb90cd7df2987aacdb15f1c911261b4158be796d02e46c85826883e65a762da",
-  "package_size_bytes": 89971758,
+  "download_url": "https://api.xibao-zg.top/updates/publisher.douyin/stable/3.0.7/DouyinPublisher_Update_v3.0.7.zip",
+  "sha256": "64a4a5e9f2a6591e5d5cbceea200419fa292a0ca7d4ccfd3479e6894f548fbd4",
+  "package_size_bytes": 100638123,
   "force_update": false,
   "is_forced": false,
   "rollout_percentage": 100,
@@ -11,16 +11,13 @@
     "app/douyin_gui_config.json"
   ],
   "release_notes": [
-    "修复部分缩放比例和页面布局下把发布页空音乐模块误判为音乐面板已打开的问题。",
-    "音乐入口优先使用新版模块直控；严格确认抽屉未打开后，完整执行 v3.0.1 音乐行识别、右侧区域和文字矩形真实点击。",
-    "歌曲列表、使用按钮、面板滚动和音乐生效校验继续使用新版规则，并限制在已确认的音乐抽屉内。",
-    "修复状态或日志路径误选为文件夹时出现 Permission denied；自动在该目录使用固定 JSON/CSV 文件名，且不改写用户配置。",
-    "发布成功后先保存账号进度；日志写入失败不再覆盖已确认成功状态，也不会重复消费文案。",
-    "城市图片子文件夹匹配新增市、州、区、县、自治州、自治县、盟、旗等行政区后缀，并对同名歧义给出明确提示。",
-    "修复启动前关闭 Chrome 残留时误杀 Playwright Node 驱动造成 Connection closed while reading from the driver。",
-    "轮换发布为缺少专用用户目录的浏览器按快捷方式和端口分配隔离持久目录，避免多个账号争用同一 Chrome 进程导致端口连接失败。",
-    "在线更新器增加下载、SHA256 校验、ZIP 检查、解压、安装和重启进度显示。",
-    "完整保留 v3.0.4 立即发布热补丁：未启用定时时直接点击底部发布按钮。",
-    "保留 v3.0.5 首次 CDP 慢启动等待和运行状态实时刷新。本次为可选更新。"
+    "音乐入口每次点击后都校验右侧音乐抽屉是否真实打开；新版模块操作无效时自动使用 v3.0.1 页面识别与真实点击兜底。",
+    "网页出现‘网页已崩溃’、Aw Snap、错误页或 Playwright crash 事件时自动刷新，并从当前作品重新上传，不消费图片、文案和发布进度。",
+    "修复轮换发布共用 Excel 时文案重复、表格仍有文案却误报用完，以及补充文案后序号超出数量的问题。",
+    "自动启动建立新的账号配额与排期轮次，同时保留未消费文案游标；手动停止和普通重启继续恢复当前进度。",
+    "图片文件夹优先匹配文案城市同名目录，再匹配市、州、区、县及‘地级市 + 区县’层级别名。",
+    "图片目录和 Excel 增加自动失效缓存，大量子文件夹场景不再按每条文案重复全量扫描。",
+    "发布失败时采集抖音页面给出的封禁、限制、违规或字段错误原文，并写入账号运行状态、日志、状态文件和失败提醒。",
+    "保留 v3.0.4 立即发布热补丁、v3.0.5 CDP 慢启动与状态实时刷新、v3.0.6 多浏览器隔离和在线更新进度显示。本次为可选更新。"
   ]
 }

@@ -1,5 +1,5 @@
 #define MyAppName "抖音智能发布中心"
-#define MyAppVersion "3.0.6"
+#define MyAppVersion "3.0.7"
 #define MyAppPublisher "百业信息"
 #define MyAppExeName "DouyinPublisher.exe"
 #ifndef MyAppId

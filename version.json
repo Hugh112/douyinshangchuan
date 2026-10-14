@@ -1,9 +1,9 @@
 {
-  "latest_version": "3.0.7",
+  "latest_version": "3.2.0",
   "minimum_supported_version": "2.3.0",
-  "download_url": "https://api.xibao-zg.top/updates/publisher.douyin/stable/3.0.7/DouyinPublisher_Update_v3.0.7.zip",
-  "sha256": "64a4a5e9f2a6591e5d5cbceea200419fa292a0ca7d4ccfd3479e6894f548fbd4",
-  "package_size_bytes": 100638123,
+  "download_url": "https://api.xibao-zg.top/updates/publisher.douyin/stable/3.2.0/DouyinPublisher_Update_v3.2.0.zip",
+  "sha256": "8db59f00343c4e6d7df00143866088a201e064db52c3a1ae3d8815a48b4b122b",
+  "package_size_bytes": 100679146,
   "force_update": false,
   "is_forced": false,
   "rollout_percentage": 100,
@@ -11,13 +11,10 @@
     "app/douyin_gui_config.json"
   ],
   "release_notes": [
-    "音乐入口每次点击后都校验右侧音乐抽屉是否真实打开；新版模块操作无效时自动使用 v3.0.1 页面识别与真实点击兜底。",
-    "网页出现‘网页已崩溃’、Aw Snap、错误页或 Playwright crash 事件时自动刷新，并从当前作品重新上传，不消费图片、文案和发布进度。",
-    "修复轮换发布共用 Excel 时文案重复、表格仍有文案却误报用完，以及补充文案后序号超出数量的问题。",
-    "自动启动建立新的账号配额与排期轮次，同时保留未消费文案游标；手动停止和普通重启继续恢复当前进度。",
-    "图片文件夹优先匹配文案城市同名目录，再匹配市、州、区、县及‘地级市 + 区县’层级别名。",
-    "图片目录和 Excel 增加自动失效缓存，大量子文件夹场景不再按每条文案重复全量扫描。",
-    "发布失败时采集抖音页面给出的封禁、限制、违规或字段错误原文，并写入账号运行状态、日志、状态文件和失败提醒。",
-    "保留 v3.0.4 立即发布热补丁、v3.0.5 CDP 慢启动与状态实时刷新、v3.0.6 多浏览器隔离和在线更新进度显示。本次为可选更新。"
+    "新增比特浏览器 Local API 接入、窗口选择和可选 Token 本机 DPAPI 加密保存，支持与快捷方式账号混合排队。",
+    "复用已打开的比特窗口和发布页，开始任务关闭默认工作台及多余标签；最后一项任务结束后自动关闭调用的窗口。",
+    "发布页加载最长等待默认 120 秒，上传声明弹窗默认选择无需添加自主声明。",
+    "修复浏览器编辑窗口保存按钮被遮挡；标签页独立滚动，主界面、登录和 API 表单操作按钮适配窗口与缩放。",
+    "保留话题选择修复、账号独立内容与图片、进度恢复和用户安装路径。本次为可选更新。"
   ]
 }

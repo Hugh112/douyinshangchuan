@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-抖音智能发布中心 v3.0.4 - 定时时间输入修复版
+抖音智能发布中心 v3.2.0 - 比特浏览器接入版
 功能：
 1. GUI 前端配置浏览器、图片、Excel、定时、等待、上传检测、重试等。
 2. 自动打开抖音创作者平台图文发布页。
@@ -36,6 +36,7 @@ import urllib.parse
 import urllib.request
 import ctypes
 import shutil
+import unicodedata
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -87,6 +88,15 @@ except Exception:
 
 from playwright.sync_api import sync_playwright, TimeoutError as PlaywrightTimeoutError
 
+from bitbrowser_api import (
+    BitBrowserClient,
+    BitBrowserTokenStore,
+    DEFAULT_BITBROWSER_API_URL,
+    normalize_bitbrowser_api_url,
+    normalize_bitbrowser_api_token,
+    validate_bitbrowser_window_id,
+)
+
 from platform_auth import (
     DpapiTokenStore,
     PlatformAuthClient,
@@ -111,8 +121,9 @@ APP_DATA_DIR = (
 CONFIG_PATH = APP_DATA_DIR / "douyin_gui_config.json"
 AUTH_TOKEN_PATH = APP_DATA_DIR / "authorization.bin"
 AUTH_LOGIN_PREFERENCES_PATH = APP_DATA_DIR / "login_preferences.bin"
+BITBROWSER_TOKEN_PATH = Path(os.environ.get("LOCALAPPDATA", str(Path.home()))) / "DouyinPublisher" / "bitbrowser_api_tokens.bin"
 DEBUG_SCREENSHOT_CLEANUP_STATE_PATH = APP_DATA_DIR / "debug_screenshot_cleanup.json"
-APP_VERSION = "3.0.7"
+APP_VERSION = "3.2.0"
 APP_NAME = f"抖音智能发布中心 v{APP_VERSION}"
 LOGO_ICO = RESOURCE_DIR / "assets" / "app_logo.ico"
 LOGO_PNG = RESOURCE_DIR / "assets" / "app_logo.png"
@@ -257,20 +268,25 @@ def format_release_notes(manifest):
 
 
 BROWSER_QUEUE_COLUMNS = (
-    "publish", "order", "name", "path", "excel", "schedule", "port", "quota", "published", "status",
+    "publish", "order", "name", "path", "excel", "schedule", "port", "quota",
+    "images", "image_mode", "declaration", "published", "status",
 )
 BROWSER_QUEUE_COLUMN_HEADINGS = {
-    "publish": "发布", "order": "顺序", "name": "账号名称", "path": "浏览器快捷方式 / EXE",
+    "publish": "发布", "order": "顺序", "name": "账号名称", "path": "浏览器路径 / 比特窗口 ID",
     "excel": "文案 Excel", "schedule": "独立发布时间",
-    "port": "端口", "quota": "发布条数", "published": "已发布", "status": "运行状态",
+    "port": "端口", "quota": "发布条数", "images": "图片/条",
+    "image_mode": "图片方式", "declaration": "声明",
+    "published": "已发布", "status": "运行状态",
 }
 BROWSER_QUEUE_DEFAULT_WIDTHS = {
     "publish": 58, "order": 48, "name": 105, "path": 250,
-    "excel": 190, "schedule": 230, "port": 66, "quota": 82, "published": 76, "status": 155,
+    "excel": 190, "schedule": 230, "port": 66, "quota": 82,
+    "images": 72, "image_mode": 105, "declaration": 90, "published": 76, "status": 155,
 }
 BROWSER_QUEUE_MIN_WIDTHS = {
     "publish": 46, "order": 42, "name": 72, "path": 120,
-    "excel": 100, "schedule": 130, "port": 52, "quota": 68, "published": 68, "status": 100,
+    "excel": 100, "schedule": 130, "port": 52, "quota": 68,
+    "images": 60, "image_mode": 76, "declaration": 65, "published": 68, "status": 100,
 }
 
 
@@ -299,6 +315,9 @@ def default_config():
     return {
         "creator_url": "https://creator.douyin.com/",
         "browser_path": str(browser),
+        "browser_type": "shortcut",
+        "bitbrowser_api_url": DEFAULT_BITBROWSER_API_URL,
+        "bitbrowser_window_id": "",
         "image_dir": r"D:\抖音\河北",
         "excel_path": r"D:\文案.xlsx",
         "sheet_name": "sheet1",
@@ -317,6 +336,7 @@ def default_config():
         "upload_max_wait_seconds": 180,
         "topic_wait_seconds": 3,
         "creator_center_wait_seconds": 8,
+        "creator_page_ready_timeout_seconds": 120,
         "retry_times": 3,
         "overall_retry_times": 1,
         "cdp_port": 9222,
@@ -352,6 +372,11 @@ def default_config():
         "auto_switch_graphic_mode": True,
         "platform_music_only": True,
         "random_image": False,
+        "images_per_post": 1,
+        "image_selection_mode": "ordered",
+        "declaration_enabled": False,
+        "declaration_entry_text": "自主声明",
+        "declaration_text": "",
         "weekly_start_enabled": False,
         "weekly_start_days": [0, 1, 2, 3, 4],
         "weekly_start_time": "09:00",
@@ -377,8 +402,11 @@ def normalize_browser_account(raw, index, legacy_cfg=None):
     """把旧单浏览器配置或新版账号配置规范化为同一种结构。"""
     raw = raw if isinstance(raw, dict) else {}
     legacy_cfg = legacy_cfg if isinstance(legacy_cfg, dict) else {}
-    browser_path = str(raw.get("browser_path") or legacy_cfg.get("browser_path") or "").strip()
-    name = str(raw.get("name") or Path(browser_path).stem or f"浏览器{index + 1}").strip()
+    browser_type = normalize_browser_type(raw.get("browser_type", legacy_cfg.get("browser_type") if not raw else "shortcut"))
+    api_url = str(raw.get("bitbrowser_api_url") or legacy_cfg.get("bitbrowser_api_url") or DEFAULT_BITBROWSER_API_URL).strip()
+    window_id = str(raw.get("bitbrowser_window_id", legacy_cfg.get("bitbrowser_window_id", "") if not raw else "") or "").strip()
+    browser_path = str(raw.get("browser_path") or (legacy_cfg.get("browser_path") if browser_type == "shortcut" else "") or "").strip()
+    name = str(raw.get("name") or (f"比特窗口 {window_id}" if browser_type == "bitbrowser" and window_id else Path(browser_path).stem) or f"浏览器{index + 1}").strip()
     try:
         port = int(raw.get("cdp_port", legacy_cfg.get("cdp_port", 9222 + index)) or (9222 + index))
     except Exception:
@@ -390,9 +418,24 @@ def normalize_browser_account(raw, index, legacy_cfg=None):
     except Exception:
         posts = 1
     posts = max(1, posts)
+    try:
+        images_per_post = int(raw.get("images_per_post", legacy_cfg.get("images_per_post", 1)) or 1)
+    except Exception:
+        images_per_post = 1
+    images_per_post = max(1, min(35, images_per_post))
+    raw_selection_mode = str(raw.get("image_selection_mode") or "").strip().casefold()
+    if raw_selection_mode in {"random", "随机", "随机顺序", "随机选择"}:
+        image_selection_mode = "random"
+    elif raw_selection_mode in {"ordered", "order", "顺序", "按名称顺序", "名称顺序"}:
+        image_selection_mode = "ordered"
+    else:
+        image_selection_mode = "random" if parse_bool(legacy_cfg.get("random_image"), False) else "ordered"
     account_id = str(raw.get("id") or "").strip()
     if not account_id:
-        digest = hashlib.sha1(f"{index}|{browser_path}|{name}".encode("utf-8", errors="ignore")).hexdigest()[:10]
+        identity_seed = f"{index}|{browser_path}|{name}"
+        if browser_type == "bitbrowser":
+            identity_seed += f"|bitbrowser|{api_url}|{window_id}"
+        digest = hashlib.sha1(identity_seed.encode("utf-8", errors="ignore")).hexdigest()[:10]
         account_id = f"browser_{digest}"
     def inherited(key, fallback=""):
         return raw.get(key) if key in raw and raw.get(key) not in {None, ""} else legacy_cfg.get(key, fallback)
@@ -407,6 +450,9 @@ def normalize_browser_account(raw, index, legacy_cfg=None):
         "id": account_id,
         "name": name or f"浏览器{index + 1}",
         "enabled": parse_bool(raw.get("enabled"), True),
+        "browser_type": browser_type,
+        "bitbrowser_api_url": api_url,
+        "bitbrowser_window_id": window_id,
         "browser_path": browser_path,
         "browser_user_data_dir": str(
             raw.get("browser_user_data_dir", legacy_cfg.get("browser_user_data_dir", "")) or ""
@@ -416,6 +462,19 @@ def normalize_browser_account(raw, index, legacy_cfg=None):
         ).strip(),
         "cdp_port": port,
         "posts_per_run": posts,
+        # 留空表示继续使用系统设置中的图片总文件夹；账号级路径只在明确填写时覆盖。
+        "image_dir": str(raw.get("image_dir") or "").strip(),
+        "images_per_post": images_per_post,
+        "image_selection_mode": image_selection_mode,
+        "declaration_enabled": parse_bool(
+            raw.get("declaration_enabled", legacy_cfg.get("declaration_enabled", False)), False
+        ),
+        "declaration_entry_text": str(
+            raw.get("declaration_entry_text", legacy_cfg.get("declaration_entry_text", "自主声明")) or "自主声明"
+        ).strip(),
+        "declaration_text": str(
+            raw.get("declaration_text", legacy_cfg.get("declaration_text", "")) or ""
+        ).strip(),
         "close_after_finish": parse_bool(raw.get("close_after_finish"), True),
         "independent_content": True,
         "excel_path": str(inherited("excel_path", "") or "").strip(),
@@ -439,8 +498,68 @@ def new_browser_queue_id():
     return f"browser_{uuid.uuid4().hex[:12]}"
 
 
+def normalize_browser_type(value):
+    value = str(value or "shortcut").strip().casefold()
+    if value in {"shortcut", "快捷方式", "快捷方式 / exe"}:
+        return "shortcut"
+    if value in {"bitbrowser", "比特浏览器"}:
+        return "bitbrowser"
+    raise ValueError(f"不支持的浏览器类型：{value}")
+
+
+def validate_browser_account_connection(account, check_path=False):
+    if normalize_browser_type(account.get("browser_type")) == "bitbrowser":
+        normalize_bitbrowser_api_url(account.get("bitbrowser_api_url"))
+        validate_bitbrowser_window_id(account.get("bitbrowser_window_id"))
+        return
+    path = str(account.get("browser_path") or "").strip()
+    if not path:
+        raise ValueError(f"浏览器账号“{account.get('name')}”未设置快捷方式或 EXE。")
+    if check_path and not Path(path).is_file():
+        raise FileNotFoundError(f"浏览器账号“{account.get('name')}”路径不存在：{path}")
+
+
+def browser_connection_endpoint(cfg, launch_info):
+    if normalize_browser_type(cfg.get("browser_type")) == "bitbrowser":
+        if not launch_info or not launch_info.get("cdp_endpoint"):
+            raise RuntimeError("比特浏览器没有返回调试连接地址。")
+        return launch_info["cdp_endpoint"]
+    return f"http://127.0.0.1:{int(cfg['cdp_port'])}"
+
+
+def bitbrowser_client(api_url):
+    api_url = normalize_bitbrowser_api_url(api_url)
+    token = BitBrowserTokenStore(BITBROWSER_TOKEN_PATH).get_token(api_url)
+    return BitBrowserClient(api_url, api_token=token)
+
+
+def close_bitbrowser_task_window(account):
+    """发布任务结束后，只关闭该任务调用的指定比特窗口，包括任务复用的窗口。"""
+    try:
+        client = bitbrowser_client(account["bitbrowser_api_url"])
+        window_id = account["bitbrowser_window_id"]
+        if client.window_is_open(window_id):
+            client.close_window(window_id)
+            wlog(f"发布任务结束，已通过比特接口关闭 {account.get('name') or '指定窗口'}。")
+        return True
+    except Exception as exc:
+        wlog(f"提醒：发布任务结束后比特窗口关闭失败：{exc}")
+        return False
+
+
+def bitbrowser_window_has_pending_accounts(account, accounts, finished_ids):
+    identity = browser_runtime_identity(account)
+    return any(browser_runtime_identity(item) == identity and str(item.get("id") or "") not in finished_ids
+               for item in accounts)
+
+
 def browser_runtime_identity(account):
     """判断两个队列项是否连接同一个浏览器运行实例。"""
+    if normalize_browser_type(account.get("browser_type")) == "bitbrowser":
+        return (
+            "bitbrowser", normalize_bitbrowser_api_url(account.get("bitbrowser_api_url")),
+            str(account.get("bitbrowser_window_id") or "").strip(),
+        )
     def normalized_path(value):
         text = str(value or "").strip()
         return os.path.normcase(os.path.normpath(text)) if text else ""
@@ -456,6 +575,8 @@ def validate_browser_queue_ports(accounts):
     """相同浏览器可复用端口；不同浏览器仍禁止端口冲突。"""
     port_owners = {}
     for account in accounts:
+        if normalize_browser_type(account.get("browser_type")) == "bitbrowser":
+            continue  # 比特浏览器动态分配调试端口，不能用队列表中的 Chrome 端口判断冲突。
         port = int(account.get("cdp_port", 0) or 0)
         identity = browser_runtime_identity(account)
         previous = port_owners.get(port)
@@ -522,12 +643,18 @@ def log_file_path(cfg):
 
 def config_for_browser_account(cfg, account):
     result = copy.deepcopy(cfg)
+    result["browser_type"] = normalize_browser_type(account.get("browser_type"))
+    result["bitbrowser_api_url"] = account.get("bitbrowser_api_url") or DEFAULT_BITBROWSER_API_URL
+    result["bitbrowser_window_id"] = account.get("bitbrowser_window_id", "")
     result["browser_path"] = account["browser_path"]
     result["browser_user_data_dir"] = account.get("browser_user_data_dir", "")
     result["browser_profile_directory"] = account.get("browser_profile_directory", "")
     result["cdp_port"] = int(account["cdp_port"])
     result["active_browser_account_id"] = account.get("id", "")
     result["active_browser_account_name"] = account.get("name", "")
+    account_image_dir = str(account.get("image_dir") or "").strip()
+    if account_image_dir:
+        result["image_dir"] = account_image_dir
     # 每个队列项都拥有独立进度。排期序号不会从前一个浏览器接着累计；
     # 同一个浏览器重复入队时，也按每一行队列任务分别计算。
     base_state_path = resolved_output_file_path(
@@ -543,12 +670,14 @@ def config_for_browser_account(cfg, account):
     )
     for key in (
         "excel_path", "sheet_name", "publish_start_date",
-        "publish_end_date", "custom_minutes",
+        "publish_end_date", "custom_minutes", "image_selection_mode",
+        "declaration_entry_text", "declaration_text",
     ):
         result[key] = str(account.get(key) or "").strip()
-    for key in ("start_hour", "end_hour", "per_hour_count"):
+    for key in ("start_hour", "end_hour", "per_hour_count", "images_per_post"):
         result[key] = int(account.get(key, result.get(key, 0)) or 0)
     result["use_schedule"] = parse_bool(account.get("use_schedule"), True)
+    result["declaration_enabled"] = parse_bool(account.get("declaration_enabled"), False)
     return result
 
 
@@ -931,6 +1060,14 @@ def close_browser_launched_by_app(browser, launch_info, display_name="浏览器"
     """先走 CDP 正常关闭；仍存活时仅结束本次端口对应的精确进程树。"""
     if not launch_info or not launch_info.get("launched"):
         return False
+    if launch_info.get("browser_type") == "bitbrowser":
+        try:
+            bitbrowser_client(launch_info["api_url"]).close_window(launch_info["window_id"])
+            wlog(f"已通过比特浏览器接口关闭本软件启动的 {display_name}。")
+            return True
+        except Exception as exc:
+            wlog(f"提醒：{display_name} 的比特浏览器关闭接口失败：{exc}")
+            return False
     port = int(launch_info.get("port", 0) or 0)
     try:
         if browser is not None:
@@ -1042,6 +1179,12 @@ def rotation_default_browser_user_data_dir(cfg, browser_path, args=""):
 def kill_chrome_residue(cfg):
     if not cfg.get("close_chrome_before_start", False):
         return
+    if cfg.get("_protect_bitbrowser_windows") or any(
+        normalize_browser_type(item.get("browser_type")) == "bitbrowser"
+        for item in cfg.get("browser_accounts", []) if isinstance(item, dict)
+    ):
+        wlog("队列包含比特浏览器，已跳过全局 Chrome 残留清理，保留比特窗口。")
+        return
     wlog("已启用：启动前关闭 Chrome 残留进程。")
     # 不再全局结束 node.exe：Playwright 驱动和其它正常软件也使用 Node，
     # 误杀会直接导致 connect_over_cdp 报 Connection closed while reading from the driver。
@@ -1070,6 +1213,15 @@ def open_browser_with_cdp(cfg, force_new=False):
     - 自动清理重复的 --remote-debugging-port，避免快捷方式和脚本重复写端口。
     - 当运行时配置 _headless_browser=True 时，使用 Chromium 新版 Headless，桌面不弹出浏览器窗口。
     """
+    if normalize_browser_type(cfg.get("browser_type")) == "bitbrowser":
+        validate_browser_account_connection(cfg)
+        info = bitbrowser_client(cfg.get("bitbrowser_api_url")).open_window(
+            cfg["bitbrowser_window_id"], cfg.get("creator_url", "https://creator.douyin.com/"),
+            reuse_existing=parse_bool(cfg.get("reuse_existing_cdp"), True),
+            headless=parse_bool(cfg.get("_headless_browser"), False),
+        )
+        wlog("已复用现有比特浏览器窗口。" if info["reused"] else "已通过比特浏览器接口打开窗口。")
+        return info
     port = int(cfg.get("cdp_port", 9222))
     kill_chrome_residue(cfg)
 
@@ -1446,8 +1598,14 @@ CITY_HEADER_NAMES = {
 BROWSER_QUEUE_TABLE_COLUMNS = [
     ("顺序", "_order"), ("队列ID", "id"), ("账号名称", "name"),
     ("启用", "enabled"), ("浏览器路径", "browser_path"),
+    ("浏览器类型", "browser_type"), ("比特API地址", "bitbrowser_api_url"),
+    ("比特窗口ID", "bitbrowser_window_id"),
     ("用户数据目录", "browser_user_data_dir"), ("Profile目录", "browser_profile_directory"),
     ("CDP端口", "cdp_port"), ("发布条数", "posts_per_run"),
+    ("每条图片数", "images_per_post"), ("账号图片文件夹", "image_dir"),
+    ("图片选择方式", "image_selection_mode"),
+    ("启用声明", "declaration_enabled"), ("声明入口文字", "declaration_entry_text"),
+    ("声明内容", "declaration_text"),
     ("完成后关闭浏览器", "close_after_finish"),
     ("文案Excel", "excel_path"), ("工作表名", "sheet_name"),
     ("使用定时发布", "use_schedule"), ("开始日期", "publish_start_date"),
@@ -1590,7 +1748,7 @@ def _city_aliases_cached(raw):
 
 def city_name_aliases(value):
     """精确名称优先，并兼容行政后缀及地级市/区县层级写法。"""
-    raw = re.sub(r"\s+", "", copy_cell_text(value)).casefold()
+    raw = city_exact_name_key(value)
     return set(_city_aliases_cached(raw))
 
 
@@ -1608,6 +1766,15 @@ def _normalized_path_key(path):
     return os.path.normcase(os.path.abspath(str(path)))
 
 
+def city_exact_name_key(value):
+    """城市同名比较键；只清理 Excel 常见空白/不可见格式字符，不做行政区别名推断。"""
+    text = unicodedata.normalize("NFKC", copy_cell_text(value))
+    return "".join(
+        ch for ch in text
+        if not ch.isspace() and unicodedata.category(ch) != "Cf"
+    ).casefold()
+
+
 def _directory_signature(path):
     try:
         stat = Path(path).stat()
@@ -1618,7 +1785,7 @@ def _directory_signature(path):
 
 def city_hierarchy_suffixes(value):
     """生成区县级尾部候选，用于“地级市名 + 区县名”没有分隔符的写法。"""
-    normalized = re.sub(r"\s+", "", copy_cell_text(value)).casefold()
+    normalized = city_exact_name_key(value)
     if not normalized or not any(normalized.endswith(suffix) for suffix in CITY_CHILD_SUFFIXES):
         return set()
     # 至少保留三个汉字，避免把“文区”等过短片段当成行政区名称。
@@ -1647,7 +1814,7 @@ def image_folder_index(cfg, force=False):
     aliases = {}
     hierarchy_suffixes = {}
     for child in children:
-        normalized = re.sub(r"\s+", "", child.name).casefold()
+        normalized = city_exact_name_key(child.name)
         exact.setdefault(normalized, []).append(child)
         for alias in city_name_aliases(child.name):
             aliases.setdefault(alias, []).append(child)
@@ -2112,10 +2279,17 @@ def resolve_image_dir_for_record(cfg, record):
     except OSError:
         pass
 
+    normalized = city_exact_name_key(city)
     index = image_folder_index(cfg)
-    normalized = re.sub(r"\s+", "", city).casefold()
     matches = list(index.get("exact", {}).get(normalized, []))
     if not matches:
+        # Windows 可能在刚新增目录时没有及时更新父目录时间戳。模糊匹配之前必须
+        # 强制刷新并再次检查同名目录，避免旧缓存里的简称目录抢先命中。
+        index = image_folder_index(cfg, force=True)
+        matches = list(index.get("exact", {}).get(normalized, []))
+
+    if not matches:
+        # 只有原文直连和规范化同名两层均未命中，才允许行政后缀/层级别名匹配。
         seen = set()
         for alias in city_name_aliases(city):
             for child in index.get("aliases", {}).get(alias, []):
@@ -2133,28 +2307,6 @@ def resolve_image_dir_for_record(cfg, record):
                 if child_key not in seen:
                     seen.add(child_key)
                     matches.append(child)
-    if not matches:
-        # 某些 Windows 文件系统在短时间内新增目录时父目录时间戳不会立刻变化；
-        # 仅在首次未命中时强制刷新一次，正常大量目录匹配仍使用缓存。
-        index = image_folder_index(cfg, force=True)
-        matches = list(index.get("exact", {}).get(normalized, []))
-        if not matches:
-            seen = set()
-            for alias in city_name_aliases(city):
-                for child in index.get("aliases", {}).get(alias, []):
-                    child_key = _normalized_path_key(child)
-                    if child_key not in seen:
-                        seen.add(child_key)
-                        matches.append(child)
-            for candidate in city_hierarchy_suffixes(city):
-                for child in (
-                    index.get("exact", {}).get(candidate, []) +
-                    index.get("hierarchy_suffixes", {}).get(candidate, [])
-                ):
-                    child_key = _normalized_path_key(child)
-                    if child_key not in seen:
-                        seen.add(child_key)
-                        matches.append(child)
     if not matches:
         raise FileNotFoundError(f"找不到城市“{city}”对应的图片子文件夹：{root / city}")
     if len(matches) > 1:
@@ -2184,9 +2336,43 @@ def list_images_for_record(cfg, record):
     return images
 
 
-def choose_image_for_record(cfg, record):
+def normalize_images_per_post(value):
+    """抖音图文单次最多支持 35 张；旧配置或异常值继续按 1 张处理。"""
+    try:
+        return max(1, min(35, int(value or 1)))
+    except Exception:
+        return 1
+
+
+def normalize_image_selection_mode(value, random_fallback=False):
+    text = str(value or "").strip().casefold()
+    if text in {"random", "随机", "随机顺序", "随机选择"}:
+        return "random"
+    if text in {"ordered", "order", "顺序", "按名称顺序", "名称顺序"}:
+        return "ordered"
+    return "random" if parse_bool(random_fallback, False) else "ordered"
+
+
+def choose_images_for_record(cfg, record, state=None):
+    """为一条作品选择固定批次；仅保证本次上传的图片互不重复。"""
     images = list_images_for_record(cfg, record)
-    return random.choice(images) if cfg.get("random_image", False) else images[0]
+    count = normalize_images_per_post(cfg.get("images_per_post", 1))
+    if len(images) < count:
+        raise RuntimeError(
+            f"当前图片目录只有 {len(images)} 张可用图片，少于此账号设置的每条 {count} 张。"
+        )
+    mode = normalize_image_selection_mode(
+        cfg.get("image_selection_mode"), cfg.get("random_image", False)
+    )
+    selected = random.sample(images, count) if mode == "random" else images[:count]
+    if len({_normalized_path_key(path) for path in selected}) != len(selected):
+        raise RuntimeError("图片批次出现重复文件，已停止本条发布。")
+    return selected
+
+
+def choose_image_for_record(cfg, record):
+    """兼容旧调用；正式发布流程使用 choose_images_for_record。"""
+    return choose_images_for_record(cfg, record)[0]
 
 
 def validate_publish_records_and_images(cfg):
@@ -2201,7 +2387,12 @@ def validate_publish_records_and_images(cfg):
         )
         if scope in checked_scopes:
             continue
-        list_images_for_record(cfg, record)
+        images = list_images_for_record(cfg, record)
+        required = normalize_images_per_post(cfg.get("images_per_post", 1))
+        if len(images) < required:
+            city = copy_cell_text(record.get("city", ""))
+            scope = f"城市“{city}”" if record.get("has_city_column", False) else "图片根目录"
+            raise RuntimeError(f"{scope}只有 {len(images)} 张图片，少于此账号每条设置的 {required} 张。")
         checked_scopes.add(scope)
     return records
 
@@ -2408,6 +2599,10 @@ class DailyPublishLimitError(RuntimeError):
     """抖音明确提示今天投稿次数已达到上限。"""
 
 
+class TopicEntryReadbackError(RuntimeError):
+    """“添加话题”已点击，但正文未可靠回读到网页插入的井号。"""
+
+
 class PageContentResetAfterCrashError(RuntimeError):
     """网页崩溃后已经自动刷新；当前未提交作品需要从上传重新恢复。"""
 
@@ -2571,7 +2766,11 @@ def run_publish_step(cfg, page, step_name, action):
         try:
             if page is not None and recover_crashed_page(cfg, page):
                 raise PageContentResetAfterCrashError("网页已自动刷新，当前作品需从图片上传步骤恢复。")
+            if page is not None:
+                handle_optional_declaration_prompt(cfg, page)
             result = action()
+            if page is not None:
+                handle_optional_declaration_prompt(cfg, page)
             if attempt > 1:
                 wlog(f"步骤“{step_name}”第 {attempt}/{total_attempts} 次执行成功。")
             return result
@@ -2668,7 +2867,17 @@ def wait_login(page):
     return False
 
 
-def image_upload_completed(page):
+def uploaded_image_count(page):
+    """读取页面明确显示的已添加图片数量；无法确认时返回 0。"""
+    try:
+        body = page.locator("body").inner_text(timeout=2500)
+    except Exception:
+        body = ""
+    counts = [int(value) for value in re.findall(r"已添加\s*(\d+)\s*张图片", body)]
+    return max(counts, default=0)
+
+
+def image_upload_completed(page, expected_count=1):
     """
     V21：严格判断图片是否真正上传完成。
     注意：不能把"封面设置 / 编辑图片 / 选择一张图片作为封面 / 基础信息"当作上传完成，
@@ -2688,15 +2897,17 @@ def image_upload_completed(page):
         return False
 
     # 明确的上传完成文字
-    if re.search(r"已添加\s*\d+\s*张图片", body):
+    expected_count = normalize_images_per_post(expected_count)
+    counts = [int(value) for value in re.findall(r"已添加\s*(\d+)\s*张图片", body)]
+    if counts and max(counts) >= expected_count:
         return True
 
-    if "清空并重新上传" in body:
+    if expected_count == 1 and "清空并重新上传" in body:
         return True
 
     # DOM 层面：只在编辑图片/封面相关区域里确认"已添加N张图片"
     try:
-        ok = page.evaluate("""
+        count = page.evaluate("""
         () => {
           function visible(el){
             const r=el.getBoundingClientRect();
@@ -2706,51 +2917,67 @@ def image_upload_completed(page):
           function txt(el){ return ((el.innerText||el.textContent||'')+'').trim(); }
 
           const bodyText = txt(document.body);
-          if (bodyText.includes('上传失败') || bodyText.includes('图片处理失败')) return false;
+          if (bodyText.includes('上传失败') || bodyText.includes('图片处理失败')) return 0;
 
           const nodes=[...document.querySelectorAll('div,section,span,p,button')].filter(visible);
+          let maxCount = 0;
           for (const el of nodes) {
             const t = txt(el);
             if (!t || t.length > 300) continue;
-            if (/已添加\\s*\\d+\\s*张图片/.test(t)) return true;
-            if (t.includes('清空并重新上传')) return true;
+            const matches = [...t.matchAll(/已添加\\s*(\\d+)\\s*张图片/g)];
+            for (const match of matches) maxCount = Math.max(maxCount, Number(match[1] || 0));
           }
-
-          return false;
+          return maxCount;
         }
         """)
-        return bool(ok)
+        if int(count or 0) >= expected_count:
+            return True
+        return expected_count == 1 and "清空并重新上传" in body
     except Exception:
         return False
 
 
-def wait_uploaded_with_config(cfg, page):
+def wait_uploaded_with_config(cfg, page, expected_count=None):
     interval = float(cfg.get("upload_check_interval_seconds", 3) or 3)
     max_wait = float(cfg.get("upload_max_wait_seconds", 180) or 180)
     interval = max(1, interval)
     max_wait = max(interval, max_wait)
-    wlog(f"判断图片是否上传完成，检测间隔={interval}秒，最大等待={max_wait}秒。")
+    expected_count = normalize_images_per_post(
+        expected_count if expected_count is not None else cfg.get("images_per_post", 1)
+    )
+    wlog(
+        f"判断 {expected_count} 张图片是否全部上传完成，检测间隔={interval}秒，"
+        f"最大等待={max_wait}秒。"
+    )
     start = time.time()
     while True:
         if recover_crashed_page(cfg, page):
             raise PageContentResetAfterCrashError("图片检测期间网页崩溃，已自动刷新；需要重新上传当前图片。")
-        if image_upload_completed(page):
-            wlog("图片上传完成：检测到编辑图片/已添加图片/封面设置等完成标识。")
+        handle_optional_declaration_prompt(cfg, page)
+        if image_upload_completed(page, expected_count):
+            wlog(f"图片上传完成：页面已确认至少添加 {expected_count} 张图片。")
             return True
         if has_any(page, ["上传失败", "图片处理失败", "重新上传"], 800):
             raise RuntimeError("检测到图片上传失败。")
         if time.time() - start >= max_wait:
-            raise RuntimeError(f"等待图片上传超过 {max_wait} 秒，仍未检测到完成标识。")
+            actual = uploaded_image_count(page)
+            raise RuntimeError(
+                f"等待图片上传超过 {max_wait} 秒；计划 {expected_count} 张，页面只确认 {actual} 张。"
+            )
         wlog(f"暂未检测到图片上传完成，等待 {interval:.1f} 秒后重试。")
         countdown_sleep(ACTIVE_CFG or {}, interval, "检测图片上传状态", "upload_check")
 
 
-def validate_uploaded_image(cfg, page):
-    ok = image_upload_completed(page)
+def validate_uploaded_image(cfg, page, expected_count=None):
+    expected_count = normalize_images_per_post(
+        expected_count if expected_count is not None else cfg.get("images_per_post", 1)
+    )
+    ok = image_upload_completed(page, expected_count)
     if not ok:
         save_debug(cfg, page, "validate_uploaded_image_failed")
-        raise RuntimeError("图片上传状态未完成，未检测到编辑图片/已添加图片/封面设置。")
-    wlog("校验通过：图片已上传完成。")
+        actual = uploaded_image_count(page)
+        raise RuntimeError(f"图片上传数量未完成：计划 {expected_count} 张，页面只确认 {actual} 张。")
+    wlog(f"校验通过：{expected_count} 张图片均已上传完成。")
 
 
 def split_text_topics(text):
@@ -2803,12 +3030,28 @@ def upload_tab_ready(page):
     return False
 
 
-def click_upload_graphic_button_or_input(cfg, page, image_path):
+def normalized_upload_paths(image_paths):
+    if isinstance(image_paths, (str, os.PathLike, Path)):
+        image_paths = [image_paths]
+    paths = [Path(path) for path in (image_paths or [])]
+    if not paths:
+        raise RuntimeError("没有提供待上传图片。")
+    if len({_normalized_path_key(path) for path in paths}) != len(paths):
+        raise RuntimeError("待上传图片中存在重复文件。")
+    missing = [str(path) for path in paths if not path.is_file()]
+    if missing:
+        raise FileNotFoundError("待上传图片不存在：" + "；".join(missing[:5]))
+    return paths
+
+
+def click_upload_graphic_button_or_input(cfg, page, image_paths):
     """
     V24：在发布图文上传页，直接上传图片。
     不处理"继续编辑 / 放弃"，也不重复点击发布入口。
     """
-    wlog("当前为发布图文上传页，直接点击上传图文/文件 input 上传图片。")
+    image_paths = normalized_upload_paths(image_paths)
+    upload_values = [str(path) for path in image_paths]
+    wlog(f"当前为发布图文上传页，直接通过文件 input 上传 {len(image_paths)} 张图片。")
     try:
         inp = page.locator("input[type='file']")
         chosen = None
@@ -2824,8 +3067,8 @@ def click_upload_graphic_button_or_input(cfg, page, image_path):
         if chosen is None and inp.count() > 0:
             chosen = inp.first
         if chosen is not None:
-            chosen.set_input_files(str(image_path), timeout=30000)
-            wlog("已通过文件 input 上传图片。")
+            chosen.set_input_files(upload_values, timeout=30000)
+            wlog(f"已通过文件 input 选择 {len(image_paths)} 张图片。")
             return True
     except Exception as e:
         wlog(f"直接设置上传 input 失败，改点上传图文按钮：{repr(e)}")
@@ -2865,8 +3108,8 @@ def click_upload_graphic_button_or_input(cfg, page, image_path):
                 """, word)
                 if not ok:
                     raise RuntimeError(f"没找到按钮：{word}")
-            fc.value.set_files(str(image_path))
-            wlog(f"已点击'{word}'并选择图片。")
+            fc.value.set_files(upload_values)
+            wlog(f"已点击'{word}'并选择 {len(image_paths)} 张图片。")
             return True
         except Exception:
             pass
@@ -2891,6 +3134,30 @@ def platform_image_publish_page_ready(page):
     except Exception:
         body = ""
     return ("作品描述" in body and "封面设置" in body and "选择音乐" in body)
+
+
+def wait_for_image_publish_page(cfg, page):
+    """等待 SPA 发布模块加载完成，避免把页面外壳误当作发布入口失败。"""
+    try:
+        timeout = float(cfg.get("creator_page_ready_timeout_seconds", 120))
+    except (TypeError, ValueError):
+        timeout = 120
+    if not math.isfinite(timeout):
+        timeout = 120
+    timeout = max(1, min(600, timeout))
+    deadline = time.monotonic() + timeout
+    waiting_logged = False
+    while True:
+        if creator_login_required(page):
+            raise AccountLoggedOutError("当前浏览器进入了登录或安全验证页面。")
+        if platform_image_publish_page_ready(page):
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        if not waiting_logged:
+            wlog(f"图文发布模块尚未加载完成，继续等待最多 {timeout:g} 秒。")
+            waiting_logged = True
+        page.wait_for_timeout(350)
 
 
 def click_creator_publish_entry(cfg, page):
@@ -2958,7 +3225,7 @@ def click_creator_publish_entry(cfg, page):
     recover_crashed_page(cfg, page, target_url)
     step_wait(cfg, "当前标签打开发布图文上传页后等待")
 
-    if platform_image_publish_page_ready(page):
+    if wait_for_image_publish_page(cfg, page):
         wlog("已在当前标签进入发布图文页面。")
         return True
 
@@ -2980,14 +3247,16 @@ def enter_publish_page(cfg, page):
     wait_login(page)
 
 
-def upload_image(cfg, page, image_path):
+def upload_images(cfg, page, image_paths):
     """
     V24：如果当前已经是发布图文上传页，直接点击"上传图文"上传。
     不管"继续编辑 / 放弃"，不重复点击发布入口。
     """
-    wlog(f"上传图片：{Path(image_path).name}")
+    image_paths = normalized_upload_paths(image_paths)
+    upload_values = [str(path) for path in image_paths]
+    wlog("上传图片批次：" + "、".join(path.name for path in image_paths))
     if upload_tab_ready(page):
-        ok = click_upload_graphic_button_or_input(cfg, page, image_path)
+        ok = click_upload_graphic_button_or_input(cfg, page, image_paths)
         if ok:
             return
         save_debug(cfg, page, "upload_graphic_button_failed")
@@ -3008,8 +3277,8 @@ def upload_image(cfg, page, image_path):
         if chosen is None and inp.count() > 0:
             chosen = inp.first
         if chosen is not None:
-            chosen.set_input_files(str(image_path), timeout=30000)
-            wlog("已选择图片。")
+            chosen.set_input_files(upload_values, timeout=30000)
+            wlog(f"已选择 {len(image_paths)} 张图片。")
             return
     except Exception as e:
         wlog(f"直接设置图片 input 失败，改用文件选择器：{repr(e)}")
@@ -3018,8 +3287,8 @@ def upload_image(cfg, page, image_path):
         try:
             with page.expect_file_chooser(timeout=8000) as fc:
                 click_text(page, [t], timeout=5000)
-            fc.value.set_files(str(image_path))
-            wlog("已通过文件选择器选择图片。")
+            fc.value.set_files(upload_values)
+            wlog(f"已通过文件选择器选择 {len(image_paths)} 张图片。")
             return
         except Exception:
             pass
@@ -3027,7 +3296,12 @@ def upload_image(cfg, page, image_path):
     raise RuntimeError("没有找到图片上传入口。")
 
 
-def wait_after_upload_to_editor(cfg, page):
+def upload_image(cfg, page, image_path):
+    """兼容旧调用。"""
+    return upload_images(cfg, page, [image_path])
+
+
+def wait_after_upload_to_editor(cfg, page, expected_count=None):
     """
     V24：点击上传图文/选择图片后，等待页面进入图文编辑页。
     """
@@ -3038,6 +3312,7 @@ def wait_after_upload_to_editor(cfg, page):
     while True:
         if recover_crashed_page(cfg, page):
             raise PageContentResetAfterCrashError("上传后网页崩溃，已自动刷新；需要重新上传当前图片。")
+        handle_optional_declaration_prompt(cfg, page)
         try:
             text = page.locator("body").inner_text(timeout=2500)
         except Exception:
@@ -3045,8 +3320,12 @@ def wait_after_upload_to_editor(cfg, page):
         if ("作品描述" in text or "基础信息" in text) and ("选择音乐" in text or "封面设置" in text):
             wlog("已进入图文编辑页。")
             return True
-        if re.search(r"已添加\s*\d+\s*张图片", text):
-            wlog("检测到已添加图片，继续。")
+        expected_count = normalize_images_per_post(
+            expected_count if expected_count is not None else cfg.get("images_per_post", 1)
+        )
+        counts = [int(value) for value in re.findall(r"已添加\s*(\d+)\s*张图片", text)]
+        if counts and max(counts) >= expected_count:
+            wlog(f"检测到已添加 {max(counts)} 张图片，继续。")
             return True
         if "上传失败" in text or "图片处理失败" in text:
             raise RuntimeError("图片上传失败。")
@@ -3064,8 +3343,7 @@ def editor_descriptor(item):
           el.getAttribute('data-placeholder') || '',
           el.getAttribute('aria-label') || '',
           el.getAttribute('name') || '',
-          el.closest('label')?.innerText || '',
-          el.parentElement?.innerText?.slice(0, 80) || ''
+          el.closest('label')?.innerText || ''
         ].join(' ')
         """)
     except Exception:
@@ -3120,7 +3398,16 @@ def find_title_editor(page):
 
 def get_input_text(item):
     try:
-        return item.evaluate("el => ('value' in el ? el.value : (el.innerText || el.textContent || ''))")
+        return item.evaluate(r"""
+        el => {
+          const tag = String(el.tagName || '').toUpperCase();
+          // 抖音富文本 DIV 可能被框架挂上空的 value 属性；不能据此把正文误读为空。
+          if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') {
+            return el.value || '';
+          }
+          return el.innerText || el.textContent || '';
+        }
+        """)
     except Exception:
         return ""
 
@@ -3158,13 +3445,589 @@ def validate_title_filled(cfg, page, title):
     raise RuntimeError("标题校验失败：标题输入框中没有检测到对应内容。")
 
 
+TOPIC_INVISIBLE_PLACEHOLDERS = frozenset(
+    "\u034f\u115f\u1160\u17b4\u17b5\u2800\u3164\uffa0"
+)
+
+
+def strip_topic_hidden_chars(value, remove_whitespace=False):
+    """清理话题附近的 Unicode 格式符、零宽符和常见肉眼不可见占位符。"""
+    value = unicodedata.normalize("NFKC", str(value or ""))
+    cleaned = []
+    for char in value:
+        category = unicodedata.category(char)
+        if category == "Cf" or char in TOPIC_INVISIBLE_PLACEHOLDERS:
+            continue
+        if remove_whitespace and (char.isspace() or category.startswith("Z") or category == "Cc"):
+            continue
+        cleaned.append(char)
+    return "".join(cleaned)
+
+
+def normalize_topic_for_match(value):
+    """话题匹配专用清理；仅忽略井号、空白和零宽字符。"""
+    value = strip_topic_hidden_chars(value)
+    return re.sub(r"^[#\s]+|\s+", "", value).casefold()
+
+
+def topic_result_text_matches(value, topic):
+    """候选项可带 # 或换行，但话题名必须完全匹配。"""
+    expected = normalize_topic_for_match(topic)
+    if not expected:
+        return False
+    lines = [line for line in re.split(r"[\r\n]+", str(value or "")) if line.strip()]
+    for line in lines:
+        normalized = normalize_topic_for_match(line)
+        if normalized == expected:
+            return True
+        # 兼容同一行追加“12.3万次播放”等热度数据，不接受更长的同前缀话题。
+        suffix = normalized[len(expected):] if normalized.startswith(expected) else ""
+        if suffix and re.fullmatch(r"[\d.,万亿+]*(?:次)?(?:播放|参与|作品|浏览|使用)", suffix):
+            return True
+    return False
+
+
+def topic_text_present(value, topic):
+    """检查编辑框回显中是否存在带 # 的完整话题。"""
+    value = strip_topic_hidden_chars(value)
+    expected = normalize_topic_for_match(topic)
+    detected = re.findall(r"[#＃]+\s*([\u4e00-\u9fa5A-Za-z0-9_]+)", value)
+    return bool(expected and any(normalize_topic_for_match(item) == expected for item in detected))
+
+
+def topic_entry_locator_is_valid(locator):
+    """只允许点击编辑框外的“添加话题”入口。"""
+    try:
+        return bool(locator.evaluate(r"""
+        el => {
+          function visible(node){
+            const r=node.getBoundingClientRect(), s=getComputedStyle(node);
+            return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden';
+          }
+          function compact(value){
+            return String(value||'').replace(/\uff03/g,'#').replace(/\s+/g,'').trim();
+          }
+          if (!visible(el) || el.closest('[contenteditable=true],textarea,input')) return false;
+          const text=compact(el.innerText||el.textContent||el.getAttribute('aria-label')||'');
+          return text==='添加话题' || text==='#添加话题';
+        }
+        """))
+    except Exception:
+        return False
+
+
+def topic_search_input(page, editor=None):
+    """优先返回话题弹层的搜索框；旧页面则由正文编辑框接收关键词。"""
+    selectors = [
+        "input[placeholder*='搜索话题']",
+        "input[placeholder*='搜话题']",
+        "input[placeholder*='输入话题']",
+        "input[aria-label*='搜索话题']",
+        "input[aria-label*='话题']",
+        "textarea[placeholder*='话题']",
+        "[contenteditable='true'][data-placeholder*='搜索话题']",
+        "[contenteditable='true'][aria-label*='搜索话题']",
+        "[role='dialog'] input[placeholder*='话题']",
+        "[role='listbox'] input",
+    ]
+    for selector in selectors:
+        item = first_visible(page, selector)
+        if item:
+            return item
+    return editor
+
+
+def topic_entry_text_has_hash(current_text, before_text):
+    """严格确认点击后只新增一个 #；允许点击前正文存在多个 DOM 回读版本。"""
+    current = strip_topic_hidden_chars(current_text, remove_whitespace=True)
+    before_values = before_text if isinstance(before_text, (list, tuple, set, frozenset)) else (before_text,)
+    return any(
+        current == strip_topic_hidden_chars(value, remove_whitespace=True) + "#"
+        for value in before_values
+    )
+
+
+def topic_entry_text_variants(page, editor=None):
+    """读取同一正文可能暴露的全部 DOM 文本版本，不用“最长文本”替代正文。"""
+    values = []
+    live_editor = find_editor(page)
+    # 富文本重建后旧 Locator 会按默认超时等待约 30 秒；已有活动节点时绝不再访问旧节点。
+    candidates = (live_editor,) if live_editor is not None else (editor,)
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        value = str(get_input_text(candidate) or "")
+        if value not in values:
+            values.append(value)
+    fallback = str(get_editor_text_for_check(page) or "")
+    if fallback not in values:
+        values.append(fallback)
+    return tuple(values)
+
+
+def topic_entry_baseline_text(page, editor=None):
+    """兼容旧调用：返回点击入口前全部正文回读版本。"""
+    return topic_entry_text_variants(page, editor)
+
+
+def topic_entry_debug_summary(values):
+    """仅输出长度、井号数和末尾转义字符，便于定位不可见字符而不刷出整篇正文。"""
+    if not isinstance(values, (list, tuple, set, frozenset)):
+        values = (values,)
+    result = []
+    for value in values:
+        raw = str(value or "")
+        cleaned = strip_topic_hidden_chars(raw, remove_whitespace=True)
+        result.append({
+            "raw_len": len(raw),
+            "clean_len": len(cleaned),
+            "hashes": cleaned.count("#"),
+            "raw_tail": raw[-16:].encode("unicode_escape").decode("ascii"),
+            "clean_tail": cleaned[-16:].encode("unicode_escape").decode("ascii"),
+        })
+    return result
+
+
+def topic_entry_target(page, before_text):
+    """返回话题关键词应输入的位置，以及它是否为独立搜索框。"""
+    dedicated = topic_search_input(page, None)
+    if dedicated is not None:
+        return dedicated, True
+    try:
+        # 点击“#添加话题”后正文节点会被网页替换；必须重新定位，不能继续读取旧 Locator。
+        live_editor = find_editor(page)
+        readbacks = topic_entry_text_variants(page, live_editor)
+        if live_editor is not None and any(
+            topic_entry_text_has_hash(current, before_text) for current in readbacks
+        ):
+            return live_editor, False
+    except Exception:
+        pass
+    return None
+
+
+def wait_topic_entry_ready(page, before_text, timeout_seconds=3):
+    """等待独立搜索框，或严格回读网页在正文末尾插入的单个 #。"""
+    deadline = time.time() + max(0.5, float(timeout_seconds or 3))
+    while time.time() < deadline:
+        target = topic_entry_target(page, before_text)
+        if target is not None:
+            return target
+        page.wait_for_timeout(150)
+    return None
+
+
+def click_topic_entry_fast(page):
+    """直接在正文组件中定位唯一入口，避免整页语义候选逐个等待超时。"""
+    try:
+        return page.evaluate(r"""
+        () => {
+          function visible(el){
+            const r=el.getBoundingClientRect(), s=getComputedStyle(el);
+            return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden';
+          }
+          function compact(value){
+            return String(value||'').replace(/\uff03/g,'#').replace(/\s+/g,'').trim();
+          }
+          const nodes=[...document.querySelectorAll('[class*=toolbar-button],button,[role=button],a,[tabindex],span,div,p')]
+            .filter(visible)
+            .filter(el => !el.closest('[contenteditable=true],textarea,input'))
+            .filter(el => {
+              const text=compact(el.innerText||el.textContent||el.getAttribute('aria-label')||'');
+              return text==='添加话题' || text==='#添加话题';
+            })
+            .sort((a,b) => (a.children.length-b.children.length) ||
+              (a.getBoundingClientRect().width*a.getBoundingClientRect().height -
+               b.getBoundingClientRect().width*b.getBoundingClientRect().height));
+          const hit=nodes[0];
+          if (!hit) return null;
+          const clickTarget=hit.closest('button,[role=button],a,[tabindex]') || hit;
+          const r=clickTarget.getBoundingClientRect();
+          clickTarget.click();
+          return {x:r.left+r.width/2,y:r.top+r.height/2};
+        }
+        """)
+    except Exception:
+        return None
+
+
+def open_topic_search(cfg, page, editor):
+    """点击页面的“添加话题”，不在描述框中手写 #话题。"""
+    before_text = topic_entry_baseline_text(page, editor)
+    fast_target = click_topic_entry_fast(page)
+    if fast_target:
+        wlog("打开添加话题：正文组件 DOM 快速点击成功。")
+        ready_target = wait_topic_entry_ready(page, before_text, 3)
+        if ready_target is not None:
+            return ready_target
+        after_text = topic_entry_text_variants(page, find_editor(page))
+        wlog(
+            "话题井号回读诊断：点击前=" + repr(topic_entry_debug_summary(before_text))
+            + "；点击后=" + repr(topic_entry_debug_summary(after_text))
+        )
+        save_debug(cfg, page, "topic_hash_readback_failed")
+        raise TopicEntryReadbackError(
+            "已点击网页“添加话题”，但正文回读未检测到新增的单个 #；已停止且不会重复点击入口。"
+        )
+    pattern = re.compile(r"^\s*[#＃]?\s*添加话题\s*$")
+    groups = [
+        page.get_by_role("button", name=pattern),
+        page.get_by_text(pattern),
+        page.locator("button,[role='button'],a,span,div").filter(has_text=re.compile(r"添加话题")),
+    ]
+    for group in groups:
+        try:
+            for index in range(min(group.count(), 20)):
+                item = group.nth(index)
+                if not item.is_visible(timeout=250) or not topic_entry_locator_is_valid(item):
+                    continue
+                if not click_locator_with_fallback(page, item, "打开添加话题", timeout=1800):
+                    continue
+                target = wait_topic_entry_ready(page, before_text, 3)
+                if target is not None:
+                    return target
+                after_text = topic_entry_text_variants(page, find_editor(page))
+                wlog(
+                    "话题井号回读诊断：点击前=" + repr(topic_entry_debug_summary(before_text))
+                    + "；点击后=" + repr(topic_entry_debug_summary(after_text))
+                )
+                save_debug(cfg, page, "topic_hash_readback_failed")
+                raise TopicEntryReadbackError(
+                    "已点击网页“添加话题”，但正文回读未检测到新增的单个 #；已停止且不会重复点击入口。"
+                )
+        except TopicEntryReadbackError:
+            raise
+        except Exception:
+            continue
+
+    # 文字子节点不可点时，只在它的真实可交互父节点内逐级兜底。
+    try:
+        target = page.evaluate(r"""
+        () => {
+          function visible(el){
+            const r=el.getBoundingClientRect(), s=getComputedStyle(el);
+            return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden';
+          }
+          function compact(value){ return String(value||'').replace(/\uff03/g,'#').replace(/\s+/g,'').trim(); }
+          const nodes=[...document.querySelectorAll('button,[role=button],a,span,div')].filter(visible);
+          const hit=nodes.find(el => {
+            if (el.closest('[contenteditable=true],textarea,input')) return false;
+            const text=compact(el.innerText||el.textContent||el.getAttribute('aria-label')||'');
+            return text==='添加话题' || text==='#添加话题';
+          });
+          if (!hit) return null;
+          let clickTarget=hit.closest('button,[role=button],a,[tabindex]') || hit;
+          const r=clickTarget.getBoundingClientRect();
+          clickTarget.click();
+          return {x:r.left+r.width/2,y:r.top+r.height/2};
+        }
+        """)
+        if target:
+            ready_target = wait_topic_entry_ready(page, before_text, 3)
+            if ready_target is not None:
+                return ready_target
+            after_text = topic_entry_text_variants(page, find_editor(page))
+            wlog(
+                "话题井号回读诊断：点击前=" + repr(topic_entry_debug_summary(before_text))
+                + "；点击后=" + repr(topic_entry_debug_summary(after_text))
+            )
+            save_debug(cfg, page, "topic_hash_readback_failed")
+            raise TopicEntryReadbackError(
+                "已点击网页“添加话题”，但正文回读未检测到新增的单个 #；已停止且不会重复点击入口。"
+            )
+    except TopicEntryReadbackError:
+        raise
+    except Exception:
+        pass
+
+    save_debug(cfg, page, "topic_entry_not_found")
+    raise RuntimeError("没有找到或打开网页的“添加话题”入口，已停止手写 #话题。")
+
+
+def topic_result_locator_is_valid(locator, topic):
+    """只把弹层/候选列表内的完全同名文本当作话题结果。"""
+    try:
+        return bool(locator.evaluate(r"""
+        (el, topic) => {
+          function visible(node){
+            const r=node.getBoundingClientRect(), s=getComputedStyle(node);
+            return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden';
+          }
+          function norm(value){
+            return String(value||'').normalize('NFKC').replace(/[\u200b-\u200d\ufeff]/g,'')
+              .replace(/^[#\s]+|\s+/g,'').toLocaleLowerCase();
+          }
+          function matches(value, expected){
+            const normalized=norm(value);
+            if (normalized===expected) return true;
+            if (!normalized.startsWith(expected)) return false;
+            const suffix=normalized.slice(expected.length);
+            return /^[\d.,万亿+]*(?:次)?(?:播放|参与|作品|浏览|使用)$/.test(suffix);
+          }
+          if (!visible(el) || el.closest('[contenteditable=true],textarea')) return false;
+          const expected=norm(topic);
+          const lines=String(el.innerText||el.textContent||'').split(/[\r\n]+/).filter(Boolean);
+          if (!expected || !lines.some(line => matches(line, expected))) return false;
+          const editor=document.querySelector('[contenteditable=true]');
+          if (editor) {
+            const er=editor.getBoundingClientRect(), r=el.getBoundingClientRect();
+            const belowEditor=r.top>=er.bottom-12 && r.top<=er.bottom+520;
+            const alignedWithEditor=r.left>=er.left-24 && r.right<=er.right+24;
+            if (belowEditor && alignedWithEditor) return true;
+          }
+          for (let node=el; node && node!==document.body; node=node.parentElement) {
+            const s=getComputedStyle(node), cls=String(node.className||'').toLowerCase();
+            if (node.matches('[role=option],[role=listbox],[role=menu],[role=dialog],[aria-modal=true],li')) return true;
+            if (s.position==='fixed') return true;
+            if (s.position==='absolute' && /(topic|hash|suggest|popover|dropdown|select|search)/.test(cls)) return true;
+          }
+          return false;
+        }
+        """, topic))
+    except Exception:
+        return False
+
+
+def matching_topic_result_visible(page, topic):
+    patterns = [
+        re.compile(rf"^\s*[#＃]?\s*{re.escape(topic)}\s*$", re.IGNORECASE),
+        re.compile(re.escape(topic), re.IGNORECASE),
+    ]
+    for pattern in patterns:
+        try:
+            group = page.get_by_text(pattern)
+            for index in range(min(group.count(), 40)):
+                item = group.nth(index)
+                if item.is_visible(timeout=120) and topic_result_locator_is_valid(item, topic):
+                    return True
+        except Exception:
+            pass
+    return False
+
+
+def topic_semantic_token_present(editor, topic):
+    try:
+        return bool(editor.evaluate(r"""
+        (root, topic) => {
+          function norm(value){
+            return String(value||'').normalize('NFKC').replace(/[\u200b-\u200d\ufeff]/g,'')
+              .replace(/\s+/g,'').toLocaleLowerCase();
+          }
+          const expected='#'+norm(topic).replace(/^#+/,'');
+          return [...root.querySelectorAll('*')].some(el => {
+            const text=norm(el.innerText||el.textContent||'');
+            if (!text.includes(expected)) return false;
+            const cls=String(el.className||'').toLowerCase();
+            const semantic=el.tagName==='A' || el.getAttribute('contenteditable')==='false' ||
+              /(topic|hash|tag|mention)/.test(cls+' '+String(el.getAttribute('data-type')||''));
+            return semantic;
+          });
+        }
+        """, topic))
+    except Exception:
+        return False
+
+
+def topic_readback_text(page, editor=None):
+    """汇总不同正文 DOM 的可读文本，兼容点击话题后编辑节点重建。"""
+    values = []
+    live_editor = find_editor(page)
+    candidates = (live_editor,) if live_editor is not None else (editor,)
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        value = str(get_input_text(candidate) or "")
+        if value and value not in values:
+            values.append(value)
+    fallback = str(get_editor_text_for_check(page) or "")
+    if fallback and fallback not in values:
+        values.append(fallback)
+    return "\n".join(values)
+
+
+def wait_topic_selection_applied(page, editor, topic, timeout_seconds=3):
+    deadline = time.time() + max(0.5, float(timeout_seconds or 3))
+    while time.time() < deadline:
+        live_editor = find_editor(page) or editor
+        text_present = topic_text_present(topic_readback_text(page, live_editor), topic)
+        if text_present and (topic_semantic_token_present(live_editor, topic) or not matching_topic_result_visible(page, topic)):
+            return True
+        page.wait_for_timeout(150)
+    return False
+
+
+def locate_topic_result_fast(page, topic):
+    """按正文下方弹层几何位置锁定完全同名候选，返回真实鼠标点击坐标。"""
+    try:
+        return page.evaluate(r"""
+        topic => {
+          function visible(el){
+            const r=el.getBoundingClientRect(), s=getComputedStyle(el);
+            return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden';
+          }
+          function norm(value){
+            return String(value||'').normalize('NFKC').replace(/[\u200b-\u200d\ufeff]/g,'')
+              .replace(/^[#\s]+|\s+/g,'').toLocaleLowerCase();
+          }
+          function matches(value, expected){
+            const normalized=norm(value);
+            if (normalized===expected) return true;
+            if (!normalized.startsWith(expected)) return false;
+            const suffix=normalized.slice(expected.length);
+            return /^[\d.,万亿+]*(?:次)?(?:播放|参与|作品|浏览|使用)$/.test(suffix);
+          }
+          const editor=document.querySelector('[contenteditable=true]');
+          if (!editor) return null;
+          const er=editor.getBoundingClientRect(), expected=norm(topic);
+          const hits=[...document.querySelectorAll('span,div,li,button,a,[role=option]')]
+            .filter(visible)
+            .filter(el => !el.closest('[contenteditable=true],textarea'))
+            .filter(el => {
+              const r=el.getBoundingClientRect();
+              if (r.top<er.bottom-12 || r.top>er.bottom+520 || r.left<er.left-24 || r.right>er.right+24) return false;
+              const lines=String(el.innerText||el.textContent||'').split(/[\r\n]+/).filter(Boolean);
+              return lines.some(line => matches(line, expected));
+            })
+            .sort((a,b) => (a.children.length-b.children.length) ||
+              (a.getBoundingClientRect().width*a.getBoundingClientRect().height -
+               b.getBoundingClientRect().width*b.getBoundingClientRect().height));
+          const hit=hits[0];
+          if (!hit) return null;
+          const r=hit.getBoundingClientRect();
+          return {x:r.left+r.width/2,y:r.top+r.height/2};
+        }
+        """, topic)
+    except Exception:
+        return None
+
+
+def select_topic_search_result(cfg, page, editor, topic):
+    """点击搜索结果中与话题完全同名的候选项，不用 Enter 猜测选中项。"""
+    deadline = time.time() + 3.5
+    while time.time() < deadline:
+        target = locate_topic_result_fast(page, topic)
+        if target:
+            page.mouse.click(float(target["x"]), float(target["y"]))
+            wlog(f"选择话题 #{topic}：弹层候选真实鼠标快速点击成功。")
+            if wait_topic_selection_applied(page, editor, topic, 3):
+                return True
+            break
+        page.wait_for_timeout(120)
+
+    patterns = [
+        re.compile(rf"^\s*[#＃]?\s*{re.escape(topic)}\s*$", re.IGNORECASE),
+        re.compile(re.escape(topic), re.IGNORECASE),
+    ]
+    for pattern in patterns:
+        try:
+            group = page.get_by_text(pattern)
+            for index in range(min(group.count(), 40)):
+                item = group.nth(index)
+                if not item.is_visible(timeout=200) or not topic_result_locator_is_valid(item, topic):
+                    continue
+                if click_locator_with_fallback(page, item, f"选择话题 #{topic}", timeout=1800):
+                    if wait_topic_selection_applied(page, editor, topic, 3):
+                        return True
+        except Exception:
+            continue
+
+    # 语义定位失效时，仅在话题弹层中查找完全同名的叶节点。
+    try:
+        target = page.evaluate(r"""
+        topic => {
+          function visible(el){
+            const r=el.getBoundingClientRect(), s=getComputedStyle(el);
+            return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden';
+          }
+          function norm(value){
+            return String(value||'').normalize('NFKC').replace(/[\u200b-\u200d\ufeff]/g,'')
+              .replace(/^[#\s]+|\s+/g,'').toLocaleLowerCase();
+          }
+          function matches(value, expected){
+            const normalized=norm(value);
+            if (normalized===expected) return true;
+            if (!normalized.startsWith(expected)) return false;
+            const suffix=normalized.slice(expected.length);
+            return /^[\d.,万亿+]*(?:次)?(?:播放|参与|作品|浏览|使用)$/.test(suffix);
+          }
+          function inTopicPanel(el){
+            const editor=document.querySelector('[contenteditable=true]');
+            if (editor) {
+              const er=editor.getBoundingClientRect(), r=el.getBoundingClientRect();
+              const belowEditor=r.top>=er.bottom-12 && r.top<=er.bottom+520;
+              const alignedWithEditor=r.left>=er.left-24 && r.right<=er.right+24;
+              if (belowEditor && alignedWithEditor) return true;
+            }
+            for (let node=el; node && node!==document.body; node=node.parentElement) {
+              const s=getComputedStyle(node), cls=String(node.className||'').toLowerCase();
+              if (node.matches('[role=option],[role=listbox],[role=menu],[role=dialog],[aria-modal=true],li')) return true;
+              if (s.position==='fixed') return true;
+              if (s.position==='absolute' && /(topic|hash|suggest|popover|dropdown|select|search)/.test(cls)) return true;
+            }
+            return false;
+          }
+          const expected=norm(topic);
+          const nodes=[...document.querySelectorAll('[role=option],li,button,[role=button],a,span,div')].filter(visible);
+          const hits=nodes.filter(el => {
+            if (el.closest('[contenteditable=true],textarea') || !inTopicPanel(el)) return false;
+            const lines=String(el.innerText||el.textContent||'').split(/[\r\n]+/).filter(Boolean);
+            return lines.some(line => matches(line, expected));
+          }).sort((a,b) => (a.children.length-b.children.length) ||
+            (a.getBoundingClientRect().width*a.getBoundingClientRect().height -
+             b.getBoundingClientRect().width*b.getBoundingClientRect().height));
+          const hit=hits[0];
+          if (!hit) return null;
+          const clickTarget=hit.closest('[role=option],li,button,[role=button],a') || hit;
+          const r=clickTarget.getBoundingClientRect();
+          clickTarget.click();
+          return {x:r.left+r.width/2,y:r.top+r.height/2};
+        }
+        """, topic)
+        if target and wait_topic_selection_applied(page, editor, topic, 2):
+            return True
+        if target:
+            page.mouse.click(float(target["x"]), float(target["y"]))
+            if wait_topic_selection_applied(page, editor, topic, 2.5):
+                return True
+    except Exception:
+        pass
+
+    save_debug(cfg, page, "topic_result_not_selected")
+    raise RuntimeError(f"话题 #{topic} 未在网页搜索结果中完成选中，已禁止继续发布。")
+
+
+def add_topic_by_search(cfg, page, editor, topic):
+    topic = str(topic or "").strip().replace("＃", "#").lstrip("#").strip()
+    if not topic:
+        return False
+    target = open_topic_search(cfg, page, editor)
+    if target is None:
+        save_debug(cfg, page, "topic_search_input_not_found")
+        raise RuntimeError(f"已打开“添加话题”，但没有找到 #{topic} 的搜索输入位置。")
+
+    search_input, dedicated_search = target
+    if dedicated_search:
+        search_input.click(force=True)
+        page.keyboard.press("Control+A")
+        page.keyboard.press("Backspace")
+    # 当前抖音网页没有独立搜索框：“#添加话题”会在正文末尾插入 # 并保留焦点。
+    # 此时不能再次点击正文（节点已刷新且会改变光标），直接输入关键词即可触发下方候选。
+    page.keyboard.type(topic, delay=0)
+    wlog(f"{'独立搜索框' if dedicated_search else '正文内'}搜索话题：{topic}")
+    topic_wait = float(cfg.get("topic_wait_seconds", 2.5) or 2.5)
+    countdown_sleep(cfg, topic_wait, f"搜索话题：{topic}", "topic_wait")
+    live_editor = find_editor(page) or editor
+    select_topic_search_result(cfg, page, live_editor, topic)
+    topic_after_select_wait = float(cfg.get("topic_after_enter_wait_seconds", 1) or 1)
+    countdown_sleep(cfg, topic_after_select_wait, f"确认话题：#{topic}", "topic_wait")
+    wlog(f"话题已通过搜索结果选中：#{topic}")
+    return True
+
+
 def fill_copy(cfg, page, text):
     """
-    填写正文并点亮话题（逐字输入版，不占用剪贴板）。
-    修复点：
-    1. 话题每输入一次后等待识别，避免太快导致话题没点亮。
-    2. 函数缩进修正，可直接运行。
-    3. 使用 page.keyboard.type() 逐字输入，不占用剪贴板。
+    填写正文，并通过网页“添加话题 → 搜索 → 选择结果”关联话题。
+    正文和搜索关键词仍使用键盘事件逐字输入，不占用剪贴板。
     """
     body, topics = split_text_topics(text)
     editor = find_editor(page)
@@ -3181,36 +4044,17 @@ def fill_copy(cfg, page, text):
     step_wait(cfg, "清空文案框后等待")
 
     # 逐字输入正文（不占用剪贴板）
-    input_text = body if body else text
+    input_text = body
     wlog(f"逐字输入正文，共 {len(input_text)} 字")
-    page.keyboard.type(input_text, delay=0)
+    if input_text:
+        page.keyboard.type(input_text, delay=0)
     step_wait(cfg, "输入文案后等待")
 
     if topics:
-        wlog("点亮话题：" + "、".join(topics))
-        page.keyboard.press("End")
-        page.keyboard.press("Enter")
-
-        # 等待抖音话题输入区域稳定
+        wlog("通过网页搜索选择话题：" + "、".join(topics))
         countdown_sleep(cfg, float(cfg.get("topic_first_wait_seconds", 1.5) or 1.5), "话题输入区域稳定", "topic_wait")
-
-        # 每个话题单独输入，输入后等待平台识别，再按 Enter 点亮
-        topic_wait = float(cfg.get("topic_wait_seconds", 2.5) or 2.5)
-        topic_after_enter_wait = float(cfg.get("topic_after_enter_wait_seconds", 1) or 1)
-
         for topic in topics:
-            topic = str(topic).strip().replace("＃", "#").lstrip("#").strip()
-            if not topic:
-                continue
-            # 逐字输入话题 #tag（不占用剪贴板）
-            page.keyboard.type("#" + topic, delay=0)
-
-            wlog(f"等待识别话题：#{topic}")
-            countdown_sleep(cfg, topic_wait, f"识别话题：#{topic}", "topic_wait")
-
-            page.keyboard.press("Enter")
-            countdown_sleep(cfg, topic_after_enter_wait, f"确认话题：#{topic}", "topic_wait")
-            page.keyboard.type(" ")
+            add_topic_by_search(cfg, page, editor, topic)
 
 
 def normalize_text_for_check(value):
@@ -3249,13 +4093,14 @@ def get_editor_text_for_check(page):
           const elements = [...document.querySelectorAll(selectors.join(","))]
             .filter(visible)
             .filter(el => {
+              // 只看输入节点自身语义。正文父容器同时含“添加作品标题”，
+              // 用 parentElement.innerText 会把重建后的真实正文编辑器误排除。
               const descriptor = [
                 el.getAttribute('placeholder') || '',
                 el.getAttribute('data-placeholder') || '',
                 el.getAttribute('aria-label') || '',
                 el.getAttribute('name') || '',
-                el.closest('label')?.innerText || '',
-                el.parentElement?.innerText?.slice(0, 80) || ''
+                el.closest('label')?.innerText || ''
               ].join(' ');
               return !descriptor.includes('标题');
             });
@@ -3275,6 +4120,21 @@ def get_editor_text_for_check(page):
         return ""
 
 
+def validate_topics_selected(cfg, page, text):
+    """回读正文编辑框，确保每个话题都已由网页话题流程写回。"""
+    _, topics = split_text_topics(text)
+    if not topics:
+        return True
+    editor = find_editor(page)
+    editor_text = topic_readback_text(page, editor)
+    missing = [topic for topic in topics if not topic_text_present(editor_text, topic)]
+    if missing:
+        save_debug(cfg, page, "validate_topics_selected_failed")
+        raise RuntimeError("话题回读校验失败，未检测到：" + "、".join(f"#{topic}" for topic in missing))
+    wlog(f"校验通过：{len(topics)} 个话题均已通过搜索结果写回。")
+    return True
+
+
 def validate_copy_filled(cfg, page, text):
     """
     校验文案是否真正写入。
@@ -3285,10 +4145,13 @@ def validate_copy_filled(cfg, page, text):
     3. 等待抖音快速检测与话题识别稳定后重复校验；
     4. 编辑框读取失败时，再使用整页文本作为兜底。
     """
-    body, _ = split_text_topics(text)
-    expected = normalize_text_for_check(body or text)
+    body, topics = split_text_topics(text)
+    expected = normalize_text_for_check(body)
 
     if not expected:
+        if topics:
+            wlog("原始内容只包含话题，跳过正文文字校验。")
+            return True
         raise RuntimeError("原始文案为空，无法进行文案校验。")
 
     actual = ""
@@ -4484,6 +5347,362 @@ def select_music(cfg, page):
     return True
 
 
+DECLARATION_PRESETS = (
+    "无需添加自主声明",
+    "内容由AI生成",
+    "个人观点，仅供参考",
+    "素材来源网络",
+    "虚构演绎，仅供娱乐",
+    "危险行为，请勿模仿",
+)
+
+
+NO_DECLARATION_PATTERN = re.compile(r"^\s*(?:无需|不需要)(?:添加)?(?:自主|内容)?声明\s*$")
+
+
+def optional_declaration_dialog(page):
+    """只识别有声明标题和无需声明选项的弹窗，排除主页面及其它确认框。"""
+    try:
+        groups = [page.get_by_role("dialog"), page.locator('[aria-modal=true],[class*="modal" i],[class*="dialog" i]')]
+        for group in groups:
+            candidates = group.filter(has_text=re.compile(r"对作品内容添加声明|请选择声明类型"))
+            for index in range(min(candidates.count(), 24)):
+                dialog = candidates.nth(index)
+                if dialog.is_visible(timeout=200) and dialog.get_by_text(NO_DECLARATION_PATTERN).count() > 0:
+                    return dialog
+    except Exception:
+        pass
+    return None
+
+
+def handle_optional_declaration_prompt(cfg, page):
+    """按用户要求，上传声明提示默认选择无需声明；所有点击限定在该弹窗内。"""
+    dialog = optional_declaration_dialog(page)
+    if dialog is None:
+        return False
+    choice = None
+    for group in (dialog.get_by_role("radio", name=NO_DECLARATION_PATTERN), dialog.get_by_text(NO_DECLARATION_PATTERN)):
+        for index in range(min(group.count(), 8)):
+            item = group.nth(index)
+            if item.is_visible(timeout=200):
+                choice = item
+                break
+        if choice is not None:
+            break
+    if choice is None or not click_locator_with_fallback(page, choice, "声明弹窗选择无需声明", timeout=1500):
+        raise RuntimeError("声明弹窗中无法选择“无需声明”。")
+
+    def selected():
+        return bool(choice.evaluate("""
+        el => {
+          const selector='input[type=radio],[role=radio]';
+          const host=el.closest('label,[role=radio]') || el.parentElement;
+          const radio=el.matches(selector) ? el : (host && host.querySelector(selector));
+          if (radio) return radio.checked===true || radio.getAttribute('aria-checked')==='true';
+          return !!host && /(?:^|[-_ ])(?:checked|selected)(?:[-_ ]|$)/i.test(String(host.className));
+        }
+        """))
+
+    deadline = time.monotonic() + 3
+    while not selected():
+        if time.monotonic() >= deadline:
+            raise RuntimeError("声明弹窗的“无需声明”点击后未回读为选中。")
+        page.wait_for_timeout(100)
+    for group in (dialog.get_by_role("button", name=re.compile(r"^\s*(?:确定|确认)\s*$")), dialog.get_by_text(re.compile(r"^\s*(?:确定|确认)\s*$"))):
+        for index in range(min(group.count(), 8)):
+            button = group.nth(index)
+            if button.is_visible(timeout=200) and button.is_enabled(timeout=200):
+                if click_locator_with_fallback(page, button, "确认无需声明", timeout=1500):
+                    deadline = time.monotonic() + 4
+                    while dialog.is_visible(timeout=200) and time.monotonic() < deadline:
+                        page.wait_for_timeout(100)
+                    if dialog.is_visible(timeout=200):
+                        raise RuntimeError("无需声明已选中，但确认后弹窗仍未关闭。")
+                    wlog("上传声明弹窗已选择“无需声明”并确认关闭。")
+                    return True
+    raise RuntimeError("声明弹窗中未找到可用的确认按钮。")
+
+
+def declaration_config(cfg):
+    enabled = parse_bool(cfg.get("declaration_enabled"), False)
+    entry_text = str(cfg.get("declaration_entry_text") or "自主声明").strip()
+    content = str(cfg.get("declaration_text") or "").strip()
+    if enabled and not entry_text:
+        raise RuntimeError("已启用发布声明，但声明入口文字为空。")
+    if enabled and not content:
+        raise RuntimeError("已启用发布声明，但声明内容为空；请在账号配置中选择或手工填写。")
+    return enabled, entry_text, content
+
+
+def declaration_panel_visible(page, entry_text="自主声明", content=""):
+    try:
+        return bool(page.evaluate("""
+        ({entryText, content}) => {
+          function visible(el){
+            const r=el.getBoundingClientRect(), s=getComputedStyle(el);
+            return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden';
+          }
+          function txt(el){ return ((el.innerText||el.textContent||'')+'').trim(); }
+          const nodes=[...document.querySelectorAll('[role=dialog],[aria-modal=true],[role=listbox],[role=menu],div,section')];
+          return nodes.some(el => {
+            if (!visible(el)) return false;
+            const t=txt(el);
+            if (!t || t.length>1500) return false;
+            const s=getComputedStyle(el), cls=String(el.className||'').toLowerCase();
+            const overlay = el.matches('[role=dialog],[aria-modal=true],[role=listbox],[role=menu]') ||
+              s.position==='fixed' || (s.position==='absolute' && (cls.includes('drawer') || cls.includes('modal') || cls.includes('popover')));
+            const relevant = t.includes(entryText) || t.includes('声明') || (content && t.includes(content));
+            const interactive = !!el.querySelector('input,[role=radio],[role=checkbox],button,[role=button]');
+            return overlay && relevant && interactive;
+          });
+        }
+        """, {"entryText": entry_text, "content": content}))
+    except Exception:
+        return False
+
+
+def declaration_control_in_panel(locator):
+    try:
+        return bool(locator.evaluate("""
+        el => {
+          function visible(node){
+            const r=node.getBoundingClientRect(), s=getComputedStyle(node);
+            return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden';
+          }
+          for (let node=el; node && node!==document.body; node=node.parentElement) {
+            if (!visible(node)) continue;
+            const s=getComputedStyle(node), cls=String(node.className||'').toLowerCase();
+            if (node.matches('[role=dialog],[aria-modal=true],[role=listbox],[role=menu]')) return true;
+            if (s.position==='fixed') return true;
+            if (s.position==='absolute' && (cls.includes('drawer') || cls.includes('modal') || cls.includes('popover'))) return true;
+          }
+          return false;
+        }
+        """))
+    except Exception:
+        return False
+
+
+def declaration_selected(page, entry_text, content):
+    """同时检查主页面回显和声明面板内选中状态，不能只凭一次点击判定成功。"""
+    try:
+        return bool(page.evaluate("""
+        ({entryText, content}) => {
+          function visible(el){
+            const r=el.getBoundingClientRect(), s=getComputedStyle(el);
+            return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden';
+          }
+          function txt(el){ return ((el.innerText||el.textContent||'')+'').trim(); }
+          function inOverlay(el){
+            for (let n=el; n && n!==document.body; n=n.parentElement) {
+              const s=getComputedStyle(n), cls=String(n.className||'').toLowerCase();
+              if (n.matches('[role=dialog],[aria-modal=true],[role=listbox],[role=menu]')) return true;
+              if (s.position==='fixed') return true;
+              if (s.position==='absolute' && (cls.includes('drawer') || cls.includes('modal') || cls.includes('popover'))) return true;
+            }
+            return false;
+          }
+          const nodes=[...document.querySelectorAll('div,section,label,span,p')].filter(visible);
+          if (nodes.some(el => {
+            const t=txt(el);
+            return !inOverlay(el) && t.length<=240 && t.includes(entryText) && t.includes(content);
+          })) return true;
+          const choices=[...document.querySelectorAll('input,[role=radio],[role=checkbox]')].filter(visible);
+          return choices.some(el => {
+            const checked = el.checked === true || el.getAttribute('aria-checked') === 'true';
+            if (!checked) return false;
+            const host=el.closest('label,[role=option],li,div') || el.parentElement;
+            return host && txt(host).includes(content);
+          });
+        }
+        """, {"entryText": entry_text, "content": content}))
+    except Exception:
+        return False
+
+
+def wait_declaration_panel(page, entry_text, content, timeout_seconds=4):
+    deadline = time.time() + max(0.5, float(timeout_seconds or 4))
+    while time.time() < deadline:
+        if declaration_panel_visible(page, entry_text, content):
+            return True
+        page.wait_for_timeout(200)
+    return False
+
+
+def open_declaration_panel(cfg, page, entry_text, content):
+    if declaration_selected(page, entry_text, content):
+        return True
+    try:
+        pattern = re.compile(rf"^(?:请选择)?\s*{re.escape(entry_text)}$")
+        candidates = [
+            page.get_by_role("button", name=pattern),
+            page.get_by_text(pattern),
+            page.get_by_text(entry_text, exact=True),
+        ]
+        for candidate_group in candidates:
+            for index in range(min(candidate_group.count(), 12)):
+                item = candidate_group.nth(index)
+                try:
+                    if not item.is_visible(timeout=250) or declaration_control_in_panel(item):
+                        continue
+                    if click_locator_with_fallback(page, item, f"打开{entry_text}", timeout=1800):
+                        if wait_declaration_panel(page, entry_text, content, 3):
+                            wlog(f"已打开“{entry_text}”面板。")
+                            return True
+                except Exception:
+                    continue
+    except Exception:
+        pass
+
+    # 文本本身不可点击时，点击其最近的可交互行；真实鼠标仍只使用识别到的元素边界。
+    try:
+        target = page.evaluate("""
+        entryText => {
+          function visible(el){
+            const r=el.getBoundingClientRect(), s=getComputedStyle(el);
+            return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden';
+          }
+          function txt(el){ return ((el.innerText||el.textContent||'')+'').trim(); }
+          const nodes=[...document.querySelectorAll('button,[role=button],label,span,div,p')].filter(visible);
+          const hit=nodes.find(el => {
+            const t=txt(el);
+            return (t===entryText || t===('请选择'+entryText)) && t.length<80;
+          });
+          if (!hit) return null;
+          let clickTarget=hit.closest('button,[role=button],a,[tabindex]') || hit;
+          if (clickTarget===hit) {
+            for (let p=hit.parentElement, depth=0; p && depth<4; p=p.parentElement, depth++) {
+              const t=txt(p);
+              if (t.length<180 && (getComputedStyle(p).cursor==='pointer' || p.onclick)) { clickTarget=p; break; }
+            }
+          }
+          const r=clickTarget.getBoundingClientRect();
+          clickTarget.click();
+          return {x:r.left+r.width/2,y:r.top+r.height/2};
+        }
+        """, entry_text)
+        if wait_declaration_panel(page, entry_text, content, 2.5):
+            wlog(f"已通过声明行 DOM 点击打开“{entry_text}”面板。")
+            return True
+        if target:
+            page.mouse.click(float(target["x"]), float(target["y"]))
+            if wait_declaration_panel(page, entry_text, content, 2.5):
+                wlog(f"已通过声明行真实鼠标兜底打开“{entry_text}”面板。")
+                return True
+    except Exception:
+        pass
+    save_debug(cfg, page, "declaration_panel_not_opened")
+    raise RuntimeError(f"未能打开声明入口“{entry_text}”；可在账号配置中按平台当前文字修改入口名称。")
+
+
+def declaration_available_options(page):
+    try:
+        values = page.evaluate("""
+        () => {
+          function visible(el){
+            const r=el.getBoundingClientRect(), s=getComputedStyle(el);
+            return r.width>0 && r.height>0 && s.display!=='none' && s.visibility!=='hidden';
+          }
+          function txt(el){ return ((el.innerText||el.textContent||'')+'').trim(); }
+          const result=[];
+          for (const el of [...document.querySelectorAll('label,[role=radio],[role=checkbox],[role=option],li,button,span')]) {
+            if (!visible(el)) continue;
+            const t=txt(el);
+            if (t && t.length<=80 && !result.includes(t)) result.push(t);
+          }
+          return result.slice(0,30);
+        }
+        """)
+        return [str(value).strip() for value in (values or []) if str(value).strip()]
+    except Exception:
+        return []
+
+
+def select_and_validate_declaration(cfg, page):
+    enabled, entry_text, content = declaration_config(cfg)
+    if not enabled:
+        return True
+    if declaration_selected(page, entry_text, content):
+        wlog(f"发布声明“{content}”已经生效，跳过重复选择。")
+        return True
+    open_declaration_panel(cfg, page, entry_text, content)
+    if NO_DECLARATION_PATTERN.fullmatch(content):
+        if handle_optional_declaration_prompt(cfg, page):
+            return True
+        raise RuntimeError("已打开声明设置，但没有找到“无需声明”选项。")
+
+    pattern = re.compile(rf"^\s*{re.escape(content)}\s*$")
+    candidate_groups = [
+        page.get_by_role("radio", name=pattern),
+        page.get_by_role("checkbox", name=pattern),
+        page.get_by_role("option", name=pattern),
+        page.get_by_text(pattern),
+        page.get_by_text(content, exact=False),
+    ]
+    clicked = False
+    for group in candidate_groups:
+        try:
+            for index in range(min(group.count(), 20)):
+                item = group.nth(index)
+                if not item.is_visible(timeout=250) or not declaration_control_in_panel(item):
+                    continue
+                if click_locator_with_fallback(page, item, f"选择声明“{content}”", timeout=1800):
+                    clicked = True
+                    break
+            if clicked:
+                break
+        except Exception:
+            continue
+
+    if not clicked:
+        # 平台若把声明改成可编辑输入框，允许直接填入用户在前端保存的实际文案。
+        for selector in ("textarea", "input[type=text]", "[contenteditable=true]"):
+            try:
+                fields = page.locator(selector)
+                for index in range(min(fields.count(), 12)):
+                    field = fields.nth(index)
+                    if not field.is_visible(timeout=200) or not declaration_control_in_panel(field):
+                        continue
+                    field.click(timeout=1000)
+                    page.keyboard.press("Control+A")
+                    page.keyboard.type(content, delay=20)
+                    clicked = True
+                    wlog("声明面板提供可编辑输入框，已逐字填入自定义声明内容。")
+                    break
+                if clicked:
+                    break
+            except Exception:
+                continue
+
+    if not clicked:
+        options = declaration_available_options(page)
+        save_debug(cfg, page, "declaration_content_not_found")
+        suffix = "；当前面板可见项：" + "、".join(options[:12]) if options else ""
+        raise RuntimeError(f"声明面板中找不到配置内容“{content}”{suffix}")
+
+    page.wait_for_timeout(350)
+    # 只在确认按钮属于声明面板时点击，避免误点页面其它“确定/完成”。
+    for label in ("确定", "确认", "完成", "保存"):
+        try:
+            buttons = page.get_by_role("button", name=re.compile(rf"^{label}$"))
+            for index in range(min(buttons.count(), 8)):
+                button = buttons.nth(index)
+                if button.is_visible(timeout=200) and declaration_control_in_panel(button):
+                    click_locator_with_fallback(page, button, f"确认声明（{label}）", timeout=1500)
+                    page.wait_for_timeout(350)
+                    break
+        except Exception:
+            pass
+        if declaration_selected(page, entry_text, content):
+            break
+
+    if not declaration_selected(page, entry_text, content):
+        save_debug(cfg, page, "declaration_state_not_applied")
+        raise RuntimeError(f"已操作声明“{content}”，但页面未回显选中状态。")
+    wlog(f"校验通过：发布声明“{content}”已生效。")
+    return True
+
+
 def validate_publish_settings_visible(cfg, page, raise_error=True):
     """
     V20：校验"发布设置"区域确实在当前可视区域，而不是仅存在于 DOM 文本里。
@@ -5509,12 +6728,56 @@ def submit(cfg, page):
 
 
 
+def is_bitbrowser_workbench_page(page):
+    """识别实机确认的比特默认工作台，不按通用标题或本机地址误关用户页。"""
+    url = urllib.parse.urlsplit(page.url or "")
+    return url.scheme in ("http", "https") and url.hostname == "console.bitbrowser.net" and url.path in ("", "/")
+
+
+def prepare_bitbrowser_publish_tab(context, page=None):
+    pages = list(context.pages)
+    creator_pages = [p for p in pages if urllib.parse.urlsplit(p.url or "").hostname == "creator.douyin.com"]
+    other_pages = [p for p in pages if not is_bitbrowser_workbench_page(p)]
+    # 优先复用发布页；没有时复用已有普通标签，仅剩工作台时才新建一次。
+    if page in creator_pages:
+        chosen = page
+    elif creator_pages:
+        chosen = creator_pages[-1]
+    elif page in other_pages:
+        chosen = page
+    else:
+        chosen = other_pages[-1] if other_pages else context.new_page()
+    workbench_closed = other_closed = 0
+    for candidate in sorted(pages, key=lambda p: not is_bitbrowser_workbench_page(p)):
+        if candidate is chosen:
+            continue
+        is_workbench = is_bitbrowser_workbench_page(candidate)
+        label = "默认工作台" if is_workbench else "多余标签"
+        try:
+            candidate.close()
+        except Exception as exc:
+            raise RuntimeError(f"无法关闭比特浏览器{label}，已停止进入发布流程。") from exc
+        if not candidate.is_closed():
+            raise RuntimeError(f"比特浏览器{label}仍未关闭，已停止进入发布流程。")
+        if is_workbench:
+            workbench_closed += 1
+        else:
+            other_closed += 1
+    if workbench_closed:
+        wlog(f"已关闭 {workbench_closed} 个比特浏览器默认工作台标签。")
+    wlog(f"比特窗口仅保留 1 个发布标签；已关闭 {other_closed} 个多余标签，后续作品复用当前页。")
+    safe_bring_to_front(ACTIVE_CFG or {}, chosen)
+    return register_page_health_monitor(chosen)
+
+
 def keep_single_browser_tab(context, page=None):
     """
     V29：强制单标签模式。
     优先保留当前传入标签；如果没有，则保留最后一个创作者中心标签。
     关闭其它标签，避免越跑越多。
     """
+    if normalize_browser_type((ACTIVE_CFG or {}).get("browser_type")) == "bitbrowser":
+        return prepare_bitbrowser_publish_tab(context, page)
     try:
         pages = list(context.pages)
         if not pages:
@@ -5717,7 +6980,7 @@ def account_worker(config_path):
             playwright_manager = sync_playwright()
             playwright = playwright_manager.start()
             browser = playwright.chromium.connect_over_cdp(
-                f"http://127.0.0.1:{int(account_cfg['cdp_port'])}"
+                browser_connection_endpoint(account_cfg, launch_info)
             )
             context = browser.contexts[0] if browser.contexts else browser.new_context()
             page = context.pages[-1] if context.pages else context.new_page()
@@ -5778,7 +7041,7 @@ def account_worker(config_path):
                 title = publish_record.get("title", "")
                 copy_text = publish_record["copy"]
                 try:
-                    img = choose_image_for_record(account_cfg, publish_record)
+                    images = choose_images_for_record(account_cfg, publish_record)
                 except Exception as exc:
                     alert_auto_pause(f"自动暂停提醒：{account_name} 的图片匹配失败：{exc}")
                     append_log(account_cfg, {
@@ -5811,7 +7074,8 @@ def account_worker(config_path):
                     wlog("-" * 60)
                     wlog(
                         f"{account_name} 当前作品总体流程 {workflow_attempt}/{workflow_total}："
-                        f"城市={city or '旧格式根目录'}；图片={img.name}；文案序号={ci + 1}；"
+                        f"城市={city or '旧格式根目录'}；图片={','.join(path.name for path in images)}；"
+                        f"文案序号={ci + 1}；"
                         f"定时={slot.strftime('%Y-%m-%d %H:%M') if account_cfg.get('use_schedule', True) else '立即发布'}"
                     )
 
@@ -5825,12 +7089,12 @@ def account_worker(config_path):
                     )
                     run_publish_step(
                         account_cfg, page, "上传图片",
-                        lambda: upload_image(account_cfg, page, img),
+                        lambda: upload_images(account_cfg, page, images),
                     )
 
                     def wait_for_editor():
                         step_wait(account_cfg, "已选择图片，等待进入图文编辑页")
-                        return wait_after_upload_to_editor(account_cfg, page)
+                        return wait_after_upload_to_editor(account_cfg, page, len(images))
 
                     run_publish_step(account_cfg, page, "等待进入图文编辑页", wait_for_editor)
 
@@ -5840,10 +7104,17 @@ def account_worker(config_path):
 
                     def input_and_validate_copy():
                         fill_copy(account_cfg, page, copy_text)
-                        return validate_copy_filled(account_cfg, page, copy_text)
+                        validate_copy_filled(account_cfg, page, copy_text)
+                        return validate_topics_selected(account_cfg, page, copy_text)
 
                     run_publish_step(account_cfg, page, "输入并校验标题", input_and_validate_title)
                     run_publish_step(account_cfg, page, "输入并校验正文话题", input_and_validate_copy)
+
+                    if account_cfg.get("declaration_enabled", False):
+                        run_publish_step(
+                            account_cfg, page, "选择并校验发布声明",
+                            lambda: select_and_validate_declaration(account_cfg, page),
+                        )
 
                     if account_cfg.get("music_required", True):
                         def select_and_validate_music():
@@ -5876,12 +7147,17 @@ def account_worker(config_path):
                         wlog("当前账号未启用定时发布：跳过发布模式设置，直接准备点击底部发布按钮。")
 
                     def final_validation():
-                        wait_uploaded_with_config(account_cfg, page)
-                        validate_uploaded_image(account_cfg, page)
+                        wait_uploaded_with_config(account_cfg, page, len(images))
+                        validate_uploaded_image(account_cfg, page, len(images))
                         validate_title_filled(account_cfg, page, title)
                         validate_copy_filled(account_cfg, page, copy_text)
+                        validate_topics_selected(account_cfg, page, copy_text)
                         if account_cfg.get("music_required", True):
                             validate_music_added(account_cfg, page)
+                        if account_cfg.get("declaration_enabled", False):
+                            enabled, entry_text, declaration_text = declaration_config(account_cfg)
+                            if enabled and not declaration_selected(page, entry_text, declaration_text):
+                                raise RuntimeError(f"点击发布前声明“{declaration_text}”回读未生效，禁止提交。")
                         if account_cfg.get("use_schedule", True) and not verify_schedule_time(page, slot):
                             raise RuntimeError("点击发布前定时时间回读不一致，禁止提交。")
                         return True
@@ -5941,7 +7217,7 @@ def account_worker(config_path):
                     write_state(account_cfg, state_now)
                     append_log(account_cfg, {
                         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "image": str(img), "copy_index": ci + 1,
+                        "image": "|".join(str(path) for path in images), "copy_index": ci + 1,
                         "schedule_time": slot.strftime("%Y-%m-%d %H:%M") if account_cfg.get("use_schedule", True) else "立即发布",
                         "copy_preview": copy_text[:80].replace("\n", " "),
                         "status": f"daily_publish_limit[{account_name}]: {daily_limit_message}"
@@ -5984,7 +7260,7 @@ def account_worker(config_path):
                     write_state(account_cfg, failure_state)
                     append_log(account_cfg, {
                         "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "image": str(img), "copy_index": ci + 1,
+                        "image": "|".join(str(path) for path in images), "copy_index": ci + 1,
                         "schedule_time": slot.strftime("%Y-%m-%d %H:%M") if account_cfg.get("use_schedule", True) else "立即发布",
                         "copy_preview": copy_text[:80].replace("\n", " "),
                         "status": f"error_after_step_and_workflow_retries[{account_name}]: {repr(last_error)}"
@@ -6006,13 +7282,15 @@ def account_worker(config_path):
                     )
                     break
 
-                # 只有确认进入作品管理页后，才消费图片、文案和排期。
+                # 只有确认进入作品管理页后，才删除图片/文案并推进排期。
+                # 未勾选删除图片时，后续作品仍可从完整图片库重新选择这些图片。
                 if account_cfg.get("delete_image_after_success", True):
-                    try:
-                        img.unlink()
-                        wlog(f"已删除已发布图片：{img.name}")
-                    except Exception as exc:
-                        wlog(f"删除图片失败：{exc}")
+                    for img in images:
+                        try:
+                            img.unlink()
+                            wlog(f"已删除已发布图片：{img.name}")
+                        except Exception as exc:
+                            wlog(f"删除图片失败：{img.name}：{exc}")
                 if account_cfg.get("delete_copy_after_success", True):
                     deleted_copy = False
                     try:
@@ -6053,7 +7331,7 @@ def account_worker(config_path):
                 write_state(account_cfg, state_now)
                 append_log(account_cfg, {
                     "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "image": str(img), "copy_index": published_copy_index,
+                    "image": "|".join(str(path) for path in images), "copy_index": published_copy_index,
                     "schedule_time": slot.strftime("%Y-%m-%d %H:%M") if account_cfg.get("use_schedule", True) else "立即发布",
                     "copy_preview": copy_text[:80].replace("\n", " "),
                     "status": f"success[{account_name}]"
@@ -6130,7 +7408,10 @@ def account_worker(config_path):
                 account_done, account_quota,
             )
         finally:
-            if launch_info and launch_info.get("launched") and account.get("close_after_finish", True):
+            if launch_info and account_cfg.get("browser_type") == "bitbrowser":
+                if account.get("close_after_finish", True):
+                    close_bitbrowser_task_window(account)
+            elif launch_info and launch_info.get("launched") and account.get("close_after_finish", True):
                 close_browser_launched_by_app(browser, launch_info, account_name)
             elif launch_info and launch_info.get("reused"):
                 wlog(f"{account_name} 使用的是已存在调试连接，未主动关闭，避免误关用户浏览器。")
@@ -6204,6 +7485,14 @@ def run_isolated_browser_sequence(config_path, child_switch, publish_mode=False)
             wlog(f"已启用账号轮换发布：每个账号连续成功发布 {rotate_batch_size} 条后切换下一个，直至各账号设定条数全部完成。")
     temp_root = Path(tempfile.mkdtemp(prefix="douyin_browser_sequence_"))
     live_queue_fingerprint = json.dumps(accounts, ensure_ascii=False, sort_keys=True)
+    bitbrowser_task_windows = {}
+
+    def close_finished_bitbrowser_windows(force=False):
+        finished = completed_account_ids | failed_account_ids | daily_limit_account_ids
+        for identity, account in list(bitbrowser_task_windows.items()):
+            if force or not bitbrowser_window_has_pending_accounts(account, accounts, finished):
+                if close_bitbrowser_task_window(account):
+                    del bitbrowser_task_windows[identity]
 
     def reload_live_queue():
         """在账号子进程边界重新读取主配置，使暂停期间的队列修改可在继续后生效。"""
@@ -6251,12 +7540,20 @@ def run_isolated_browser_sequence(config_path, child_switch, publish_mode=False)
             return 0, True
 
         child_cfg = copy.deepcopy(cfg)
+        child_cfg["_protect_bitbrowser_windows"] = any(
+            item.get("browser_type") == "bitbrowser" for item in accounts
+        )
         child_account = copy.deepcopy(account)
         # 保留完整配额，以便账号 worker 的 run_progress 能跨轮次累计。
         child_account["posts_per_run"] = quota
         child_cfg["browser_accounts"] = [child_account]
         if publish_mode:
             child_cfg["_queue_run_id"] = queue_run_id
+            if child_account.get("browser_type") == "bitbrowser":
+                if account.get("close_after_finish", True):
+                    bitbrowser_task_windows[browser_runtime_identity(account)] = copy.deepcopy(account)
+                # 父进程等同一窗口的最后一个队列任务完成后关闭，避免轮换/重复行重开。
+                child_account["close_after_finish"] = False
             if rotate_each_post:
                 # 每个账号连续成功发布指定条数后，子进程必须结束并把控制权交还父进程，
                 # 由父进程明确切换到队列中的下一个账号。
@@ -6333,6 +7630,7 @@ def run_isolated_browser_sequence(config_path, child_switch, publish_mode=False)
             )
             wlog(f"{account['name']} 已标记为‘今日投稿上限’，本轮后续不再重新进入该账号。")
             update_queue_run_state(cfg, queue_run_id, accounts, completed_account_ids, active=True)
+            close_finished_bitbrowser_windows()
             return gained, False
 
         last_outcome = str(_after_state.get("last_account_outcome") or "")
@@ -6346,6 +7644,7 @@ def run_isolated_browser_sequence(config_path, child_switch, publish_mode=False)
                 after_progress, quota,
             )
             update_queue_run_state(cfg, queue_run_id, accounts, completed_account_ids, active=True)
+            close_finished_bitbrowser_windows()
             return gained, False
 
         completed = after_progress >= quota
@@ -6354,6 +7653,7 @@ def run_isolated_browser_sequence(config_path, child_switch, publish_mode=False)
             completed_account_ids.add(account_id)
             emit_browser_status(account, "done", "本账号配额完成", after_progress, quota)
         update_queue_run_state(cfg, queue_run_id, accounts, completed_account_ids, active=True)
+        close_finished_bitbrowser_windows()
         return gained, completed
 
     try:
@@ -6465,6 +7765,7 @@ def run_isolated_browser_sequence(config_path, child_switch, publish_mode=False)
                 run_one_account(index, account, 1)
 
     finally:
+        close_finished_bitbrowser_windows(force=True)
         try:
             temp_root.rmdir()
         except Exception:
@@ -6529,7 +7830,7 @@ def probe_account_in_process(config_path):
             launch_info = open_browser_with_cdp(account_cfg, force_new=False)
             playwright_manager = sync_playwright()
             playwright = playwright_manager.start()
-            browser = playwright.chromium.connect_over_cdp(f"http://127.0.0.1:{int(account_cfg['cdp_port'])}")
+            browser = playwright.chromium.connect_over_cdp(browser_connection_endpoint(account_cfg, launch_info))
             context = browser.contexts[0] if browser.contexts else browser.new_context()
             page = keep_single_browser_tab(context, context.pages[-1] if context.pages else context.new_page())
             emit_browser_status(account, "checking", "登录检查：正在进入发布页", 0, quota)
@@ -6544,7 +7845,7 @@ def probe_account_in_process(config_path):
             emit_browser_status(account, "error", f"页面检查失败：{exc}", 0, quota)
             wlog(f"{account['name']}：页面检查失败但未确认掉号，{repr(exc)}")
         finally:
-            if launch_info and launch_info.get("launched") and account.get("close_after_finish", True):
+            if launch_info and launch_info.get("browser_type") != "bitbrowser" and launch_info.get("launched") and account.get("close_after_finish", True):
                 close_browser_launched_by_app(browser, launch_info, account.get("name", "浏览器"))
             if playwright_manager is not None:
                 try:
@@ -6611,22 +7912,94 @@ def next_weekly_trigger(cfg, now=None):
     return None
 
 
+class BitBrowserWindowDialog:
+    def __init__(self, owner, windows):
+        self.result = None
+        self.windows = windows
+        self.window = tk.Toplevel(owner)
+        self.window.title("选择比特浏览器窗口")
+        self.window.geometry("900x520")
+        self.window.minsize(700, 420)
+        self.window.transient(owner)
+        self.window.grab_set()
+        outer = ttk.Frame(self.window, padding=16)
+        outer.pack(fill="both", expand=True)
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(2, weight=1)
+        ttk.Label(outer, text="选择已登录抖音的 Chrome 内核窗口").grid(row=0, column=0, sticky="w")
+        self.search_var = tk.StringVar()
+        ttk.Entry(outer, textvariable=self.search_var).grid(row=1, column=0, sticky="ew", pady=(8, 12))
+        frame = ttk.Frame(outer)
+        frame.grid(row=2, column=0, sticky="nsew")
+        frame.rowconfigure(0, weight=1)
+        frame.columnconfigure(0, weight=1)
+        self.tree = ttk.Treeview(frame, columns=("seq", "name", "group", "id"), show="headings", selectmode="browse")
+        for key, title, width in (("seq", "序号", 65), ("name", "窗口名称", 180), ("group", "分组", 130), ("id", "窗口 ID", 330)):
+            self.tree.heading(key, text=title)
+            self.tree.column(key, width=width, minwidth=60, stretch=(key == "name"))
+        self.tree.grid(row=0, column=0, sticky="nsew")
+        scroll = ttk.Scrollbar(frame, orient="vertical", command=self.tree.yview)
+        scroll.grid(row=0, column=1, sticky="ns")
+        horizontal = ttk.Scrollbar(frame, orient="horizontal", command=self.tree.xview)
+        horizontal.grid(row=1, column=0, sticky="ew")
+        self.tree.configure(yscrollcommand=scroll.set, xscrollcommand=horizontal.set)
+        self.tree.bind("<Double-1>", lambda _event: self._choose())
+        self.search_var.trace_add("write", self._filter)
+        self._filter()
+        actions = ttk.Frame(outer)
+        actions.grid(row=3, column=0, sticky="ew", pady=(12, 0))
+        ttk.Button(actions, text="取消", command=self.window.destroy).pack(side="right")
+        ttk.Button(actions, text="选择窗口", command=self._choose).pack(side="right", padx=8)
+        self.window.wait_window()
+
+    def _filter(self, *_args):
+        self.tree.delete(*self.tree.get_children())
+        needle = self.search_var.get().strip().casefold()
+        for index, item in enumerate(self.windows):
+            values = (item["seq"], item["name"], item["groupName"], item["id"])
+            if not needle or any(needle in str(value).casefold() for value in values):
+                self.tree.insert("", "end", iid=str(index), values=values)
+
+    def _choose(self):
+        selected = self.tree.selection()
+        if selected:
+            self.result = self.windows[int(selected[0])]
+            self.window.destroy()
+
+
 class BrowserAccountDialog:
     def __init__(self, owner, account, title="浏览器账号"):
         self.result = None
         self.window = tk.Toplevel(owner)
         self.window.title(title)
-        self.window.geometry("820x720")
-        self.window.resizable(False, False)
+        width = min(900, max(640, self.window.winfo_screenwidth() - 80))
+        height = min(800, max(420, self.window.winfo_screenheight() - 100))
+        self.window.geometry(f"{width}x{height}")
+        self.window.minsize(640, 420)
+        self.window.resizable(True, True)
         self.window.transient(owner)
         self.window.grab_set()
         self.vars = {
             "name": tk.StringVar(value=str(account.get("name", ""))),
+            "browser_type": tk.StringVar(value=(
+                "比特浏览器" if normalize_browser_type(account.get("browser_type")) == "bitbrowser" else "快捷方式 / EXE"
+            )),
+            "bitbrowser_api_url": tk.StringVar(value=str(account.get("bitbrowser_api_url") or DEFAULT_BITBROWSER_API_URL)),
+            "bitbrowser_window_id": tk.StringVar(value=str(account.get("bitbrowser_window_id") or "")),
+            "bitbrowser_api_token": tk.StringVar(),
             "browser_path": tk.StringVar(value=str(account.get("browser_path", ""))),
             "browser_user_data_dir": tk.StringVar(value=str(account.get("browser_user_data_dir", ""))),
             "browser_profile_directory": tk.StringVar(value=str(account.get("browser_profile_directory", ""))),
             "cdp_port": tk.StringVar(value=str(account.get("cdp_port", 9222))),
             "posts_per_run": tk.StringVar(value=str(account.get("posts_per_run", 1))),
+            "images_per_post": tk.StringVar(value=str(account.get("images_per_post", 1))),
+            "image_selection_mode": tk.StringVar(value=(
+                "随机选择" if normalize_image_selection_mode(account.get("image_selection_mode")) == "random"
+                else "按图片名称顺序"
+            )),
+            "declaration_entry_text": tk.StringVar(value=str(account.get("declaration_entry_text", "自主声明"))),
+            "declaration_text": tk.StringVar(value=str(account.get("declaration_text", ""))),
+            "image_dir": tk.StringVar(value=str(account.get("image_dir", ""))),
             "excel_path": tk.StringVar(value=str(account.get("excel_path", ""))),
             "sheet_name": tk.StringVar(value=str(account.get("sheet_name", ""))),
             "publish_start_date": tk.StringVar(value=str(account.get("publish_start_date", ""))),
@@ -6639,7 +8012,11 @@ class BrowserAccountDialog:
         self.enabled_var = tk.BooleanVar(value=parse_bool(account.get("enabled"), True))
         self.close_var = tk.BooleanVar(value=parse_bool(account.get("close_after_finish"), True))
         self.use_schedule_var = tk.BooleanVar(value=parse_bool(account.get("use_schedule"), True))
+        self.declaration_enabled_var = tk.BooleanVar(value=parse_bool(account.get("declaration_enabled"), False))
         self.original_id = str(account.get("id", ""))
+        self._token_api_url = ""
+        self._sync_api_token()
+        self.vars["bitbrowser_api_url"].trace_add("write", self._sync_api_token)
         self._build()
         self.window.protocol("WM_DELETE_WINDOW", self.window.destroy)
         self.window.wait_window()
@@ -6647,34 +8024,94 @@ class BrowserAccountDialog:
     def _build(self):
         outer = ttk.Frame(self.window, padding=20)
         outer.pack(fill="both", expand=True)
-        ttk.Label(outer, text="浏览器队列项配置", font=("Microsoft YaHei UI", 17, "bold")).pack(anchor="w")
-        notebook = ttk.Notebook(outer)
-        notebook.pack(fill="both", expand=True, pady=(14, 10))
-        account_tab = ttk.Frame(notebook, padding=16)
-        schedule_tab = ttk.Frame(notebook, padding=16)
-        notebook.add(account_tab, text="浏览器与内容")
-        notebook.add(schedule_tab, text="独立发布时间")
+        outer.columnconfigure(0, weight=1)
+        outer.rowconfigure(1, weight=1)
+        ttk.Label(outer, text="浏览器队列项配置", font=("Microsoft YaHei UI", 17, "bold")).grid(row=0, column=0, sticky="w")
+        self.notebook = notebook = ttk.Notebook(outer)
+        notebook.grid(row=1, column=0, sticky="nsew", pady=(14, 10))
+        self.tab_scroll_canvases = []
+
+        def scrollable_tab(title):
+            host = ttk.Frame(notebook)
+            host.rowconfigure(0, weight=1)
+            host.columnconfigure(0, weight=1)
+            background = ttk.Style(self.window).lookup("TFrame", "background") or "#FFFFFF"
+            canvas = tk.Canvas(host, background=background, highlightthickness=0, width=1, height=1)
+            canvas.grid(row=0, column=0, sticky="nsew")
+            scrollbar = ttk.Scrollbar(host, orient="vertical", command=canvas.yview)
+            scrollbar.grid(row=0, column=1, sticky="ns")
+            canvas.configure(yscrollcommand=scrollbar.set)
+            body = ttk.Frame(canvas, padding=16)
+            item = canvas.create_window((0, 0), window=body, anchor="nw")
+            body.bind("<Configure>", lambda _event: canvas.configure(scrollregion=canvas.bbox("all")))
+            canvas.bind("<Configure>", lambda event: canvas.itemconfigure(item, width=event.width))
+            notebook.add(host, text=title)
+            self.tab_scroll_canvases.append(canvas)
+            return body
+
+        account_tab = scrollable_tab("浏览器与内容")
+        schedule_tab = scrollable_tab("独立发布时间")
+        content_options_tab = scrollable_tab("图片与声明")
+
+        def scroll_current_tab(event):
+            canvas = self.tab_scroll_canvases[notebook.index(notebook.select())]
+            if str(event.widget).startswith(str(canvas)) and event.delta:
+                canvas.yview_scroll(-1 if event.delta > 0 else 1, "units")
+                return "break"
+
+        self.window.bind("<MouseWheel>", scroll_current_tab, add="+")
 
         form = ttk.Frame(account_tab)
         form.pack(fill="x")
+        ttk.Label(form, text="账号名称", width=20, anchor="e").grid(row=0, column=0, padx=(0, 10), pady=7)
+        ttk.Entry(form, textvariable=self.vars["name"], width=52).grid(row=0, column=1, pady=7, sticky="we")
+        ttk.Label(form, text="浏览器类型", width=20, anchor="e").grid(row=1, column=0, padx=(0, 10), pady=7)
+        ttk.Combobox(
+            form, textvariable=self.vars["browser_type"], values=("快捷方式 / EXE", "比特浏览器"),
+            state="readonly", width=30,
+        ).grid(row=1, column=1, pady=7, sticky="w")
+        form.columnconfigure(1, weight=1)
+        connection = ttk.Frame(account_tab)
+        connection.pack(fill="x")
+        self.shortcut_form = ttk.Frame(connection)
         rows = [
-            ("账号名称", "name", None),
             ("快捷方式 / EXE", "browser_path", "file"),
             ("用户数据目录（可空）", "browser_user_data_dir", "folder"),
             ("Profile 目录（可空）", "browser_profile_directory", None),
             ("CDP 调试端口", "cdp_port", None),
-            ("本轮发布条数", "posts_per_run", None),
         ]
         for row, (label, key, browse) in enumerate(rows):
-            ttk.Label(form, text=label, width=20, anchor="e").grid(row=row, column=0, padx=(0, 10), pady=7, sticky="e")
-            ttk.Entry(form, textvariable=self.vars[key], width=52).grid(row=row, column=1, pady=7, sticky="we")
+            ttk.Label(self.shortcut_form, text=label, width=20, anchor="e").grid(row=row, column=0, padx=(0, 10), pady=7, sticky="e")
+            ttk.Entry(self.shortcut_form, textvariable=self.vars[key], width=52).grid(row=row, column=1, pady=7, sticky="we")
             if browse:
-                ttk.Button(form, text="选择", command=lambda k=key, b=browse: self._browse(k, b)).grid(row=row, column=2, padx=(8, 0), pady=7)
-        form.columnconfigure(1, weight=1)
+                ttk.Button(self.shortcut_form, text="选择", command=lambda k=key, b=browse: self._browse(k, b)).grid(row=row, column=2, padx=(8, 0), pady=7)
+        self.shortcut_form.columnconfigure(1, weight=1)
+        self.bitbrowser_form = ttk.Frame(connection)
+        for row, (label, key) in enumerate((("比特本地接口地址", "bitbrowser_api_url"), ("比特窗口 ID", "bitbrowser_window_id"))):
+            ttk.Label(self.bitbrowser_form, text=label, width=20, anchor="e").grid(row=row, column=0, padx=(0, 10), pady=7)
+            ttk.Entry(self.bitbrowser_form, textvariable=self.vars[key], width=52).grid(row=row, column=1, pady=7, sticky="we")
+        ttk.Label(self.bitbrowser_form, text="API Token（可空）", width=20, anchor="e").grid(row=2, column=0, padx=(0, 10), pady=7)
+        ttk.Entry(self.bitbrowser_form, textvariable=self.vars["bitbrowser_api_token"], show="*", width=52).grid(row=2, column=1, pady=7, sticky="we")
+        self.bitbrowser_select_button = ttk.Button(self.bitbrowser_form, text="读取并选择窗口", command=self._choose_bitbrowser_window)
+        self.bitbrowser_select_button.grid(row=3, column=1, pady=7, sticky="w")
+        ttk.Label(
+            self.bitbrowser_form, text="先启动并登录比特浏览器；开启鉴权时填写 Token，Token 仅在本机加密保存，不导出到队列表。",
+            foreground="#667085", wraplength=660,
+        ).grid(row=4, column=0, columnspan=2, pady=7, sticky="w")
+        self.bitbrowser_form.columnconfigure(1, weight=1)
+        self.vars["browser_type"].trace_add("write", self._sync_browser_type)
+        self._sync_browser_type()
+        quota_form = ttk.Frame(account_tab)
+        quota_form.pack(fill="x")
+        ttk.Label(quota_form, text="本轮发布条数", width=20, anchor="e").grid(row=0, column=0, padx=(0, 10), pady=7)
+        ttk.Entry(quota_form, textvariable=self.vars["posts_per_run"], width=52).grid(row=0, column=1, pady=7, sticky="we")
+        quota_form.columnconfigure(1, weight=1)
         checks = ttk.Frame(account_tab)
         checks.pack(fill="x", pady=(12, 8))
-        ttk.Checkbutton(checks, text="启用此浏览器账号", variable=self.enabled_var).pack(side="left", padx=(150, 18))
-        ttk.Checkbutton(checks, text="完成后关闭本软件启动的浏览器", variable=self.close_var).pack(side="left")
+        ttk.Checkbutton(checks, text="启用此浏览器账号", variable=self.enabled_var).pack(anchor="w")
+        self.close_checkbox = ttk.Checkbutton(checks, text="完成后关闭本软件启动的浏览器", variable=self.close_var)
+        self.close_checkbox.pack(anchor="w", pady=(5, 0))
+        self._sync_browser_type()
         content = ttk.LabelFrame(account_tab, text="账号发布内容", padding=12)
         content.pack(fill="x", pady=(8, 8))
         content_rows = [
@@ -6720,10 +8157,157 @@ class BrowserAccountDialog:
             )
         schedule_form.columnconfigure(1, weight=1)
 
+        image_group = ttk.LabelFrame(content_options_tab, text="单条作品图片", padding=14)
+        image_group.pack(fill="x")
+        ttk.Label(image_group, text="账号图片文件夹（可空）", width=18, anchor="e").grid(
+            row=0, column=0, padx=(0, 10), pady=8, sticky="e"
+        )
+        ttk.Entry(image_group, textvariable=self.vars["image_dir"], width=52).grid(
+            row=0, column=1, pady=8, sticky="we"
+        )
+        ttk.Button(
+            image_group, text="选择", command=lambda: self._browse("image_dir", "folder")
+        ).grid(row=0, column=2, padx=(8, 0), pady=8)
+        ttk.Label(image_group, text="每条上传图片数", width=18, anchor="e").grid(
+            row=1, column=0, padx=(0, 10), pady=8, sticky="e"
+        )
+        ttk.Spinbox(
+            image_group, from_=1, to=35, textvariable=self.vars["images_per_post"], width=12
+        ).grid(row=1, column=1, pady=8, sticky="w")
+        ttk.Label(image_group, text="图片选择方式", width=18, anchor="e").grid(
+            row=2, column=0, padx=(0, 10), pady=8, sticky="e"
+        )
+        ttk.Combobox(
+            image_group,
+            textvariable=self.vars["image_selection_mode"],
+            values=("按图片名称顺序", "随机选择"),
+            state="readonly",
+            width=24,
+        ).grid(row=2, column=1, pady=8, sticky="w")
+        ttk.Label(
+            image_group,
+            text="账号图片文件夹留空时使用系统设置里的图片总路径；同一条作品的图片互不重复。",
+            foreground="#667085",
+            wraplength=690,
+        ).grid(row=3, column=0, columnspan=3, padx=8, pady=(6, 2), sticky="w")
+        image_group.columnconfigure(1, weight=1)
+
+        declaration_group = ttk.LabelFrame(content_options_tab, text="发布声明", padding=14)
+        declaration_group.pack(fill="x", pady=(16, 0))
+        ttk.Checkbutton(
+            declaration_group,
+            text="启用并在发布前选择声明",
+            variable=self.declaration_enabled_var,
+        ).grid(row=0, column=0, columnspan=3, pady=(0, 8), sticky="w")
+        ttk.Label(declaration_group, text="声明入口文字", width=18, anchor="e").grid(
+            row=1, column=0, padx=(0, 10), pady=7, sticky="e"
+        )
+        self.declaration_entry = ttk.Entry(
+            declaration_group, textvariable=self.vars["declaration_entry_text"], width=52
+        )
+        self.declaration_entry.grid(row=1, column=1, pady=7, sticky="we")
+        ttk.Label(declaration_group, text="声明内容", width=18, anchor="e").grid(
+            row=2, column=0, padx=(0, 10), pady=7, sticky="e"
+        )
+        self.declaration_content_combo = ttk.Combobox(
+            declaration_group,
+            textvariable=self.vars["declaration_text"],
+            values=DECLARATION_PRESETS,
+            state="normal",
+            width=50,
+        )
+        self.declaration_content_combo.grid(row=2, column=1, pady=7, sticky="we")
+        ttk.Label(
+            declaration_group,
+            text=(
+                "下拉项仅供快速选择；可直接手工输入抖音页面当前显示的完整文案。"
+                "若平台改了入口名称，也可修改上方入口文字。"
+            ),
+            foreground="#667085",
+            wraplength=690,
+        ).grid(row=3, column=0, columnspan=3, padx=8, pady=(8, 2), sticky="w")
+        declaration_group.columnconfigure(1, weight=1)
+
+        def sync_declaration_state(*_args):
+            state = "normal" if self.declaration_enabled_var.get() else "disabled"
+            self.declaration_entry.configure(state=state)
+            self.declaration_content_combo.configure(state=state)
+
+        self.declaration_enabled_var.trace_add("write", sync_declaration_state)
+        sync_declaration_state()
+
         actions = ttk.Frame(outer)
-        actions.pack(fill="x")
-        ttk.Button(actions, text="取消", command=self.window.destroy).pack(side="right", padx=(8, 0))
-        ttk.Button(actions, text="保存账号", style="Accent.TButton", command=self._save).pack(side="right")
+        actions.grid(row=2, column=0, sticky="ew")
+        self.cancel_button = ttk.Button(actions, text="取消", command=self.window.destroy)
+        self.cancel_button.pack(side="right", padx=(8, 0))
+        self.save_button = ttk.Button(actions, text="保存账号", style="Accent.TButton", command=self._save)
+        self.save_button.pack(side="right")
+
+    def _sync_api_token(self, *_args):
+        try:
+            api_url = normalize_bitbrowser_api_url(self.vars["bitbrowser_api_url"].get())
+        except Exception:
+            self._token_api_url = ""
+            self.vars["bitbrowser_api_token"].set("")
+            return
+        if api_url == self._token_api_url:
+            return
+        self._token_api_url = api_url
+        try:
+            token = BitBrowserTokenStore(BITBROWSER_TOKEN_PATH).get_token(api_url)
+        except Exception as exc:
+            token = ""
+            messagebox.showwarning("比特 API Token 读取失败", str(exc), parent=self.window)
+        self.vars["bitbrowser_api_token"].set(token)
+
+    def _sync_browser_type(self, *_args):
+        is_bitbrowser = normalize_browser_type(self.vars["browser_type"].get()) == "bitbrowser"
+        self.shortcut_form.pack_forget()
+        self.bitbrowser_form.pack_forget()
+        (self.bitbrowser_form if is_bitbrowser else self.shortcut_form).pack(fill="x")
+        if hasattr(self, "close_checkbox"):
+            self.close_checkbox.configure(state="normal", text="任务结束后关闭调用的比特窗口" if is_bitbrowser else "完成后关闭本软件启动的浏览器")
+
+    def _choose_bitbrowser_window(self):
+        try:
+            client = BitBrowserClient(
+                self.vars["bitbrowser_api_url"].get(), api_token=self.vars["bitbrowser_api_token"].get(),
+            )
+        except Exception as exc:
+            messagebox.showwarning("比特接口地址无效", str(exc), parent=self.window)
+            return
+        self.bitbrowser_select_button.configure(state="disabled", text="正在读取窗口…")
+        results = queue.Queue()
+
+        def fetch():
+            try:
+                results.put((client.list_windows(), None))
+            except Exception as exc:
+                results.put((None, str(exc)))
+
+        def poll():
+            try:
+                windows, error = results.get_nowait()
+            except queue.Empty:
+                self.window.after(100, poll)
+                return
+            self.bitbrowser_select_button.configure(state="normal", text="读取并选择窗口")
+            if error:
+                messagebox.showwarning("读取比特窗口失败", error, parent=self.window)
+                return
+            if not windows:
+                messagebox.showinfo("没有窗口", "比特浏览器中没有可选择的窗口，请先在比特浏览器创建窗口并登录抖音。", parent=self.window)
+                return
+            chooser = BitBrowserWindowDialog(self.window, windows)
+            if chooser.result:
+                self.vars["bitbrowser_api_url"].set(client.api_url)
+                self.vars["bitbrowser_window_id"].set(chooser.result["id"])
+                if not self.vars["name"].get().strip() or re.fullmatch(r"浏览器\d+", self.vars["name"].get().strip()):
+                    self.vars["name"].set(chooser.result["name"] or f"比特窗口 {chooser.result['seq']}")
+            self.window.grab_set()
+
+        threading.Thread(target=fetch, daemon=True).start()
+        self.window.after(100, poll)
 
     def _browse(self, key, kind):
         if kind == "folder":
@@ -6747,12 +8331,20 @@ class BrowserAccountDialog:
         try:
             name = self.vars["name"].get().strip()
             browser_path = self.vars["browser_path"].get().strip()
-            port = int(self.vars["cdp_port"].get().strip())
+            browser_type = normalize_browser_type(self.vars["browser_type"].get())
+            port = int(self.vars["cdp_port"].get().strip()) if browser_type == "shortcut" else 9222
             posts = int(self.vars["posts_per_run"].get().strip())
+            images_per_post = normalize_images_per_post(self.vars["images_per_post"].get().strip())
             if not name:
                 raise ValueError("请填写账号名称。")
-            if not browser_path:
-                raise ValueError("请选择浏览器快捷方式或 EXE。")
+            api_url = self.vars["bitbrowser_api_url"].get().strip()
+            window_id = self.vars["bitbrowser_window_id"].get().strip()
+            validate_browser_account_connection({
+                "name": name, "browser_type": browser_type, "browser_path": browser_path,
+                "bitbrowser_api_url": api_url, "bitbrowser_window_id": window_id,
+            })
+            if browser_type == "bitbrowser":
+                api_url = normalize_bitbrowser_api_url(api_url)
             if not 1 <= port <= 65535:
                 raise ValueError("CDP 调试端口必须在 1—65535 之间。")
             if posts < 1:
@@ -6762,15 +8354,32 @@ class BrowserAccountDialog:
             if not excel_path or not sheet_name:
                 raise ValueError("文案 Excel 和工作表名都必须填写。")
             validate_copy_file_path(excel_path)
+            declaration_entry_text = self.vars["declaration_entry_text"].get().strip()
+            declaration_text = self.vars["declaration_text"].get().strip()
+            if self.declaration_enabled_var.get() and not declaration_entry_text:
+                raise ValueError("启用发布声明时，声明入口文字不能为空。")
+            if self.declaration_enabled_var.get() and not declaration_text:
+                raise ValueError("启用发布声明时，请选择或手工填写声明内容。")
             raw = {
                 "id": self.original_id,
                 "name": name,
                 "enabled": self.enabled_var.get(),
+                "browser_type": browser_type,
+                "bitbrowser_api_url": api_url,
+                "bitbrowser_window_id": window_id,
                 "browser_path": browser_path,
                 "browser_user_data_dir": self.vars["browser_user_data_dir"].get().strip(),
                 "browser_profile_directory": self.vars["browser_profile_directory"].get().strip(),
                 "cdp_port": port,
                 "posts_per_run": posts,
+                "image_dir": self.vars["image_dir"].get().strip(),
+                "images_per_post": images_per_post,
+                "image_selection_mode": (
+                    "random" if self.vars["image_selection_mode"].get().strip() == "随机选择" else "ordered"
+                ),
+                "declaration_enabled": self.declaration_enabled_var.get(),
+                "declaration_entry_text": declaration_entry_text,
+                "declaration_text": declaration_text,
                 "close_after_finish": self.close_var.get(),
                 "independent_content": True,
                 "excel_path": excel_path,
@@ -6788,8 +8397,13 @@ class BrowserAccountDialog:
                 self.result["id"] = self.original_id
             if self.result.get("use_schedule", True):
                 build_slots(config_for_browser_account({}, self.result))
+            if browser_type == "bitbrowser":
+                BitBrowserTokenStore(BITBROWSER_TOKEN_PATH).save_token(
+                    api_url, normalize_bitbrowser_api_token(self.vars["bitbrowser_api_token"].get()),
+                )
             self.window.destroy()
         except Exception as exc:
+            self.result = None
             messagebox.showwarning("账号配置无效", str(exc), parent=self.window)
 
 
@@ -6799,8 +8413,10 @@ class App:
         # 授权恢复完成前不展示任何发布配置，避免主界面先闪现再弹登录框。
         self.root.withdraw()
         self.root.title(APP_NAME + "｜智能发布中心")
-        self.root.geometry("1240x880")
-        self.root.minsize(1080, 760)
+        available_width = max(760, self.root.winfo_screenwidth() - 80)
+        available_height = max(520, self.root.winfo_screenheight() - 100)
+        self.root.geometry(f"{min(1240, available_width)}x{min(880, available_height)}")
+        self.root.minsize(min(1080, available_width), min(760, available_height))
         try:
             if LOGO_ICO.exists():
                 self.root.iconbitmap(str(LOGO_ICO))
@@ -6823,6 +8439,7 @@ class App:
         self.restore_browser_runtime_state()
         self.proc = None
         self.proc_mode = ""
+        self.active_bitbrowser_task_accounts = {}
         self.q = queue.Queue()
         self.is_paused = False
         # 暂停期间允许编辑队列。保存暂停时实际创建的 flag 路径，避免删除/改动队列后
@@ -6856,7 +8473,8 @@ class App:
         self._configure_style()
         self.build()
         self.root.protocol("WM_DELETE_WINDOW", self.on_close)
-        self.root.after(250, self.start_authorization_restore)
+        if "--self-test" not in sys.argv:
+            self.root.after(250, self.start_authorization_restore)
 
     def restore_browser_runtime_state(self):
         """软件重启后恢复未完成队列中每个账号的累计进度与最后失败原因。"""
@@ -7094,6 +8712,7 @@ class App:
             ("发布间隔最小秒", "publish_interval_min_seconds"), ("发布间隔最大秒", "publish_interval_max_seconds"),
             ("上传检测间隔秒", "upload_check_interval_seconds"), ("上传最大等待秒", "upload_max_wait_seconds"),
             ("话题识别等待秒", "topic_wait_seconds"), ("创作者中心等待秒", "creator_center_wait_seconds"),
+            ("发布页加载最长等待秒", "creator_page_ready_timeout_seconds"),
             ("单步骤失败后重试次数", "retry_times"),
             ("总体流程失败后重试次数", "overall_retry_times"),
             ("今日上限切换等待秒", "daily_limit_switch_wait_seconds"),
@@ -7105,7 +8724,7 @@ class App:
         option_items = [
             ("发布成功后删除图片", "delete_image_after_success"),
             ("发布成功后删除文案", "delete_copy_after_success"),
-            ("随机使用图片", "random_image"),
+            ("旧账号默认随机图片（账号设置优先）", "random_image"),
             ("复用已存在调试端口", "reuse_existing_cdp"),
             ("启动前关闭 Chrome 残留", "close_chrome_before_start"),
             ("后台运行不拉起浏览器", "no_raise_browser"),
@@ -7186,15 +8805,15 @@ class App:
         self.browser_tree.tag_configure("error", foreground="#B42318")
         actions = ttk.Frame(body)
         actions.pack(fill="x", pady=(12, 0))
-        for text, command in [
+        for index, (text, command) in enumerate([
             ("添加", self.add_browser_account), ("复制", self.duplicate_browser_account),
             ("编辑", self.edit_browser_account),
             ("删除", self.remove_browser_account), ("上移", lambda: self.move_browser_account(-1)),
             ("下移", lambda: self.move_browser_account(1)),
             ("全选发布", lambda: self.set_all_browser_accounts_enabled(True)),
             ("全部取消", lambda: self.set_all_browser_accounts_enabled(False)),
-        ]:
-            ttk.Button(actions, text=text, command=command).pack(side="left", padx=(0, 6))
+        ]):
+            ttk.Button(actions, text=text, command=command).grid(row=index // 4, column=index % 4, padx=(0, 6), pady=(0, 6), sticky="w")
         table_actions = ttk.Frame(body)
         table_actions.pack(fill="x", pady=(8, 0))
         for text, command in [
@@ -7214,24 +8833,24 @@ class App:
         controls = ttk.Frame(runtime)
         self.task_controls_frame = controls
         controls.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 10))
-        ttk.Label(controls, text="任务控制", style="Title.TLabel").pack(side="left", padx=(0, 14))
-        ttk.Button(controls, text="保存配置", command=lambda: self.save_from_ui(show_message=True)).pack(side="left", padx=(0, 6))
-        ttk.Button(controls, text="打开选中浏览器", style="Success.TButton", command=self.open_browser_window).pack(side="left", padx=(0, 6))
-        ttk.Button(controls, text="检查全部账号", command=self.probe_all_browsers).pack(side="left", padx=(0, 6))
+        ttk.Label(controls, text="任务控制", style="Title.TLabel").grid(row=0, column=0, rowspan=2, padx=(0, 14), sticky="nw")
+        ttk.Button(controls, text="保存配置", command=lambda: self.save_from_ui(show_message=True)).grid(row=0, column=1, padx=(0, 6), pady=(0, 6), sticky="w")
+        ttk.Button(controls, text="打开选中浏览器", style="Success.TButton", command=self.open_browser_window).grid(row=0, column=2, padx=(0, 6), pady=(0, 6), sticky="w")
+        ttk.Button(controls, text="检查全部账号", command=self.probe_all_browsers).grid(row=0, column=3, padx=(0, 6), pady=(0, 6), sticky="w")
         self.start_button = ttk.Button(controls, text="开始本轮发布", style="Accent.TButton", command=self.start)
-        self.start_button.pack(side="left", padx=(0, 6))
+        self.start_button.grid(row=0, column=4, padx=(0, 6), pady=(0, 6), sticky="w")
         self.start_button.configure(state="disabled")
         self.retry_failed_button = ttk.Button(
             controls, text="重试勾选失败账号", command=self.retry_selected_failed_accounts,
         )
-        self.retry_failed_button.pack(side="left", padx=(0, 6))
+        self.retry_failed_button.grid(row=1, column=1, padx=(0, 6), sticky="w")
         self.retry_failed_button.configure(state="disabled")
         self.pause_button = ttk.Button(controls, text="暂停 / 继续", command=self.toggle_pause)
-        self.pause_button.pack(side="left", padx=(0, 6))
+        self.pause_button.grid(row=1, column=2, padx=(0, 6), sticky="w")
         self.stop_button = ttk.Button(
             controls, text="停止任务", style="Danger.TButton", command=self.stop,
         )
-        self.stop_button.pack(side="left")
+        self.stop_button.grid(row=1, column=3, sticky="w")
 
         ttk.Label(runtime, textvariable=self.countdown_var, font=("Microsoft YaHei UI", 16, "bold"), foreground="#D4380D").grid(row=1, column=0, padx=(0, 18), pady=(0, 8), sticky="w")
         ttk.Label(runtime, textvariable=self.countdown_reason_var, style="Muted.TLabel").grid(row=1, column=1, pady=(0, 8), sticky="w")
@@ -7247,7 +8866,7 @@ class App:
             command=lambda: self.logbox.delete("1.0", "end"),
         )
         self.clear_log_button.pack(side="left")
-        self.logbox = ScrolledText(runtime, height=7, font=("Consolas", 10), bg="#0F172A", fg="#D1FAE5", insertbackground="#FFFFFF", relief="flat", padx=10, pady=8)
+        self.logbox = ScrolledText(runtime, height=5, font=("Consolas", 10), bg="#0F172A", fg="#D1FAE5", insertbackground="#FFFFFF", relief="flat", padx=10, pady=8)
         self.logbox.grid(row=2, column=0, columnspan=3, sticky="nsew")
 
     def _build_settings_tab(self, parent):
@@ -7390,7 +9009,8 @@ class App:
         self.authorization_window = window
         window.title("软件用户登录" if not switch_account else "切换软件授权账号")
         window.geometry("440x325")
-        window.resizable(False, False)
+        window.minsize(440, 325)
+        window.resizable(True, True)
         if self.main_window_revealed:
             window.transient(self.root)
         window.grab_set()
@@ -7399,8 +9019,13 @@ class App:
                 window.iconbitmap(str(LOGO_ICO))
         except Exception:
             pass
-        body = ttk.Frame(window, padding=24)
-        body.pack(fill="both", expand=True)
+        outer = ttk.Frame(window, padding=24)
+        outer.pack(fill="both", expand=True)
+        outer.rowconfigure(0, weight=1)
+        outer.columnconfigure(0, weight=1)
+        body = ttk.Frame(outer)
+        body.grid(row=0, column=0, sticky="nsew")
+        body.rowconfigure(4, weight=1)
         ttk.Label(body, text="统一软件授权", font=("Microsoft YaHei UI", 18, "bold")).grid(row=0, column=0, columnspan=2, sticky="w")
         ttk.Label(body, text="软件账号", width=11, anchor="e").grid(row=1, column=0, padx=(0, 10), pady=(20, 7), sticky="e")
         try:
@@ -7449,8 +9074,8 @@ class App:
         ).pack(side="left", padx=(18, 0))
         status_var = tk.StringVar(value="")
         ttk.Label(body, textvariable=status_var, foreground="#B42318", wraplength=375).grid(row=4, column=0, columnspan=2, sticky="w", pady=(5, 8))
-        buttons = ttk.Frame(body)
-        buttons.grid(row=5, column=0, columnspan=2, sticky="e")
+        buttons = ttk.Frame(outer)
+        buttons.grid(row=1, column=0, sticky="e", pady=(8, 0))
         def close_login_window():
             try:
                 window.grab_release()
@@ -7526,6 +9151,15 @@ class App:
         login_button.configure(command=submit)
         window.bind("<Return>", submit)
         (password_entry if account_var.get() else account_entry).focus_set()
+
+        def fit_login_window(*_args):
+            window.update_idletasks()
+            width = min(max(440, window.winfo_width(), outer.winfo_reqwidth()), max(440, window.winfo_screenwidth() - 80))
+            height = min(max(325, window.winfo_height(), outer.winfo_reqheight()), max(325, window.winfo_screenheight() - 100))
+            window.geometry(f"{width}x{height}")
+
+        status_var.trace_add("write", fit_login_window)
+        fit_login_window()
         window.update_idletasks()
         if login_required:
             width = window.winfo_width()
@@ -7748,6 +9382,7 @@ class App:
             "wait_min_seconds", "wait_max_seconds", "publish_interval_min_seconds",
             "publish_interval_max_seconds", "upload_check_interval_seconds",
             "upload_max_wait_seconds", "topic_wait_seconds", "creator_center_wait_seconds",
+            "creator_page_ready_timeout_seconds",
         }
         for key, value in self.vars.items():
             text_value = value.get().strip()
@@ -7760,6 +9395,9 @@ class App:
         for key, value in self.bool_vars.items():
             cfg[key] = bool(value.get())
         cfg["rotate_batch_size"] = normalize_rotate_batch_size(cfg.get("rotate_batch_size", 1))
+        page_wait = cfg.get("creator_page_ready_timeout_seconds", 120)
+        if not math.isfinite(page_wait) or not 1 <= page_wait <= 600:
+            raise ValueError("发布页加载最长等待秒必须在 1—600 之间。")
         cfg["retry_times"] = normalize_retry_count(cfg.get("retry_times", 3), 3)
         cfg["overall_retry_times"] = normalize_retry_count(cfg.get("overall_retry_times", 1), 1)
         cfg["daily_limit_switch_wait_seconds"] = normalize_daily_limit_switch_wait_seconds(
@@ -7777,8 +9415,7 @@ class App:
         if enabled:
             validate_browser_queue_ports(enabled)
         for account in enabled:
-            if not account.get("browser_path"):
-                raise ValueError(f"浏览器账号“{account.get('name')}”未设置快捷方式或 EXE。")
+            validate_browser_account_connection(account)
         for account in enabled:
             account_cfg = config_for_browser_account(cfg, account)
             if not str(account_cfg.get("sheet_name") or "").strip():
@@ -7793,6 +9430,9 @@ class App:
         if not queue_rows:
             raise ValueError("浏览器账号队列不能为空。")
         first = queue_rows[0]
+        cfg["browser_type"] = first.get("browser_type", "shortcut")
+        cfg["bitbrowser_api_url"] = first.get("bitbrowser_api_url", DEFAULT_BITBROWSER_API_URL)
+        cfg["bitbrowser_window_id"] = first.get("bitbrowser_window_id", "")
         cfg["browser_path"] = first["browser_path"]
         cfg["browser_user_data_dir"] = first.get("browser_user_data_dir", "")
         cfg["browser_profile_directory"] = first.get("browser_profile_directory", "")
@@ -7852,11 +9492,14 @@ class App:
                     "✓" if account.get("enabled", True) else "□",
                     index,
                     account["name"],
-                    account["browser_path"],
+                    ("比特：" + account.get("bitbrowser_window_id", "")) if account.get("browser_type") == "bitbrowser" else account["browser_path"],
                     account.get("excel_path", ""),
                     schedule_text,
-                    account["cdp_port"],
+                    "自动" if account.get("browser_type") == "bitbrowser" else account["cdp_port"],
                     account["posts_per_run"],
+                    account.get("images_per_post", 1),
+                    "随机" if normalize_image_selection_mode(account.get("image_selection_mode")) == "random" else "名称顺序",
+                    "已启用" if account.get("declaration_enabled", False) else "未启用",
                     published_count,
                     status,
                 ),
@@ -8073,7 +9716,7 @@ class App:
             sheet = workbook.active
             sheet.title = "浏览器账号队列"
             sheet.append([label for label, _key in BROWSER_QUEUE_TABLE_COLUMNS])
-            bool_keys = {"enabled", "close_after_finish", "use_schedule"}
+            bool_keys = {"enabled", "close_after_finish", "use_schedule", "declaration_enabled"}
             for order, account in enumerate(self.browser_accounts, start=1):
                 row = []
                 for _label, key in BROWSER_QUEUE_TABLE_COLUMNS:
@@ -8122,13 +9765,16 @@ class App:
                 for index, cell in enumerate(sheet[1])
                 if str(cell.value or "").strip()
             }
-            required = {"账号名称", "浏览器路径", "CDP端口", "发布条数", "文案Excel", "工作表名"}
+            required = {"账号名称", "发布条数", "文案Excel", "工作表名"}
             missing = sorted(required - set(headers))
             if missing:
                 raise ValueError("队列表缺少列：" + "、".join(missing))
             imported = []
-            bool_keys = {"enabled", "close_after_finish", "use_schedule"}
-            int_keys = {"cdp_port", "posts_per_run", "start_hour", "end_hour", "per_hour_count"}
+            bool_keys = {"enabled", "close_after_finish", "use_schedule", "declaration_enabled"}
+            int_keys = {
+                "cdp_port", "posts_per_run", "images_per_post",
+                "start_hour", "end_hour", "per_hour_count",
+            }
             for row_number, cells in enumerate(sheet.iter_rows(min_row=2, values_only=True), start=2):
                 if not any(value not in {None, ""} for value in cells):
                     continue
@@ -8146,8 +9792,12 @@ class App:
                 if not str(raw.get("id") or "").strip():
                     raw["id"] = new_browser_queue_id()
                 account = normalize_browser_account(raw, len(imported), self.cfg)
-                if not account.get("browser_path"):
-                    raise ValueError(f"第 {row_number} 行没有浏览器路径。")
+                try:
+                    validate_browser_account_connection(account)
+                except Exception as exc:
+                    raise ValueError(f"第 {row_number} 行浏览器配置无效：{exc}") from exc
+                if account["browser_type"] == "shortcut" and ("浏览器路径" not in headers or "CDP端口" not in headers):
+                    raise ValueError("快捷方式账号必须包含浏览器路径和 CDP端口列。")
                 imported.append(account)
             workbook.close()
             workbook = None
@@ -8230,6 +9880,8 @@ class App:
                 }
                 account_id = str(payload.get("id", ""))
                 raw_status = str(payload.get("status", ""))
+                if raw_status in {"launching", "checking", "publishing"}:
+                    self.remember_bitbrowser_task_account(account_id)
                 message = str(payload.get("message", "")).strip()
                 status = labels.get(str(payload.get("status", "")), str(payload.get("status", "")))
                 success_count = int(payload.get("success_count", 0) or 0)
@@ -8312,6 +9964,9 @@ class App:
             self.proc = None
             self.proc_mode = ""
             if mode == "worker":
+                if code != 0:
+                    self.close_invoked_bitbrowser_task_windows()
+                self.active_bitbrowser_task_accounts = {}
                 if code == 0 and not self.telemetry_failed_accounts:
                     telemetry_status = "succeeded"
                 elif code == 0 and self.telemetry_success_by_account:
@@ -8336,6 +9991,8 @@ class App:
                 self.reset_countdown_display("状态：空闲", "浏览器打开命令已完成")
 
     def run_subprocess(self, args, mode="helper"):
+        if mode == "worker":
+            self.active_bitbrowser_task_accounts = {}
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
         env["PYTHONUTF8"] = "1"
@@ -8360,7 +10017,8 @@ class App:
         cmd = application_command(
             "--open-browser", CONFIG_PATH, "--account-id", account["id"]
         )
-        self.write_ui(f"\n正在打开：{account['name']}（端口 {account['cdp_port']}）\n")
+        connection = "比特窗口 " + account.get("bitbrowser_window_id", "") if account.get("browser_type") == "bitbrowser" else f"端口 {account['cdp_port']}"
+        self.write_ui(f"\n正在打开：{account['name']}（{connection}）\n")
         self.reset_countdown_display(f"状态：打开 {account['name']}", "正在连接浏览器")
         self.run_subprocess(cmd, mode="open-browser")
 
@@ -8402,8 +10060,7 @@ class App:
             for account in browser_accounts_from_config(self.cfg, enabled_only=True):
                 account_cfg = config_for_browser_account(self.cfg, account)
                 validate_publish_records_and_images(account_cfg)
-                if not Path(account["browser_path"]).exists():
-                    raise FileNotFoundError(f"浏览器账号“{account['name']}”路径不存在：{account['browser_path']}")
+                validate_browser_account_connection(account, check_path=True)
         except Exception as exc:
             self.write_ui(f"任务启动前检查失败：{exc}\n")
             if not scheduled:
@@ -8518,6 +10175,25 @@ class App:
             self.countdown_reason_var.set("暂停中：现在可以修改浏览器账号队列")
             self.write_ui("已请求暂停；当前安全步骤结束后生效。暂停期间可修改浏览器队列，点击继续时自动保存。\n")
 
+    def remember_bitbrowser_task_account(self, account_id):
+        if getattr(self, "proc_mode", "") != "worker":
+            return
+        for account in self.browser_accounts:
+            if str(account.get("id") or "") != account_id or account.get("browser_type") != "bitbrowser" or not account.get("close_after_finish", True):
+                continue
+            if not hasattr(self, "active_bitbrowser_task_accounts"):
+                self.active_bitbrowser_task_accounts = {}
+            self.active_bitbrowser_task_accounts[browser_runtime_identity(account)] = copy.deepcopy(account)
+            break
+
+    def close_invoked_bitbrowser_task_windows(self):
+        accounts = list(getattr(self, "active_bitbrowser_task_accounts", {}).values())
+        self.active_bitbrowser_task_accounts = {}
+        for account in accounts:
+            self.write_ui(f"正在关闭本次发布任务调用的比特窗口：{account.get('name') or '指定窗口'}。\n")
+            if not close_bitbrowser_task_window(account):
+                self.write_ui("比特窗口关闭失败，请检查接口或手动关闭该窗口。\n")
+
     def stop(self):
         was_worker = bool(self.proc and self.proc.poll() is None and self.proc_mode == "worker")
         try:
@@ -8554,6 +10230,7 @@ class App:
                     pass
             self.active_pause_flags = []
             if was_worker:
+                self.close_invoked_bitbrowser_task_windows()
                 self.finish_task_telemetry("stopped")
             self.reset_countdown_display("状态：已停止", "任务已停止")
 
@@ -8651,7 +10328,7 @@ def run_gui():
 
 def run_self_test():
     """不连接浏览器、不发布内容的内置冒烟测试。"""
-    assert APP_VERSION == "3.0.7"
+    assert APP_VERSION == "3.2.0"
     assert APP_NAME.endswith(APP_VERSION)
     assert UPDATE_MANIFEST_URL.startswith("https://api.xibao-zg.top/updates/")
     assert "github" not in UPDATE_MANIFEST_URL.lower() and not UPDATE_MANIFEST_FALLBACK_URLS
@@ -8681,6 +10358,26 @@ def run_self_test():
     assert valid_release["sha256"] == "a" * 64
     body, topics = split_text_topics("正文内容 ##话题一 #话题二")
     assert "#" not in body and topics == ["话题一", "话题二"]
+    assert topic_result_text_matches("#话题一\n123.4万次播放", "话题一")
+    assert topic_result_text_matches("#话题一 123.4万次播放", "话题一")
+    assert not topic_result_text_matches("#话题一延伸", "话题一")
+    assert topic_text_present("正文\n#话题一 # 话题二", "话题一")
+    assert topic_text_present("正文\n#话题一 # 话题二", "话题二")
+    assert not topic_text_present("正文\n#话题一延伸", "话题一")
+    assert topic_entry_text_has_hash("正文\u00a0\u2060#\u200b", "正\u034f文")
+    assert topic_entry_text_has_hash("正文\u3164#\u034f", "正文")
+    assert topic_entry_text_has_hash("很长的外围文本正文#\u200b", ("正文", "很长的外围文本正文"))
+    assert topic_entry_text_has_hash("正文#\u200b", ("正文添加话题好友", "正文"))
+    assert not topic_entry_text_has_hash("正文\u200b", "正文")
+    assert not topic_entry_text_has_hash("正文##\u200b", "正文")
+    assert wait_topic_entry_ready.__defaults__ == (3,)
+    assert "add_topic_by_search" in fill_copy.__code__.co_names
+    assert "select_topic_search_result" in add_topic_by_search.__code__.co_names
+    assert "click_topic_entry_fast" in open_topic_search.__code__.co_names
+    assert "locate_topic_result_fast" in select_topic_search_result.__code__.co_names
+    assert "topic_readback_text" in wait_topic_selection_applied.__code__.co_names
+    assert "topic_readback_text" in validate_topics_selected.__code__.co_names
+    assert not any("parentElement?.innerText" in str(value) for value in editor_descriptor.__code__.co_consts)
     assert COPY_FILE_EXTS == {".xlsx", ".xls", ".xlsm"}
     assert extract_copy_texts(pd.DataFrame([["第一条文案"], ["第二条文案"]])) == ["第一条文案", "第二条文案"]
     assert extract_copy_texts(pd.DataFrame([["第一条文案", "备注一"], ["第二条文案", "备注二"]])) == ["第一条文案", "第二条文案"]
@@ -8742,9 +10439,33 @@ def run_self_test():
         city_dir.mkdir(parents=True)
         (city_dir / "b.jpg").write_bytes(b"b")
         (city_dir / "A.png").write_bytes(b"a")
+        (city_dir / "c.webp").write_bytes(b"c")
+        (city_dir / "D.jpeg").write_bytes(b"d")
         image_cfg = {"image_dir": str(image_root), "random_image": False}
         assert choose_image_for_record(image_cfg, structured_records[0]).name == "A.png"
         assert choose_image_for_record({**image_cfg, "random_image": True}, structured_records[0]).parent == city_dir
+        batch_state_path = Path(temp_dir) / "image_batch_state.json"
+        batch_cfg = {
+            **image_cfg,
+            "state_path": str(batch_state_path),
+            "images_per_post": 2,
+            "image_selection_mode": "ordered",
+        }
+        first_batch = choose_images_for_record(batch_cfg, structured_records[0])
+        assert [path.name for path in first_batch] == ["A.png", "b.jpg"]
+        assert len({_normalized_path_key(path) for path in first_batch}) == 2
+        second_batch = choose_images_for_record(
+            batch_cfg,
+            structured_records[0],
+            state={"used_image_keys": ["legacy-history-must-be-ignored"]},
+        )
+        assert [path.name for path in second_batch] == ["A.png", "b.jpg"]
+        random_batch = choose_images_for_record(
+            {**batch_cfg, "state_path": str(Path(temp_dir) / "random_batch_state.json"), "image_selection_mode": "random"},
+            structured_records[0],
+        )
+        assert len(random_batch) == 2 and len({_normalized_path_key(path) for path in random_batch}) == 2
+        assert normalized_upload_paths(first_batch) == first_batch
         assert resolve_image_dir_for_record(image_cfg, alias_records[0]) == city_dir
         region_folders = {
             "恩施土家族苗族自治州": "恩施",
@@ -8769,6 +10490,17 @@ def run_self_test():
         assert resolve_image_dir_for_record(
             image_cfg, {**structured_records[0], "city": "杭州余杭区"}
         ) == district_folder
+        # 同名目录永远优先于简称/层级别名；即使目录索引还是新增前的旧缓存，
+        # Excel 单元格又带有不可见格式字符，也必须刷新后命中同名目录。
+        west_peak_alias = image_root / "西峰区"
+        west_peak_alias.mkdir()
+        image_folder_index(image_cfg, force=True)
+        qingyang_exact = image_root / "庆阳西峰区"
+        qingyang_exact.mkdir()
+        assert resolve_image_dir_for_record(
+            image_cfg,
+            {**structured_records[0], "city": "\ufeff庆阳西峰区\u200b"},
+        ) == qingyang_exact
         cached_index = image_folder_index(image_cfg)
         assert image_folder_index(image_cfg) is cached_index
         (image_root / "新城区").mkdir()
@@ -8924,14 +10656,23 @@ def run_self_test():
             "image_dir": r"D:\账号9图片",
             "excel_path": r"D:\账号9文案.xlsx",
             "sheet_name": "账号9",
+            "images_per_post": 4,
+            "image_selection_mode": "random",
+            "declaration_enabled": True,
+            "declaration_entry_text": "自主声明",
+            "declaration_text": "个人观点，仅供参考",
         },
         0,
         legacy,
     )
     mapped = config_for_browser_account(legacy, custom)
-    assert "image_dir" not in custom
-    assert mapped["image_dir"] == r"D:\共享城市图片"
+    assert custom["image_dir"] == r"D:\账号9图片"
+    assert mapped["image_dir"] == r"D:\账号9图片"
+    blank_image_account = normalize_browser_account({**custom, "image_dir": ""}, 0, legacy)
+    assert config_for_browser_account(legacy, blank_image_account)["image_dir"] == r"D:\共享城市图片"
     assert mapped["excel_path"] == r"D:\账号9文案.xlsx"
+    assert mapped["images_per_post"] == 4 and mapped["image_selection_mode"] == "random"
+    assert declaration_config(mapped) == (True, "自主声明", "个人观点，仅供参考")
     assert "browser_custom" in mapped["state_path"]
     duplicate_a = normalize_browser_account(
         {**custom, "id": "queue_a", "name": "账号第1次", "cdp_port": 9229}, 0, legacy
@@ -8940,6 +10681,15 @@ def run_self_test():
         {**custom, "id": "queue_b", "name": "账号第2次", "cdp_port": 9229}, 1, legacy
     )
     validate_browser_queue_ports([duplicate_a, duplicate_b])
+    bit_a = normalize_browser_account({
+        **custom, "id": "queue_bit_a", "browser_type": "bitbrowser", "browser_path": "",
+        "bitbrowser_api_url": DEFAULT_BITBROWSER_API_URL, "bitbrowser_window_id": "selftest-window-a",
+    }, 2, legacy)
+    bit_b = normalize_browser_account({**bit_a, "id": "queue_bit_b", "bitbrowser_window_id": "selftest-window-b"}, 3, legacy)
+    validate_browser_queue_ports([duplicate_a, duplicate_b, bit_a, bit_b])
+    validate_browser_account_connection(bit_a, check_path=True)
+    assert config_for_browser_account(legacy, bit_a)["browser_type"] == "bitbrowser"
+    assert browser_connection_endpoint(config_for_browser_account(legacy, bit_a), {"cdp_endpoint": "ws://127.0.0.1:53325/devtools/browser/test"}).startswith("ws://")
     duplicate_cfg = {**legacy, "browser_accounts": [duplicate_a, {**duplicate_b, "id": "queue_a"}]}
     duplicate_accounts = browser_accounts_from_config(duplicate_cfg)
     assert len({item["id"] for item in duplicate_accounts}) == 2
@@ -9234,6 +10984,7 @@ def run_self_test():
         ]
         assert "retry_times" in gui.vars
         assert "overall_retry_times" in gui.vars
+        assert "creator_page_ready_timeout_seconds" in gui.vars
         assert "image_dir" in gui.vars
         assert not {"excel_path", "publish_start_date", "publish_end_date", "max_posts_this_run"} & set(gui.vars)
         assert "use_schedule" not in gui.bool_vars
@@ -9291,7 +11042,7 @@ def run_self_test():
             old_askyesno = messagebox.askyesno
             dialog_errors = []
             try:
-                gui.browser_accounts = [duplicate_a, duplicate_b]
+                gui.browser_accounts = [duplicate_a, duplicate_b, bit_a, bit_b]
                 gui.refresh_browser_tree()
                 filedialog.asksaveasfilename = lambda **_kwargs: str(queue_path)
                 filedialog.askopenfilename = lambda **_kwargs: str(queue_path)
@@ -9303,9 +11054,12 @@ def run_self_test():
                 gui.browser_accounts = []
                 gui.refresh_browser_tree()
                 gui.import_browser_queue_table()
-                assert len(gui.browser_accounts) == 2
+                assert len(gui.browser_accounts) == 4
                 assert gui.browser_accounts[0]["browser_path"] == gui.browser_accounts[1]["browser_path"]
-                assert len({item["id"] for item in gui.browser_accounts}) == 2
+                assert len({item["id"] for item in gui.browser_accounts}) == 4
+                assert gui.browser_accounts[2]["browser_type"] == "bitbrowser"
+                assert gui.browser_accounts[2]["bitbrowser_window_id"] == bit_a["bitbrowser_window_id"]
+                assert gui.browser_accounts[2]["bitbrowser_api_url"] == bit_a["bitbrowser_api_url"]
                 assert not dialog_errors
             finally:
                 filedialog.asksaveasfilename = old_save_dialog
@@ -9313,6 +11067,29 @@ def run_self_test():
                 messagebox.showinfo = old_showinfo
                 messagebox.showerror = old_showerror
                 messagebox.askyesno = old_askyesno
+        with tempfile.TemporaryDirectory(prefix="douyin_dialog_selftest_") as dialog_temp:
+            old_wait_window = tk.Toplevel.wait_window
+            old_bit_token_path = globals()["BITBROWSER_TOKEN_PATH"]
+            try:
+                tk.Toplevel.wait_window = lambda _self: None
+                globals()["BITBROWSER_TOKEN_PATH"] = Path(dialog_temp) / "tokens.bin"
+                root.deiconify()
+                root.update()
+                dialog = BrowserAccountDialog(root, normalize_browser_account({
+                    "browser_type": "bitbrowser", "bitbrowser_window_id": "selftest-window",
+                }, 0, {}), "编辑窗口布局自检")
+                dialog.window.geometry("640x420")
+                root.update()
+                for tab_index in range(3):
+                    dialog.notebook.select(tab_index)
+                    root.update()
+                    for button in (dialog.save_button, dialog.cancel_button):
+                        assert button.winfo_ismapped()
+                        assert button.winfo_rooty() + button.winfo_height() <= dialog.window.winfo_rooty() + dialog.window.winfo_height()
+                dialog.window.destroy()
+            finally:
+                tk.Toplevel.wait_window = old_wait_window
+                globals()["BITBROWSER_TOKEN_PATH"] = old_bit_token_path
         root.destroy()
     print("SELF_TEST_OK", flush=True)
 

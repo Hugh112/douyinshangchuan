@@ -12,9 +12,22 @@ packages/*.zip
 app/douyin_gui_config.json
 app/authorization.bin
 app/login_preferences.bin
+app/bitbrowser_api_tokens.bin
+app/bitbrowser_api_tokens.bin.tmp
 app/debug_screenshot_cleanup.json
 *.pause
 *_publish_state.json
 *_publish_log.csv
 debug_screenshots/
 *.log
+
+# 本机测试、回滚副本及发布数据不上传源码仓库
+outputs/
+validation/
+release_transition/rollback/
+**/douyin_gui_config.json
+**/authorization.bin
+**/login_preferences.bin
+**/bitbrowser_api_tokens.bin*
+*_publish_state*.json
+*_publish_log*.csv

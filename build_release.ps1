@@ -3,7 +3,7 @@ param()
 
 $ErrorActionPreference = 'Stop'
 $ProjectRoot = [System.IO.Path]::GetFullPath($PSScriptRoot)
-$Version = '3.0.7'
+$Version = '3.2.0'
 $MainDist = Join-Path $ProjectRoot 'dist\DouyinPublisher'
 $UpdateZip = Join-Path $ProjectRoot "packages\DouyinPublisher_Update_v$Version.zip"
 $InnoCompiler = 'C:\Users\1\AppData\Local\Programs\Inno Setup 6\ISCC.exe'
@@ -11,6 +11,7 @@ $IconPath = Join-Path $ProjectRoot 'app\assets\app_logo.ico'
 $AssetsPath = Join-Path $ProjectRoot 'app\assets'
 $AppPath = Join-Path $ProjectRoot 'app'
 $VersionInfoPath = Join-Path $ProjectRoot 'build_tools\version_info.txt'
+$UpdaterVersionInfoPath = Join-Path $ProjectRoot 'build_tools\version_info_updater.txt'
 
 function Remove-BuildTarget([string]$TargetPath) {
     $full = [System.IO.Path]::GetFullPath($TargetPath)
@@ -52,6 +53,7 @@ if ($LASTEXITCODE -ne 0) { throw 'Main executable build failed.' }
 py -m PyInstaller --noconfirm --clean --windowed --onefile `
     --name DouyinPublisherUpdater `
     --icon $IconPath `
+    --version-file $UpdaterVersionInfoPath `
     --add-data "$IconPath;assets" `
     --distpath $MainDist `
     --workpath build\updater `
@@ -78,6 +80,9 @@ $zipHash = (Get-FileHash -LiteralPath $UpdateZip -Algorithm SHA256).Hash.ToLower
 $zipSize = (Get-Item -LiteralPath $UpdateZip).Length
 $installer = Join-Path $ProjectRoot "release\DouyinPublisher_Setup_v$Version.exe"
 $installerHash = (Get-FileHash -LiteralPath $installer -Algorithm SHA256).Hash.ToLowerInvariant()
+$standaloneUpdater = Join-Path $ProjectRoot "release\DouyinPublisherUpdater_v$Version.exe"
+Copy-Item -LiteralPath (Join-Path $MainDist 'DouyinPublisherUpdater.exe') -Destination $standaloneUpdater -Force
+$updaterHash = (Get-FileHash -LiteralPath $standaloneUpdater -Algorithm SHA256).Hash.ToLowerInvariant()
 Remove-BuildTarget (Join-Path $ProjectRoot 'build')
 Remove-BuildTarget (Join-Path $ProjectRoot 'app\__pycache__')
 Write-Host "UPDATE_ZIP=$UpdateZip"
@@ -85,3 +90,5 @@ Write-Host "UPDATE_SHA256=$zipHash"
 Write-Host "UPDATE_SIZE=$zipSize"
 Write-Host "INSTALLER=$installer"
 Write-Host "INSTALLER_SHA256=$installerHash"
+Write-Host "UPDATER=$standaloneUpdater"
+Write-Host "UPDATER_SHA256=$updaterHash"
